@@ -31,7 +31,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 # ---------------------------------------------------
 
-OZON_ANALYTICS_URL = "https://api-seller.ozon.ru/v1/analytics/data"
 OZON_POSTING_FBO_URL = "https://api-seller.ozon.ru/v2/posting/fbo/list"
 MANAGERS_FILE = "managers.json"
 LOG_FILE = "/app/data/ozon_log.txt"
@@ -84,8 +83,9 @@ def write_log(message):
     except Exception as e:
         print(f"⚠️ Не удалось записать в файл: {e}", flush=True)
 
-# ---------- ЗАПРОС К АНАЛИТИКЕ (КОЛИЧЕСТВО) ----------
-def get_ozon_analytics(date_from, date_to, metric_names):
+# ---------- ПОЛУЧЕНИЕ ОТГРУЗОК FBO ----------
+def get_all_postings(date_from, date_to):
+    """Возвращает список всех отгрузок за период."""
     headers = {
         "Client-Id": OZON_CLIENT_ID,
         "Api-Key": OZON_API_KEY,
@@ -94,46 +94,7 @@ def get_ozon_analytics(date_from, date_to, metric_names):
     payload = {
         "date_from": date_from,
         "date_to": date_to,
-        "metrics": metric_names,
-        "dimension": ["day"],
-        "filters": [],
-        "sort": [],
-        "limit": 1000,
-    }
-    max_attempts = 5
-    for attempt in range(max_attempts):
-        try:
-            response = requests.post(OZON_ANALYTICS_URL, headers=headers, json=payload, timeout=15)
-            if response.status_code == 429:
-                wait = 10 * (attempt + 1)
-                write_log(f"⚠️ 429, повтор через {wait} сек (попытка {attempt+1}/{max_attempts})")
-                time.sleep(wait)
-                continue
-            response.raise_for_status()
-            data = response.json()
-            if "result" in data and "data" in data["result"]:
-                return data["result"]["data"]
-            else:
-                write_log("⚠️ Неожиданный формат аналитики")
-                return None
-        except Exception as e:
-            write_log(f"❌ Ошибка аналитики: {e}")
-            if attempt == max_attempts - 1:
-                return None
-            time.sleep(5)
-    return None
-
-# ---------- ЗАПРОС К СПИСКУ ОТГРУЗОК FBO (СУММЫ) ----------
-def get_ozon_postings(date_from, date_to):
-    headers = {
-        "Client-Id": OZON_CLIENT_ID,
-        "Api-Key": OZON_API_KEY,
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "date_from": date_from,
-        "date_to": date_to,
-        "status": "",
+        "status": "",          # все статусы
         "limit": 1000,
         "offset": 0,
     }
@@ -142,90 +103,90 @@ def get_ozon_postings(date_from, date_to):
         try:
             response = requests.post(OZON_POSTING_FBO_URL, headers=headers, json=payload, timeout=15)
             if response.status_code == 429:
+                write_log("⚠️ 429 Too Many Requests, ждём 10 сек")
                 time.sleep(10)
                 continue
             response.raise_for_status()
             data = response.json()
             postings = data.get("result", [])
             if postings and not all_postings:
-                write_log(f"🔍 Пример отгрузки (первая): {json.dumps(postings[0], indent=2, ensure_ascii=False)[:1500]}")
+                write_log(f"🔍 Пример отгрузки: {json.dumps(postings[0], indent=2, ensure_ascii=False)[:800]}")
             all_postings.extend(postings)
             if len(postings) < payload["limit"]:
                 break
             payload["offset"] += payload["limit"]
         except Exception as e:
-            write_log(f"❌ Ошибка получения отгрузок FBO: {e}")
+            write_log(f"❌ Ошибка получения отгрузок: {e}")
             break
     write_log(f"📦 Всего получено отгрузок: {len(all_postings)}")
     return all_postings
 
-def extract_metrics_from_day_data(day_data, metric_names):
-    if not day_data or "metrics" not in day_data:
-        return {name: 0 for name in metric_names}
-    values = day_data["metrics"]
-    while len(values) < len(metric_names):
-        values.append(0)
-    return dict(zip(metric_names, values))
-
-def get_quantities(date_from, date_to):
-    metric_names = ["ordered_units", "delivered_units", "canceled_units"]
-    rows = get_ozon_analytics(date_from, date_to, metric_names)
-    if rows is None:
-        return {}
-    result = {}
-    for row in rows:
-        if "dimensions" in row and len(row["dimensions"]) > 0:
-            date_str = row["dimensions"][0].get("id", "")
-            if date_str:
-                result[date_str] = extract_metrics_from_day_data(row, metric_names)
-    return result
-
-def get_amounts(date_from, date_to):
+def extract_posting_metrics(posting):
     """
-    Извлекает суммы из отгрузок FBO, суммируя price * quantity по товарам.
-    Логирует первые 5 отгрузок для отладки.
+    Извлекает из одной отгрузки:
+      - общее количество товаров (сумма quantity)
+      - общую сумму (сумма price * quantity)
+      - статус отгрузки
+      - дату создания (created_at)
     """
-    postings = get_ozon_postings(date_from, date_to)
-    amounts = {}
-    log_count = 0
+    products = posting.get("products", [])
+    total_units = 0
+    total_sum = 0.0
+    for product in products:
+        qty = int(product.get("quantity", 0))
+        price_str = product.get("price", "0")
+        try:
+            price = float(price_str)
+        except:
+            price = 0.0
+        total_units += qty
+        total_sum += price * qty
+    status = posting.get("status", "")
+    created_at = posting.get("created_at", "")
+    if created_at:
+        date_str = created_at[:10]  # YYYY-MM-DD
+    else:
+        date_str = None
+    return {
+        "date": date_str,
+        "status": status,
+        "units": total_units,
+        "sum": total_sum
+    }
+
+def aggregate_postings(postings):
+    """
+    Агрегирует отгрузки по дням и статусам.
+    Возвращает словарь {date: {metrics}}
+    """
+    aggregated = {}
     for posting in postings:
-        created_at = posting.get("created_at", "")
-        if not created_at:
+        metrics = extract_posting_metrics(posting)
+        date_str = metrics["date"]
+        if not date_str:
             continue
-        date_str = created_at[:10]
-        if date_str not in amounts:
-            amounts[date_str] = {"ordered_sum": 0, "delivered_sum": 0, "canceled_sum": 0}
-
-        # Вычисляем сумму по товарам
-        total = 0.0
-        products = posting.get("products", [])
-        for product in products:
-            price_str = product.get("price", "0")
-            try:
-                price = float(price_str)
-            except:
-                price = 0.0
-            quantity = product.get("quantity", 1)
-            try:
-                qty = int(quantity)
-            except:
-                qty = 1
-            total += price * qty
-
-        status = posting.get("status", "")
+        if date_str not in aggregated:
+            aggregated[date_str] = {
+                "ordered_units": 0,
+                "ordered_sum": 0.0,
+                "delivered_units": 0,
+                "delivered_sum": 0.0,
+                "canceled_units": 0,
+                "canceled_sum": 0.0,
+            }
+        status = metrics["status"]
+        units = metrics["units"]
+        sum_val = metrics["sum"]
         if status in ["cancelled", "canceled"]:
-            amounts[date_str]["canceled_sum"] += total
+            aggregated[date_str]["canceled_units"] += units
+            aggregated[date_str]["canceled_sum"] += sum_val
         elif status in ["delivered", "completed"]:
-            amounts[date_str]["delivered_sum"] += total
+            aggregated[date_str]["delivered_units"] += units
+            aggregated[date_str]["delivered_sum"] += sum_val
         else:
-            amounts[date_str]["ordered_sum"] += total
-
-        # Логируем первые 5 отгрузок для проверки
-        if log_count < 5:
-            write_log(f"🔍 Отгрузка #{log_count+1}: дата={date_str}, статус={status}, сумма={total:.2f}")
-            log_count += 1
-
-    return amounts
+            aggregated[date_str]["ordered_units"] += units
+            aggregated[date_str]["ordered_sum"] += sum_val
+    return aggregated
 
 def get_full_report():
     today = datetime.date.today()
@@ -233,30 +194,25 @@ def get_full_report():
     date_from = first_day.strftime("%Y-%m-%d")
     date_to = today.strftime("%Y-%m-%d")
 
-    quantities = get_quantities(date_from, date_to)
-    amounts = get_amounts(date_from, date_to)
-
-    all_dates = set(quantities.keys()) | set(amounts.keys())
-    full_data = {}
-    for d in all_dates:
-        full_data[d] = {
-            "ordered_units": quantities.get(d, {}).get("ordered_units", 0),
-            "delivered_units": quantities.get(d, {}).get("delivered_units", 0),
-            "canceled_units": quantities.get(d, {}).get("canceled_units", 0),
-            "ordered_sum": amounts.get(d, {}).get("ordered_sum", 0),
-            "delivered_sum": amounts.get(d, {}).get("delivered_sum", 0),
-            "canceled_sum": amounts.get(d, {}).get("canceled_sum", 0),
-        }
+    postings = get_all_postings(date_from, date_to)
+    agg = aggregate_postings(postings)
 
     today_str = today.strftime("%Y-%m-%d")
     yesterday_str = (today - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
 
-    today_data = full_data.get(today_str, {})
-    yesterday_data = full_data.get(yesterday_str, {})
+    today_data = agg.get(today_str, {})
+    yesterday_data = agg.get(yesterday_str, {})
 
-    month_data = {"ordered_units": 0, "delivered_units": 0, "canceled_units": 0,
-                  "ordered_sum": 0, "delivered_sum": 0, "canceled_sum": 0}
-    for d, vals in full_data.items():
+    # Суммируем за месяц
+    month_data = {
+        "ordered_units": 0,
+        "ordered_sum": 0.0,
+        "delivered_units": 0,
+        "delivered_sum": 0.0,
+        "canceled_units": 0,
+        "canceled_sum": 0.0,
+    }
+    for date, vals in agg.items():
         for key in month_data:
             month_data[key] += vals.get(key, 0)
 
