@@ -1,0 +1,304 @@
+import asyncio
+import datetime
+import json
+import os
+import requests
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, ConversationHandler
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+# ---------------------- БЕЗОПАСНОЕ ПОЛУЧЕНИЕ КЛЮЧЕЙ ----------------------
+OZON_CLIENT_ID = os.getenv("OZON_CLIENT_ID")
+OZON_API_KEY = os.getenv("OZON_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
+# -------------------------------------------------------------------------
+
+OZON_ANALYTICS_URL = "https://api-seller.ozon.ru/v1/analytics/data"
+MANAGERS_FILE = "managers.json"
+
+# Состояния для диалога ввода ID
+WAITING_FOR_ADD_ID = 1
+WAITING_FOR_REMOVE_ID = 2
+
+# ---------- РАБОТА СО СПИСКОМ МЕНЕДЖЕРОВ ----------
+def load_managers():
+    if os.path.exists(MANAGERS_FILE):
+        with open(MANAGERS_FILE, "r", encoding="utf-8") as f:
+            try:
+                return json.load(f)
+            except:
+                return []
+    return []
+
+def save_managers(managers):
+    with open(MANAGERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(managers, f, ensure_ascii=False, indent=2)
+
+def is_manager(chat_id):
+    return chat_id in load_managers()
+
+def add_manager(chat_id):
+    managers = load_managers()
+    if chat_id not in managers:
+        managers.append(chat_id)
+        save_managers(managers)
+        return True
+    return False
+
+def remove_manager(chat_id):
+    managers = load_managers()
+    if chat_id in managers:
+        managers.remove(chat_id)
+        save_managers(managers)
+        return True
+    return False
+# ------------------------------------------------
+
+def get_ozon_analytics(date_from, date_to):
+    headers = {
+        "Client-Id": OZON_CLIENT_ID,
+        "Api-Key": OZON_API_KEY,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "date_from": date_from,
+        "date_to": date_to,
+        "metrics": [
+            "ordered_units",
+            "ordered_sum",
+            "delivered_units",
+            "delivered_sum",
+            "canceled_units",
+            "canceled_sum",
+        ],
+        "dimension": ["day"],
+        "filters": [],
+        "sort": [],
+    }
+    try:
+        response = requests.post(OZON_ANALYTICS_URL, headers=headers, json=payload)
+        response.raise_for_status()
+        return response.json()
+    except:
+        return None
+
+def format_sales_message(period_name, analytics_data):
+    if not analytics_data or "result" not in analytics_data:
+        return f"❌ Нет данных за {period_name}."
+    total_ordered_units = 0
+    total_ordered_sum = 0
+    total_delivered_units = 0
+    total_delivered_sum = 0
+    total_canceled_units = 0
+    total_canceled_sum = 0
+    for row in analytics_data["result"]:
+        total_ordered_units += row.get("ordered_units", 0)
+        total_ordered_sum += row.get("ordered_sum", 0)
+        total_delivered_units += row.get("delivered_units", 0)
+        total_delivered_sum += row.get("delivered_sum", 0)
+        total_canceled_units += row.get("canceled_units", 0)
+        total_canceled_sum += row.get("canceled_sum", 0)
+    message = (
+        f"📊 *{period_name}*\n\n"
+        f"🛒 *Заказано*\n  На сумму: {total_ordered_sum:,.2f} ₽\n  Штук: {total_ordered_units}\n\n"
+        f"📦 *Доставлено*\n  На сумму: {total_delivered_sum:,.2f} ₽\n  Штук: {total_delivered_units}\n\n"
+        f"❌ *Отмены*\n  На сумму: {total_canceled_sum:,.2f} ₽\n  Штук: {total_canceled_units}"
+    )
+    return message
+
+async def send_scheduled_report(app):
+    managers = load_managers()
+    if not managers:
+        return
+    today = datetime.date.today()
+    today_str = today.strftime("%Y-%m-%d")
+    yesterday = today - datetime.timedelta(days=1)
+    yesterday_str = yesterday.strftime("%Y-%m-%d")
+    first_day_of_month = today.replace(day=1)
+    month_start_str = first_day_of_month.strftime("%Y-%m-%d")
+    data_today = get_ozon_analytics(today_str, today_str)
+    data_yesterday = get_ozon_analytics(yesterday_str, yesterday_str)
+    data_month = get_ozon_analytics(month_start_str, today_str)
+    msg_today = format_sales_message("Сегодня", data_today)
+    msg_yesterday = format_sales_message("Вчера", data_yesterday)
+    msg_month = format_sales_message("Текущий месяц", data_month)
+    for chat_id in managers:
+        try:
+            await app.bot.send_message(chat_id=chat_id, text=msg_today, parse_mode="Markdown")
+            await app.bot.send_message(chat_id=chat_id, text=msg_yesterday, parse_mode="Markdown")
+            await app.bot.send_message(chat_id=chat_id, text=msg_month, parse_mode="Markdown")
+        except Exception as e:
+            print(f"Ошибка отправки для {chat_id}: {e}")
+
+# ---------- КЛАВИАТУРЫ ----------
+def get_admin_keyboard():
+    """Клавиатура для администратора."""
+    buttons = [
+        [KeyboardButton("📊 Отчёт"), KeyboardButton("👥 Менеджеры (кол-во)")],
+        [KeyboardButton("➕ Добавить менеджера"), KeyboardButton("➖ Удалить менеджера")],
+        [KeyboardButton("📋 Список менеджеров")]
+    ]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+def get_user_keyboard():
+    """Клавиатура для обычного менеджера – только отчёт."""
+    buttons = [
+        [KeyboardButton("📊 Отчёт")]
+    ]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+# ---------- ОБРАБОТЧИКИ СООБЩЕНИЙ ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Приветствие и показ клавиатуры в зависимости от роли."""
+    chat_id = update.effective_chat.id
+    if chat_id == ADMIN_CHAT_ID:
+        await update.message.reply_text(
+            "👋 Добро пожаловать, администратор!\n"
+            "Используйте кнопки ниже для управления.",
+            reply_markup=get_admin_keyboard()
+        )
+    elif is_manager(chat_id):
+        await update.message.reply_text(
+            "👋 Здравствуйте, менеджер!\n"
+            "Нажмите кнопку «Отчёт» для получения статистики.",
+            reply_markup=get_user_keyboard()
+        )
+    else:
+        await update.message.reply_text(
+            "🤖 Бот для статистики Ozon.\n"
+            "Доступ предоставляется только авторизованным менеджерам.\n"
+            "Если вы менеджер, обратитесь к администратору для добавления.",
+            reply_markup=ReplyKeyboardMarkup([], resize_keyboard=True)  # убираем клавиатуру
+        )
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка нажатий на кнопки."""
+    text = update.message.text
+    chat_id = update.effective_chat.id
+
+    # ---- Отчёт ----
+    if text == "📊 Отчёт":
+        if not is_manager(chat_id):
+            await update.message.reply_text("⛔ У вас нет доступа к этой информации.")
+            return
+        today = datetime.date.today()
+        today_str = today.strftime("%Y-%m-%d")
+        yesterday = today - datetime.timedelta(days=1)
+        yesterday_str = yesterday.strftime("%Y-%m-%d")
+        first_day_of_month = today.replace(day=1)
+        month_start_str = first_day_of_month.strftime("%Y-%m-%d")
+        data_today = get_ozon_analytics(today_str, today_str)
+        data_yesterday = get_ozon_analytics(yesterday_str, yesterday_str)
+        data_month = get_ozon_analytics(month_start_str, today_str)
+        msg_today = format_sales_message("Сегодня", data_today)
+        msg_yesterday = format_sales_message("Вчера", data_yesterday)
+        msg_month = format_sales_message("Текущий месяц", data_month)
+        await update.message.reply_text(msg_today, parse_mode="Markdown")
+        await update.message.reply_text(msg_yesterday, parse_mode="Markdown")
+        await update.message.reply_text(msg_month, parse_mode="Markdown")
+        return
+
+    # ---- Количество менеджеров (только для админа) ----
+    if text == "👥 Менеджеры (кол-во)":
+        if chat_id != ADMIN_CHAT_ID:
+            await update.message.reply_text("⛔ Эта информация доступна только администратору.")
+            return
+        managers = load_managers()
+        count = len(managers)
+        await update.message.reply_text(f"📊 Количество авторизованных менеджеров: {count}")
+        return
+
+    # ---- Админские кнопки (только для админа) ----
+    if chat_id != ADMIN_CHAT_ID:
+        await update.message.reply_text("⛔ Эта функция доступна только администратору.")
+        return
+
+    if text == "➕ Добавить менеджера":
+        await update.message.reply_text("Введите ID пользователя, которого хотите добавить (только цифры):")
+        return WAITING_FOR_ADD_ID
+
+    if text == "➖ Удалить менеджера":
+        await update.message.reply_text("Введите ID пользователя, которого хотите удалить (только цифры):")
+        return WAITING_FOR_REMOVE_ID
+
+    if text == "📋 Список менеджеров":
+        managers = load_managers()
+        if not managers:
+            await update.message.reply_text("Список менеджеров пуст.")
+        else:
+            text_list = "📋 Список ID всех менеджеров:\n" + "\n".join(str(m) for m in managers)
+            await update.message.reply_text(text_list)
+        return
+
+    # Если неизвестная кнопка
+    await update.message.reply_text("Неизвестная команда. Используйте кнопки.")
+
+# ---------- ОБРАБОТЧИКИ ВВОДА ID ----------
+async def add_manager_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    try:
+        user_id = int(text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ ID должен быть числом. Попробуйте снова.")
+        return WAITING_FOR_ADD_ID
+    if add_manager(user_id):
+        await update.message.reply_text(f"✅ Менеджер с ID {user_id} добавлен в список.")
+    else:
+        await update.message.reply_text(f"⚠️ Менеджер с ID {user_id} уже есть в списке.")
+    await update.message.reply_text("Что дальше?", reply_markup=get_admin_keyboard())
+    return ConversationHandler.END
+
+async def remove_manager_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    try:
+        user_id = int(text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ ID должен быть числом. Попробуйте снова.")
+        return WAITING_FOR_REMOVE_ID
+    if remove_manager(user_id):
+        await update.message.reply_text(f"✅ Менеджер с ID {user_id} удалён из списка.")
+    else:
+        await update.message.reply_text(f"❌ Менеджер с ID {user_id} не найден в списке.")
+    await update.message.reply_text("Что дальше?", reply_markup=get_admin_keyboard())
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Действие отменено.", reply_markup=get_admin_keyboard())
+    return ConversationHandler.END
+
+# ---------- ЗАПУСК ----------
+def main():
+    if not all([OZON_CLIENT_ID, OZON_API_KEY, TELEGRAM_BOT_TOKEN]) or ADMIN_CHAT_ID == 0:
+        print("ОШИБКА: Не все переменные окружения установлены или ADMIN_CHAT_ID не задан!")
+        return
+
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+
+    conv_handler = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Text("➕ Добавить менеджера"), handle_message),
+            MessageHandler(filters.Text("➖ Удалить менеджера"), handle_message),
+        ],
+        states={
+            WAITING_FOR_ADD_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_manager_input)],
+            WAITING_FOR_REMOVE_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_manager_input)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    application.add_handler(conv_handler)
+
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
+    scheduler.add_job(send_scheduled_report, CronTrigger(hour="9-23", minute="0"), args=[application])
+    scheduler.start()
+
+    print("Бот запущен. Отчёты отправляются менеджерам с 9 до 23 по МСК.")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
