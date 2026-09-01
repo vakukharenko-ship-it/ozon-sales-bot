@@ -618,38 +618,39 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         # Проверяем навигацию: prev_month или next_month
         if "prev_month" in data or "next_month" in data:
-            parts = data.split("_")
-            # parts должно быть ['date', 'prev_month', 'YEAR', 'MONTH']
-            if len(parts) == 4:
-                action = parts[1]  # 'prev_month' или 'next_month'
-                try:
-                    year = int(parts[2])
-                    month = int(parts[3])
-                except ValueError:
-                    await query.edit_message_text("❌ Ошибка в данных навигации.")
-                    return WAITING_DATE_SINGLE
-
-                # Корректируем месяц
-                if action == "prev_month":
-                    month -= 1
-                    if month == 0:
-                        month = 12
-                        year -= 1
-                elif action == "next_month":
-                    month += 1
-                    if month == 13:
-                        month = 1
-                        year += 1
+            # Извлекаем год и месяц с помощью регулярного выражения
+            match = re.search(r'prev_month_(\d+)_(\d+)|next_month_(\d+)_(\d+)', data)
+            if match:
+                if match.group(1) and match.group(2):
+                    year = int(match.group(1))
+                    month = int(match.group(2))
+                    action = "prev_month"
                 else:
-                    await query.edit_message_text("❌ Неизвестное действие.")
-                    return WAITING_DATE_SINGLE
-
-                keyboard = create_calendar(year, month, "date_")
-                await query.edit_message_reply_markup(reply_markup=keyboard)
-                return WAITING_DATE_SINGLE
+                    year = int(match.group(3))
+                    month = int(match.group(4))
+                    action = "next_month"
             else:
                 await query.edit_message_text("❌ Ошибка формата навигации.")
                 return WAITING_DATE_SINGLE
+
+            # Корректируем месяц
+            if action == "prev_month":
+                month -= 1
+                if month == 0:
+                    month = 12
+                    year -= 1
+            elif action == "next_month":
+                month += 1
+                if month == 13:
+                    month = 1
+                    year += 1
+            else:
+                await query.edit_message_text("❌ Неизвестное действие.")
+                return WAITING_DATE_SINGLE
+
+            keyboard = create_calendar(year, month, "date_")
+            await query.edit_message_reply_markup(reply_markup=keyboard)
+            return WAITING_DATE_SINGLE
 
         # Если не навигация, пробуем распарсить дату
         date_str = data[5:]  # убираем "date_"
@@ -773,36 +774,37 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return ConversationHandler.END
 
         if "prev_month" in data or "next_month" in data:
-            parts = data.split("_")
-            if len(parts) == 4:
-                action = parts[1]
-                try:
-                    year = int(parts[2])
-                    month = int(parts[3])
-                except ValueError:
-                    await query.edit_message_text("❌ Ошибка в данных навигации.")
-                    return WAITING_PERIOD_START
-
-                if action == "prev_month":
-                    month -= 1
-                    if month == 0:
-                        month = 12
-                        year -= 1
-                elif action == "next_month":
-                    month += 1
-                    if month == 13:
-                        month = 1
-                        year += 1
+            match = re.search(r'prev_month_(\d+)_(\d+)|next_month_(\d+)_(\d+)', data)
+            if match:
+                if match.group(1) and match.group(2):
+                    year = int(match.group(1))
+                    month = int(match.group(2))
+                    action = "prev_month"
                 else:
-                    await query.edit_message_text("❌ Неизвестное действие.")
-                    return WAITING_PERIOD_START
-
-                keyboard = create_calendar(year, month, "start_")
-                await query.edit_message_reply_markup(reply_markup=keyboard)
-                return WAITING_PERIOD_START
+                    year = int(match.group(3))
+                    month = int(match.group(4))
+                    action = "next_month"
             else:
                 await query.edit_message_text("❌ Ошибка формата навигации.")
                 return WAITING_PERIOD_START
+
+            if action == "prev_month":
+                month -= 1
+                if month == 0:
+                    month = 12
+                    year -= 1
+            elif action == "next_month":
+                month += 1
+                if month == 13:
+                    month = 1
+                    year += 1
+            else:
+                await query.edit_message_text("❌ Неизвестное действие.")
+                return WAITING_PERIOD_START
+
+            keyboard = create_calendar(year, month, "start_")
+            await query.edit_message_reply_markup(reply_markup=keyboard)
+            return WAITING_PERIOD_START
 
         # Парсим дату начала
         date_str = data[6:]  # убираем "start_"
@@ -824,36 +826,37 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return ConversationHandler.END
 
         if "prev_month" in data or "next_month" in data:
-            parts = data.split("_")
-            if len(parts) == 4:
-                action = parts[1]
-                try:
-                    year = int(parts[2])
-                    month = int(parts[3])
-                except ValueError:
-                    await query.edit_message_text("❌ Ошибка в данных навигации.")
-                    return WAITING_PERIOD_END
-
-                if action == "prev_month":
-                    month -= 1
-                    if month == 0:
-                        month = 12
-                        year -= 1
-                elif action == "next_month":
-                    month += 1
-                    if month == 13:
-                        month = 1
-                        year += 1
+            match = re.search(r'prev_month_(\d+)_(\d+)|next_month_(\d+)_(\d+)', data)
+            if match:
+                if match.group(1) and match.group(2):
+                    year = int(match.group(1))
+                    month = int(match.group(2))
+                    action = "prev_month"
                 else:
-                    await query.edit_message_text("❌ Неизвестное действие.")
-                    return WAITING_PERIOD_END
-
-                keyboard = create_calendar(year, month, "end_")
-                await query.edit_message_reply_markup(reply_markup=keyboard)
-                return WAITING_PERIOD_END
+                    year = int(match.group(3))
+                    month = int(match.group(4))
+                    action = "next_month"
             else:
                 await query.edit_message_text("❌ Ошибка формата навигации.")
                 return WAITING_PERIOD_END
+
+            if action == "prev_month":
+                month -= 1
+                if month == 0:
+                    month = 12
+                    year -= 1
+            elif action == "next_month":
+                month += 1
+                if month == 13:
+                    month = 1
+                    year += 1
+            else:
+                await query.edit_message_text("❌ Неизвестное действие.")
+                return WAITING_PERIOD_END
+
+            keyboard = create_calendar(year, month, "end_")
+            await query.edit_message_reply_markup(reply_markup=keyboard)
+            return WAITING_PERIOD_END
 
         # Парсим дату конца
         end_date_str = data[4:]  # убираем "end_"
