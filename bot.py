@@ -32,7 +32,7 @@ ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 # ---------------------------------------------------
 
 OZON_ANALYTICS_URL = "https://api-seller.ozon.ru/v1/analytics/data"
-OZON_ORDER_LIST_URL = "https://api-seller.ozon.ru/v1/order/list"
+OZON_POSTING_FBO_URL = "https://api-seller.ozon.ru/v2/posting/fbo/list"  # ✅ актуальный эндпоинт для FBO
 MANAGERS_FILE = "managers.json"
 LOG_FILE = "/app/data/ozon_log.txt"
 
@@ -124,9 +124,9 @@ def get_ozon_analytics(date_from, date_to, metric_names):
             time.sleep(5)
     return None
 
-# ---------- ЗАПРОС К СПИСКУ ЗАКАЗОВ (СУММЫ) ----------
-def get_ozon_orders(date_from, date_to):
-    """Возвращает список заказов за период."""
+# ---------- ЗАПРОС К СПИСКУ ОТГРУЗОК FBO (СУММЫ) ----------
+def get_ozon_postings(date_from, date_to):
+    """Возвращает список отгрузок FBO за период."""
     headers = {
         "Client-Id": OZON_CLIENT_ID,
         "Api-Key": OZON_API_KEY,
@@ -135,31 +135,29 @@ def get_ozon_orders(date_from, date_to):
     payload = {
         "date_from": date_from,
         "date_to": date_to,
-        "statuses": [],  # все статусы
+        "status": "",          # все статусы
         "limit": 1000,
         "offset": 0,
-        "sort": {"key": "created_at", "direction": "ASC"},
     }
-    all_orders = []
+    all_postings = []
     while True:
         try:
-            response = requests.post(OZON_ORDER_LIST_URL, headers=headers, json=payload, timeout=15)
+            response = requests.post(OZON_POSTING_FBO_URL, headers=headers, json=payload, timeout=15)
             if response.status_code == 429:
                 time.sleep(10)
                 continue
             response.raise_for_status()
             data = response.json()
-            orders = data.get("result", {}).get("items", [])
-            all_orders.extend(orders)
-            if len(orders) < payload["limit"]:
+            postings = data.get("result", [])
+            all_postings.extend(postings)
+            if len(postings) < payload["limit"]:
                 break
             payload["offset"] += payload["limit"]
         except Exception as e:
-            write_log(f"❌ Ошибка получения заказов: {e}")
+            write_log(f"❌ Ошибка получения отгрузок FBO: {e}")
             break
-    return all_orders
+    return all_postings
 
-# ---------- ИЗВЛЕЧЕНИЕ ДАННЫХ ----------
 def extract_metrics_from_day_data(day_data, metric_names):
     if not day_data or "metrics" not in day_data:
         return {name: 0 for name in metric_names}
@@ -183,24 +181,30 @@ def get_quantities(date_from, date_to):
     return result
 
 def get_amounts(date_from, date_to):
-    """Возвращает словарь {дата: {ordered_sum, delivered_sum, canceled_sum}}."""
-    orders = get_ozon_orders(date_from, date_to)
+    """Возвращает словарь {дата: {ordered_sum, delivered_sum, canceled_sum}} на основе отгрузок FBO."""
+    postings = get_ozon_postings(date_from, date_to)
     amounts = {}
-    for order in orders:
-        created_at = order.get("created_at", "")
-        if created_at:
-            date_str = created_at[:10]  # YYYY-MM-DD
-            if date_str not in amounts:
-                amounts[date_str] = {"ordered_sum": 0, "delivered_sum": 0, "canceled_sum": 0}
-            total_price = float(order.get("total_price", 0))
-            status = order.get("status", "")
-            # По статусу распределяем суммы
-            if status in ["cancelled", "canceled"]:
-                amounts[date_str]["canceled_sum"] += total_price
-            elif status in ["delivered", "completed"]:
-                amounts[date_str]["delivered_sum"] += total_price
-            else:
-                amounts[date_str]["ordered_sum"] += total_price
+    for posting in postings:
+        # Дата создания отгрузки
+        created_at = posting.get("created_at", "")
+        if not created_at:
+            continue
+        date_str = created_at[:10]  # YYYY-MM-DD
+        if date_str not in amounts:
+            amounts[date_str] = {"ordered_sum": 0, "delivered_sum": 0, "canceled_sum": 0}
+
+        # Общая сумма заказа в отгрузке
+        total_price = float(posting.get("total_price", 0))
+        status = posting.get("status", "")
+
+        # Распределяем по статусу отгрузки
+        if status in ["cancelled", "canceled"]:
+            amounts[date_str]["canceled_sum"] += total_price
+        elif status in ["delivered", "completed"]:
+            amounts[date_str]["delivered_sum"] += total_price
+        else:
+            amounts[date_str]["ordered_sum"] += total_price
+
     return amounts
 
 def get_full_report():
@@ -243,7 +247,7 @@ def get_full_report():
     return today_data, yesterday_data, month_data
 
 def format_sales_message(period_name, metrics_dict):
-    if not metrics_dict:
+    if not metrics_dict or all(v == 0 for v in metrics_dict.values()):
         return f"❌ Нет данных за {period_name}."
     return (
         f"📊 *{period_name}*\n\n"
