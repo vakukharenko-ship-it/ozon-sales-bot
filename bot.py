@@ -249,21 +249,24 @@ def aggregate_postings(postings, date_from=None, date_to=None):
 # ---------- ЗАПРОСЫ К OZON (PERFORMANCE API - РЕКЛАМА) ----------
 def get_performance_token():
     """
-    Получает Bearer-токен для Performance API, используя Client ID и Client Secret.
+    Получает Bearer-токен для Performance API через эндпоинт /api/client/token.
     """
     if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
         write_log("⚠️ OZON_PERFORMANCE_CLIENT_ID или CLIENT_SECRET не заданы!")
         return None
 
-    url = "https://api-performance.ozon.ru/api/client/oauth/token"
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    data = {
-        "grant_type": "client_credentials",
+    url = "https://api-performance.ozon.ru/api/client/token"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    payload = {
         "client_id": OZON_PERFORMANCE_CLIENT_ID,
-        "client_secret": OZON_PERFORMANCE_CLIENT_SECRET
+        "client_secret": OZON_PERFORMANCE_CLIENT_SECRET,
+        "grant_type": "client_credentials"
     }
     try:
-        response = requests.post(url, headers=headers, data=data, timeout=15)
+        response = requests.post(url, headers=headers, json=payload, timeout=15)
         response.raise_for_status()
         token_data = response.json()
         token = token_data.get("access_token")
@@ -280,7 +283,6 @@ def get_performance_token():
 def fetch_advertising_expense(date_from, date_to):
     """
     Получает сумму расходов на рекламу за период через Performance API.
-    Возвращает float или None в случае ошибки.
     """
     token = get_performance_token()
     if not token:
