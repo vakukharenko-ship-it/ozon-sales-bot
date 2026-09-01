@@ -18,25 +18,24 @@ warnings.filterwarnings("ignore", category=PTBUserWarning)
 OZON_CLIENT_ID = os.getenv("OZON_CLIENT_ID")
 OZON_API_KEY = os.getenv("OZON_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_CHAT_ID = 6134182006  # жёстко задан ID администратора
+ADMIN_CHAT_ID = 6134182006  # ID администратора
 
 OZON_POSTING_FBO_URL = "https://api-seller.ozon.ru/v2/posting/fbo/list"
 MANAGERS_FILE = "managers.json"
 LOG_FILE = "/app/data/ozon_log.txt"
 
-# Состояния для диалогов
+# Состояния
 WAITING_DATE_SINGLE = 1
 WAITING_PERIOD_TYPE = 2
 WAITING_PERIOD_START = 3
 WAITING_PERIOD_END = 4
 WAITING_ADD_MANAGER = 5
 WAITING_REMOVE_MANAGER = 6
-WAITING_MONTH_SELECT = 7
-WAITING_QUARTER_SELECT = 8
-WAITING_YEAR_SELECT = 9
-WAITING_PERIOD_YEAR = 10      # для выбора года перед месяцем/кварталом
-WAITING_PERIOD_MONTH = 11      # выбор месяца после года
-WAITING_PERIOD_QUARTER = 12    # выбор квартала после года
+WAITING_MANAGER_PHONE = 7
+WAITING_PERIOD_YEAR = 8
+WAITING_PERIOD_MONTH = 9
+WAITING_PERIOD_QUARTER = 10
+WAITING_YEAR_SELECT = 11
 # =====================================================
 
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
@@ -65,21 +64,18 @@ def save_managers(managers):
         json.dump(managers, f, ensure_ascii=False, indent=2)
 
 def is_manager(chat_id):
-    """Проверяет, есть ли пользователь в списке менеджеров (по id)."""
     managers = load_managers()
     return any(m.get("id") == chat_id for m in managers)
 
 def get_manager_info(chat_id):
-    """Возвращает информацию о менеджере по id или None."""
     managers = load_managers()
     for m in managers:
         if m.get("id") == chat_id:
             return m
     return None
 
-def add_manager(chat_id, username=None, first_name=None, last_name=None):
+def add_manager(chat_id, username=None, first_name=None, last_name=None, phone=None):
     managers = load_managers()
-    # Проверяем, существует ли уже
     for m in managers:
         if m.get("id") == chat_id:
             return False
@@ -88,6 +84,7 @@ def add_manager(chat_id, username=None, first_name=None, last_name=None):
         "username": username or "",
         "first_name": first_name or "",
         "last_name": last_name or "",
+        "phone": phone or ""
     })
     save_managers(managers)
     return True
@@ -104,8 +101,25 @@ def is_admin(chat_id):
     return chat_id == ADMIN_CHAT_ID
 
 def has_access(chat_id):
-    """Проверяет, имеет ли пользователь доступ к отчётам (админ или менеджер)."""
     return is_admin(chat_id) or is_manager(chat_id)
+
+def get_greeting(name):
+    """Возвращает приветствие в зависимости от времени суток (МСК)."""
+    moscow_tz = datetime.timezone(datetime.timedelta(hours=3))
+    now = datetime.datetime.now(moscow_tz)
+    hour = now.hour
+    if 5 <= hour < 12:
+        part = "Доброе утро"
+    elif 12 <= hour < 18:
+        part = "Добрый день"
+    elif 18 <= hour < 24:
+        part = "Добрый вечер"
+    else:
+        part = "Доброй ночи"
+    if name:
+        return f"{part}, {name}!"
+    else:
+        return f"{part}, уважаемый пользователь!"
 
 # ---------- КАЛЕНДАРЬ ----------
 def create_calendar(year, month, callback_prefix):
@@ -141,7 +155,7 @@ def create_calendar(year, month, callback_prefix):
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data=f"{callback_prefix}cancel")])
     return InlineKeyboardMarkup(keyboard)
 
-# ---------- ПОЛУЧЕНИЕ ДАННЫХ ИЗ OZON ----------
+# ---------- ЗАПРОСЫ К OZON ----------
 def fetch_postings(date_from, date_to):
     headers = {
         "Client-Id": OZON_CLIENT_ID,
@@ -174,7 +188,7 @@ def fetch_postings(date_from, date_to):
         except Exception as e:
             write_log(f"❌ Ошибка получения отгрузок: {e}")
             break
-    write_log(f"📦 Загружено отгрузок: {len(all_postings)} за период {date_from} – {date_to}")
+    write_log(f"📦 Загружено отгрузок: {len(all_postings)} за {date_from}–{date_to}")
     return all_postings
 
 def aggregate_postings(postings, date_from=None, date_to=None):
@@ -323,21 +337,20 @@ def admin_keyboard():
 # ---------- ОБРАБОТЧИКИ КОМАНД ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    user = update.effective_user  # содержит first_name, username и т.д.
+
     if is_admin(chat_id):
-        await update.message.reply_text(
-            "👋 Добро пожаловать, администратор!",
-            reply_markup=main_admin_keyboard()
-        )
+        # Для администратора используем его имя из Telegram
+        name = user.first_name if user.first_name else ""
+        greeting = get_greeting(name)
+        await update.message.reply_text(f"{greeting}\n👋 Добро пожаловать, администратор!", reply_markup=main_admin_keyboard())
     elif is_manager(chat_id):
-        await update.message.reply_text(
-            "👋 Здравствуйте, менеджер!",
-            reply_markup=main_user_keyboard()
-        )
+        manager = get_manager_info(chat_id)
+        name = manager.get("first_name") if manager and manager.get("first_name") else user.first_name or ""
+        greeting = get_greeting(name)
+        await update.message.reply_text(f"{greeting}\n👋 Добро пожаловать, менеджер!", reply_markup=main_user_keyboard())
     else:
-        await update.message.reply_text(
-            "❌ Нет доступа! Обратитесь к администратору.",
-            reply_markup=ReplyKeyboardRemove()
-        )
+        await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.", reply_markup=ReplyKeyboardRemove())
 
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -347,20 +360,14 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not has_access(chat_id):
             await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.")
             return
-        await update.message.reply_text(
-            "Выберите тип отчёта:",
-            reply_markup=reports_keyboard()
-        )
+        await update.message.reply_text("Выберите тип отчёта:", reply_markup=reports_keyboard())
         return
 
     if text == "⚙️ Администрирование":
         if not is_admin(chat_id):
             await update.message.reply_text("⛔ Только для администратора.")
             return
-        await update.message.reply_text(
-            "Управление менеджерами:",
-            reply_markup=admin_keyboard()
-        )
+        await update.message.reply_text("Управление менеджерами:", reply_markup=admin_keyboard())
         return
 
     await update.message.reply_text("Используйте кнопки меню.")
@@ -369,49 +376,28 @@ async def handle_reports_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = update.message.text
     chat_id = update.effective_chat.id
 
-    # Кнопка "Назад" доступна всем, кто дошёл до меню
     if text == "🔙 Назад":
         if is_admin(chat_id):
-            await update.message.reply_text(
-                "Главное меню",
-                reply_markup=main_admin_keyboard()
-            )
+            await update.message.reply_text("Главное меню", reply_markup=main_admin_keyboard())
         else:
-            await update.message.reply_text(
-                "Главное меню",
-                reply_markup=main_user_keyboard()
-            )
+            await update.message.reply_text("Главное меню", reply_markup=main_user_keyboard())
         return
 
-    # Все остальные пункты требуют прав
     if not has_access(chat_id):
         await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.")
         return
 
     if text == "📅 Текущие показатели":
         today_m, yesterday_m, month_m = get_current_metrics()
-        await update.message.reply_text(
-            format_metrics(today_m, "Сегодня"),
-            parse_mode="Markdown"
-        )
-        await update.message.reply_text(
-            format_metrics(yesterday_m, "Вчера"),
-            parse_mode="Markdown"
-        )
-        await update.message.reply_text(
-            format_metrics(month_m, "Текущий месяц"),
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text(format_metrics(today_m, "Сегодня"), parse_mode="Markdown")
+        await update.message.reply_text(format_metrics(yesterday_m, "Вчера"), parse_mode="Markdown")
+        await update.message.reply_text(format_metrics(month_m, "Текущий месяц"), parse_mode="Markdown")
         return
 
     if text == "📆 Выбрать дату":
         now = datetime.date.today()
-        year, month = now.year, now.month
-        keyboard = create_calendar(year, month, "date_")
-        await update.message.reply_text(
-            "Выберите дату:",
-            reply_markup=keyboard
-        )
+        keyboard = create_calendar(now.year, now.month, "date_")
+        await update.message.reply_text("Выберите дату:", reply_markup=keyboard)
         return WAITING_DATE_SINGLE
 
     if text == "📊 Выбрать период":
@@ -422,10 +408,7 @@ async def handle_reports_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
             [InlineKeyboardButton("📊 Произвольный период", callback_data="period_custom")],
             [InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")]
         ])
-        await update.message.reply_text(
-            "Выберите тип периода:",
-            reply_markup=keyboard
-        )
+        await update.message.reply_text("Выберите тип периода:", reply_markup=keyboard)
         return WAITING_PERIOD_TYPE
 
     await update.message.reply_text("Неизвестная команда.")
@@ -437,7 +420,6 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text
-
     if text == "📋 Список менеджеров":
         managers = load_managers()
         if not managers:
@@ -450,80 +432,59 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     info += f", @{m.get('username')}"
                 if m.get('first_name'):
                     info += f", {m.get('first_name')}"
+                if m.get('phone'):
+                    info += f", 📞 {m.get('phone')}"
                 lines.append(info)
             await update.message.reply_text("\n".join(lines))
         return
 
     if text == "🔙 Назад":
-        await update.message.reply_text(
-            "Главное меню",
-            reply_markup=main_admin_keyboard()
-        )
+        await update.message.reply_text("Главное меню", reply_markup=main_admin_keyboard())
         return
 
     await update.message.reply_text("Неизвестная команда.")
 
-# ---------- ОБРАБОТЧИКИ INLINE CALLBACK ----------
+# ---------- INLINE CALLBACK ----------
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
     chat_id = update.effective_chat.id
 
-    # Проверка прав для всех callback, кроме отмены
     if not has_access(chat_id):
         await query.edit_message_text("❌ Нет доступа! Обратитесь к администратору.")
         return ConversationHandler.END
 
-    # ----- Календарь (выбор даты) -----
+    # Обработка календаря (дата)
     if data.startswith("date_"):
         if data == "date_cancel":
             await query.edit_message_text("Выбор даты отменён.")
-            await query.message.reply_text(
-                "Выберите действие:",
-                reply_markup=reports_keyboard()
-            )
+            await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
             return ConversationHandler.END
-
         parts = data.split("_")
         if len(parts) == 4 and parts[1] in ("prev_month", "next_month"):
-            action = parts[1]
-            year = int(parts[2])
-            month = int(parts[3])
+            action, year, month = parts[1], int(parts[2]), int(parts[3])
             if action == "prev_month":
-                if month == 1:
-                    month = 12
-                    year -= 1
-                else:
-                    month -= 1
-            elif action == "next_month":
-                if month == 12:
-                    month = 1
-                    year += 1
-                else:
-                    month += 1
+                month -= 1
+                if month == 0: month, year = 12, year-1
+            else:
+                month += 1
+                if month == 13: month, year = 1, year+1
             keyboard = create_calendar(year, month, "date_")
             await query.edit_message_reply_markup(reply_markup=keyboard)
             return WAITING_DATE_SINGLE
-
-        # Выбор конкретной даты: date_2025-05-01
         date_str = data[5:]
         if re.match(r"\d{4}-\d{2}-\d{2}", date_str):
             metrics = get_metrics_for_date(date_str)
             msg = format_metrics(metrics, f"Отчёт за {date_str}")
             await query.edit_message_text(msg, parse_mode="Markdown")
-            await query.message.reply_text(
-                "Выберите действие:",
-                reply_markup=reports_keyboard()
-            )
+            await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
             return ConversationHandler.END
-        else:
-            await query.edit_message_text("Ошибка формата даты.")
-            return WAITING_DATE_SINGLE
+        await query.edit_message_text("Ошибка формата даты.")
+        return WAITING_DATE_SINGLE
 
-    # ----- Выбор периода (общие) -----
+    # Выбор периода (общее)
     if data == "period_month":
-        # Показываем выбор года
         current_year = datetime.date.today().year
         years = list(range(current_year - 9, current_year + 1))
         buttons = [[InlineKeyboardButton(str(y), callback_data=f"period_year_month_{y}")] for y in years]
@@ -549,24 +510,19 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     if data == "period_custom":
         now = datetime.date.today()
-        year, month = now.year, now.month
-        keyboard = create_calendar(year, month, "start_")
+        keyboard = create_calendar(now.year, now.month, "start_")
         await query.edit_message_text("Выберите начальную дату:", reply_markup=keyboard)
         return WAITING_PERIOD_START
 
     if data == "period_cancel":
         await query.edit_message_text("Выбор периода отменён.")
-        await query.message.reply_text(
-            "Выберите действие:",
-            reply_markup=reports_keyboard()
-        )
+        await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
         return ConversationHandler.END
 
-    # ----- Выбор года для месяца -----
+    # Выбор года для месяца
     if data.startswith("period_year_month_"):
         year = int(data.split("_")[-1])
         context.user_data['period_year'] = year
-        # Показываем список месяцев
         months = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
                   "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
         buttons = [[InlineKeyboardButton(name, callback_data=f"period_month_{i}_{year}")] for i, name in enumerate(months, 1)]
@@ -574,7 +530,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(f"Выберите месяц {year}:", reply_markup=InlineKeyboardMarkup(buttons))
         return WAITING_PERIOD_MONTH
 
-    # ----- Выбор года для квартала -----
+    # Выбор года для квартала
     if data.startswith("period_year_quarter_"):
         year = int(data.split("_")[-1])
         context.user_data['period_year'] = year
@@ -584,48 +540,37 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(f"Выберите квартал {year}:", reply_markup=InlineKeyboardMarkup(buttons))
         return WAITING_PERIOD_QUARTER
 
-    # ----- Выбор только года -----
+    # Только год
     if data.startswith("period_year_only_"):
         year = int(data.split("_")[-1])
         first_day = datetime.date(year, 1, 1)
         last_day = datetime.date(year, 12, 31)
-        date_from = first_day.strftime("%Y-%m-%d")
-        date_to = last_day.strftime("%Y-%m-%d")
-        metrics = get_metrics_for_period(date_from, date_to)
+        metrics = get_metrics_for_period(first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d"))
         msg = format_metrics(metrics, f"Год {year}")
         await query.edit_message_text(msg, parse_mode="Markdown")
-        await query.message.reply_text(
-            "Выберите действие:",
-            reply_markup=reports_keyboard()
-        )
+        await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
         return ConversationHandler.END
 
-    # ----- Месяц (после выбора года) -----
+    # Месяц после выбора года
     if data.startswith("period_month_"):
         parts = data.split("_")
-        month_num = int(parts[2])
-        year = int(parts[3])
+        month_num, year = int(parts[2]), int(parts[3])
         first_day = datetime.date(year, month_num, 1)
         if month_num == 12:
             last_day = datetime.date(year, 12, 31)
         else:
             last_day = datetime.date(year, month_num+1, 1) - datetime.timedelta(days=1)
-        date_from = first_day.strftime("%Y-%m-%d")
-        date_to = last_day.strftime("%Y-%m-%d")
+        date_from, date_to = first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d")
         metrics = get_metrics_for_period(date_from, date_to)
         msg = format_metrics(metrics, f"Месяц {first_day.strftime('%B %Y')}")
         await query.edit_message_text(msg, parse_mode="Markdown")
-        await query.message.reply_text(
-            "Выберите действие:",
-            reply_markup=reports_keyboard()
-        )
+        await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
         return ConversationHandler.END
 
-    # ----- Квартал (после выбора года) -----
+    # Квартал после выбора года
     if data.startswith("period_quarter_"):
         parts = data.split("_")
-        q = int(parts[2])
-        year = int(parts[3])
+        q, year = int(parts[2]), int(parts[3])
         start_month = (q-1)*3 + 1
         end_month = q*3
         first_day = datetime.date(year, start_month, 1)
@@ -633,43 +578,28 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             last_day = datetime.date(year, 12, 31)
         else:
             last_day = datetime.date(year, end_month+1, 1) - datetime.timedelta(days=1)
-        date_from = first_day.strftime("%Y-%m-%d")
-        date_to = last_day.strftime("%Y-%m-%d")
+        date_from, date_to = first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d")
         metrics = get_metrics_for_period(date_from, date_to)
         msg = format_metrics(metrics, f"{q} квартал {year}")
         await query.edit_message_text(msg, parse_mode="Markdown")
-        await query.message.reply_text(
-            "Выберите действие:",
-            reply_markup=reports_keyboard()
-        )
+        await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
         return ConversationHandler.END
 
-    # ----- Календарь для произвольного периода (начало) -----
+    # Произвольный период – начало
     if data.startswith("start_"):
         if data == "start_cancel":
             await query.edit_message_text("Выбор периода отменён.")
-            await query.message.reply_text(
-                "Выберите действие:",
-                reply_markup=reports_keyboard()
-            )
+            await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
             return ConversationHandler.END
         parts = data.split("_")
         if len(parts) == 4 and parts[1] in ("prev_month", "next_month"):
-            action = parts[1]
-            year = int(parts[2])
-            month = int(parts[3])
+            action, year, month = parts[1], int(parts[2]), int(parts[3])
             if action == "prev_month":
-                if month == 1:
-                    month = 12
-                    year -= 1
-                else:
-                    month -= 1
-            elif action == "next_month":
-                if month == 12:
-                    month = 1
-                    year += 1
-                else:
-                    month += 1
+                month -= 1
+                if month == 0: month, year = 12, year-1
+            else:
+                month += 1
+                if month == 13: month, year = 1, year+1
             keyboard = create_calendar(year, month, "start_")
             await query.edit_message_reply_markup(reply_markup=keyboard)
             return WAITING_PERIOD_START
@@ -677,43 +607,27 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if re.match(r"\d{4}-\d{2}-\d{2}", date_str):
             context.user_data['period_start_date'] = date_str
             now = datetime.date.today()
-            year, month = now.year, now.month
-            keyboard = create_calendar(year, month, "end_")
-            await query.edit_message_text(
-                f"Начало: {date_str}\nТеперь выберите конечную дату:",
-                reply_markup=keyboard
-            )
+            keyboard = create_calendar(now.year, now.month, "end_")
+            await query.edit_message_text(f"Начало: {date_str}\nТеперь выберите конечную дату:", reply_markup=keyboard)
             return WAITING_PERIOD_END
-        else:
-            await query.edit_message_text("Ошибка формата даты.")
-            return WAITING_PERIOD_START
+        await query.edit_message_text("Ошибка формата даты.")
+        return WAITING_PERIOD_START
 
-    # ----- Календарь для произвольного периода (конец) -----
+    # Произвольный период – конец
     if data.startswith("end_"):
         if data == "end_cancel":
             await query.edit_message_text("Выбор периода отменён.")
-            await query.message.reply_text(
-                "Выберите действие:",
-                reply_markup=reports_keyboard()
-            )
+            await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
             return ConversationHandler.END
         parts = data.split("_")
         if len(parts) == 4 and parts[1] in ("prev_month", "next_month"):
-            action = parts[1]
-            year = int(parts[2])
-            month = int(parts[3])
+            action, year, month = parts[1], int(parts[2]), int(parts[3])
             if action == "prev_month":
-                if month == 1:
-                    month = 12
-                    year -= 1
-                else:
-                    month -= 1
-            elif action == "next_month":
-                if month == 12:
-                    month = 1
-                    year += 1
-                else:
-                    month += 1
+                month -= 1
+                if month == 0: month, year = 12, year-1
+            else:
+                month += 1
+                if month == 13: month, year = 1, year+1
             keyboard = create_calendar(year, month, "end_")
             await query.edit_message_reply_markup(reply_markup=keyboard)
             return WAITING_PERIOD_END
@@ -721,39 +635,29 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if re.match(r"\d{4}-\d{2}-\d{2}", end_date_str):
             start_date = context.user_data.get('period_start_date')
             if not start_date:
-                await query.edit_message_text("Ошибка: не найдена начальная дата. Попробуйте снова.")
+                await query.edit_message_text("Ошибка: начальная дата не найдена. Попробуйте снова.")
                 return ConversationHandler.END
             if start_date > end_date_str:
-                await query.edit_message_text("❌ Начальная дата не может быть позже конечной. Попробуйте сначала.")
+                await query.edit_message_text("❌ Начальная дата позже конечной. Попробуйте сначала.")
                 now = datetime.date.today()
-                year, month = now.year, now.month
-                keyboard = create_calendar(year, month, "start_")
-                await query.message.reply_text(
-                    "Выберите начальную дату заново:",
-                    reply_markup=keyboard
-                )
+                keyboard = create_calendar(now.year, now.month, "start_")
+                await query.message.reply_text("Выберите начальную дату заново:", reply_markup=keyboard)
                 return WAITING_PERIOD_START
             metrics = get_metrics_for_period(start_date, end_date_str)
             msg = format_metrics(metrics, f"Период {start_date} – {end_date_str}")
             await query.edit_message_text(msg, parse_mode="Markdown")
-            await query.message.reply_text(
-                "Выберите действие:",
-                reply_markup=reports_keyboard()
-            )
+            await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
             context.user_data.pop('period_start_date', None)
             return ConversationHandler.END
-        else:
-            await query.edit_message_text("Ошибка формата даты.")
-            return WAITING_PERIOD_END
+        await query.edit_message_text("Ошибка формата даты.")
+        return WAITING_PERIOD_END
 
     await query.edit_message_text("Неизвестная команда.")
     return ConversationHandler.END
 
-# ---------- ДИАЛОГИ ДЛЯ АДМИНИСТРИРОВАНИЯ ----------
+# ---------- АДМИНИСТРИРОВАНИЕ (добавление/удаление) ----------
 async def add_manager_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Введите ID пользователя (число) или username (без @):"
-    )
+    await update.message.reply_text("Введите ID (число) или username (без @):")
     return WAITING_ADD_MANAGER
 
 async def add_manager_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -767,49 +671,70 @@ async def add_manager_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Введите ID или username.")
         return WAITING_ADD_MANAGER
 
-    # Определяем, является ли ввод числом (ID)
     if text.isdigit():
         user_id = int(text)
-        # Пытаемся получить информацию о пользователе через бота
         try:
             user = await context.bot.get_chat(user_id)
             username = user.username or ""
             first_name = user.first_name or ""
             last_name = user.last_name or ""
-        except Exception as e:
-            await update.message.reply_text(f"❌ Не удалось получить информацию о пользователе с ID {user_id}. Убедитесь, что пользователь уже написал боту.")
+        except Exception:
+            await update.message.reply_text(f"❌ Не удалось найти пользователя с ID {user_id}. Убедитесь, что он уже написал боту.")
             return WAITING_ADD_MANAGER
     else:
-        # Это username (без @)
         username = text.lstrip('@')
         try:
             user = await context.bot.get_chat(username)
             user_id = user.id
             first_name = user.first_name or ""
             last_name = user.last_name or ""
-        except Exception as e:
-            await update.message.reply_text(f"❌ Не удалось найти пользователя с username @{username}. Убедитесь, что пользователь уже написал боту.")
+        except Exception:
+            await update.message.reply_text(f"❌ Не удалось найти пользователя @{username}. Убедитесь, что он уже написал боту.")
             return WAITING_ADD_MANAGER
 
-    # Проверяем, не является ли пользователь администратором
     if user_id == ADMIN_CHAT_ID:
         await update.message.reply_text("❌ Администратор уже имеет доступ.")
         return WAITING_ADD_MANAGER
 
-    if add_manager(user_id, username, first_name, last_name):
+    context.user_data['new_manager'] = {
+        'id': user_id,
+        'username': username,
+        'first_name': first_name,
+        'last_name': last_name
+    }
+    await update.message.reply_text("Введите номер телефона менеджера (или '-' чтобы пропустить):")
+    return WAITING_MANAGER_PHONE
+
+async def add_manager_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await update.message.reply_text("⛔ Только для администратора.")
+        return ConversationHandler.END
+
+    phone = update.message.text.strip()
+    if phone == "-":
+        phone = ""
+
+    data = context.user_data.get('new_manager')
+    if not data:
+        await update.message.reply_text("❌ Ошибка: данные менеджера потеряны. Начните заново.")
+        return ConversationHandler.END
+
+    user_id = data['id']
+    username = data['username']
+    first_name = data['first_name']
+    last_name = data['last_name']
+
+    if add_manager(user_id, username, first_name, last_name, phone):
         await update.message.reply_text(f"✅ Менеджер с ID {user_id} (username: @{username}) добавлен.")
     else:
         await update.message.reply_text(f"⚠️ Менеджер с ID {user_id} уже существует.")
-    await update.message.reply_text(
-        "Управление менеджерами:",
-        reply_markup=admin_keyboard()
-    )
+    context.user_data.pop('new_manager', None)
+    await update.message.reply_text("Управление менеджерами:", reply_markup=admin_keyboard())
     return ConversationHandler.END
 
 async def remove_manager_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Введите ID пользователя (только цифры):"
-    )
+    await update.message.reply_text("Введите ID менеджера (цифры):")
     return WAITING_REMOVE_MANAGER
 
 async def remove_manager_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -821,9 +746,7 @@ async def remove_manager_input(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         user_id = int(update.message.text.strip())
     except ValueError:
-        await update.message.reply_text(
-            "❌ Ошибка: ID должен быть числом. Попробуйте снова."
-        )
+        await update.message.reply_text("❌ Введите число.")
         return WAITING_REMOVE_MANAGER
 
     if user_id == ADMIN_CHAT_ID:
@@ -834,22 +757,13 @@ async def remove_manager_input(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"✅ Менеджер с ID {user_id} удалён.")
     else:
         await update.message.reply_text(f"❌ Менеджер с ID {user_id} не найден.")
-    await update.message.reply_text(
-        "Управление менеджерами:",
-        reply_markup=admin_keyboard()
-    )
+    await update.message.reply_text("Управление менеджерами:", reply_markup=admin_keyboard())
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    if is_admin(chat_id):
-        keyboard = main_admin_keyboard()
-    else:
-        keyboard = main_user_keyboard()
-    await update.message.reply_text(
-        "Действие отменено.",
-        reply_markup=keyboard
-    )
+    keyboard = main_admin_keyboard() if is_admin(chat_id) else main_user_keyboard()
+    await update.message.reply_text("Действие отменено.", reply_markup=keyboard)
     return ConversationHandler.END
 
 # ---------- ЗАПУСК ----------
@@ -859,41 +773,26 @@ def main():
         return
 
     write_log("🚀 Запуск бота...")
-
-    application = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .connect_timeout(30.0)
-        .read_timeout(30.0)
-        .write_timeout(30.0)
-        .build()
-    )
+    application = (Application.builder()
+                   .token(TELEGRAM_BOT_TOKEN)
+                   .connect_timeout(30.0)
+                   .read_timeout(30.0)
+                   .write_timeout(30.0)
+                   .build())
 
     application.add_handler(CommandHandler("start", start))
 
-    application.add_handler(MessageHandler(
-        filters.Text(["📊 Отчёт", "⚙️ Администрирование"]),
-        handle_main_menu
-    ))
-    application.add_handler(MessageHandler(
-        filters.Text(["📅 Текущие показатели", "📆 Выбрать дату", "📊 Выбрать период", "🔙 Назад"]),
-        handle_reports_menu
-    ))
-    application.add_handler(MessageHandler(
-        filters.Text(["📋 Список менеджеров", "🔙 Назад"]),
-        handle_admin_menu
-    ))
+    application.add_handler(MessageHandler(filters.Text(["📊 Отчёт", "⚙️ Администрирование"]), handle_main_menu))
+    application.add_handler(MessageHandler(filters.Text(["📅 Текущие показатели", "📆 Выбрать дату", "📊 Выбрать период", "🔙 Назад"]), handle_reports_menu))
+    application.add_handler(MessageHandler(filters.Text(["📋 Список менеджеров", "🔙 Назад"]), handle_admin_menu))
 
-    # ConversationHandler для выбора даты
+    # Диалоги
     conv_date = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📆 Выбрать дату"), handle_reports_menu)],
-        states={
-            WAITING_DATE_SINGLE: [CallbackQueryHandler(handle_callback_query)],
-        },
+        states={WAITING_DATE_SINGLE: [CallbackQueryHandler(handle_callback_query)]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    # ConversationHandler для выбора периода
     conv_period = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📊 Выбрать период"), handle_reports_menu)],
         states={
@@ -908,60 +807,55 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    conv_add_manager = ConversationHandler(
+    conv_add = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➕ Добавить менеджера"), add_manager_start)],
         states={
             WAITING_ADD_MANAGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_manager_input)],
+            WAITING_MANAGER_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_manager_phone)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    conv_remove_manager = ConversationHandler(
+    conv_remove = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➖ Удалить менеджера"), remove_manager_start)],
-        states={
-            WAITING_REMOVE_MANAGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_manager_input)],
-        },
+        states={WAITING_REMOVE_MANAGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_manager_input)]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
     application.add_handler(conv_date)
     application.add_handler(conv_period)
-    application.add_handler(conv_add_manager)
-    application.add_handler(conv_remove_manager)
+    application.add_handler(conv_add)
+    application.add_handler(conv_remove)
 
     application.add_handler(CallbackQueryHandler(handle_callback_query))
 
-    # Планировщик автоматических отчётов
+    # Планировщик отчётов
     async def scheduled_report(context):
         moscow_tz = datetime.timezone(datetime.timedelta(hours=3))
         now = datetime.datetime.now(moscow_tz)
         if not (9 <= now.hour <= 23):
             return
-
         managers = load_managers()
         if not managers:
             return
-
         today_m, yesterday_m, month_m = get_current_metrics()
         msg_today = format_metrics(today_m, "Сегодня")
         msg_yesterday = format_metrics(yesterday_m, "Вчера")
         msg_month = format_metrics(month_m, "Текущий месяц")
-
         for m in managers:
-            chat_id = m.get("id")
             try:
-                await context.bot.send_message(chat_id=chat_id, text=msg_today, parse_mode="Markdown")
-                await context.bot.send_message(chat_id=chat_id, text=msg_yesterday, parse_mode="Markdown")
-                await context.bot.send_message(chat_id=chat_id, text=msg_month, parse_mode="Markdown")
+                await context.bot.send_message(chat_id=m['id'], text=msg_today, parse_mode="Markdown")
+                await context.bot.send_message(chat_id=m['id'], text=msg_yesterday, parse_mode="Markdown")
+                await context.bot.send_message(chat_id=m['id'], text=msg_month, parse_mode="Markdown")
             except Exception as e:
-                write_log(f"❌ Ошибка отправки для {chat_id}: {e}")
+                write_log(f"Ошибка отправки {m['id']}: {e}")
 
     job_queue = application.job_queue
     if job_queue:
         job_queue.run_repeating(scheduled_report, interval=60*60, first=0)
-        write_log("✅ Планировщик отчётов запущен (каждый час с 9:00 до 23:00 МСК).")
+        write_log("✅ Планировщик запущен.")
     else:
-        write_log("⚠️ JobQueue недоступен! Автоматические отчёты не будут работать.")
+        write_log("⚠️ JobQueue недоступен.")
 
     write_log("🚀 Бот готов.")
     application.run_polling(allowed_updates=Update.ALL_TYPES, timeout=30)
