@@ -197,6 +197,11 @@ def fetch_postings(date_from, date_to):
     return all_postings
 
 def aggregate_postings(postings, date_from=None, date_to=None):
+    """
+    Агрегирует отгрузки по дням.
+    Для метрик продаж (заказано, доставлено, отмены) используется цена продавца (old_price, если есть, иначе price).
+    Для налога используется цена покупателя (price).
+    """
     aggregated = {}
     for posting in postings:
         created_at = posting.get("created_at", "")
@@ -210,41 +215,60 @@ def aggregate_postings(postings, date_from=None, date_to=None):
 
         products = posting.get("products", [])
         total_units = 0
-        total_sum = 0.0
+        total_sum_seller = 0.0   # сумма по цене продавца (для метрик)
+        total_sum_buyer = 0.0    # сумма по цене покупателя (для налога)
         for product in products:
             qty = int(product.get("quantity", 0))
-            price_str = product.get("price", "0")
+            # Цена покупателя (фактическая оплата)
+            price_buyer_str = product.get("price", "0")
             try:
-                price = float(price_str)
+                price_buyer = float(price_buyer_str)
             except:
-                price = 0.0
+                price_buyer = 0.0
+            # Цена продавца (базовая). Используем old_price, если есть, иначе price_buyer
+            price_seller_str = product.get("old_price")  # может быть None
+            if price_seller_str is not None:
+                try:
+                    price_seller = float(price_seller_str)
+                except:
+                    price_seller = price_buyer
+            else:
+                price_seller = price_buyer
             total_units += qty
-            total_sum += price * qty
+            total_sum_seller += price_seller * qty
+            total_sum_buyer += price_buyer * qty
 
+        status = posting.get("status", "")
         if date_str not in aggregated:
             aggregated[date_str] = {
+                # Метрики продаж (по цене продавца)
                 "ordered_units": 0,
                 "ordered_sum": 0.0,
                 "delivered_units": 0,
                 "delivered_sum": 0.0,
                 "canceled_units": 0,
                 "canceled_sum": 0.0,
+                # Для налога (по цене покупателя)
+                "taxable_delivered_sum": 0.0,
             }
 
+        # Все отгрузки добавляем в "заказано" (по цене продавца)
         aggregated[date_str]["ordered_units"] += total_units
-        aggregated[date_str]["ordered_sum"] += total_sum
+        aggregated[date_str]["ordered_sum"] += total_sum_seller
 
-        status = posting.get("status", "")
+        # По статусу распределяем в доставленные/отмены (по цене продавца)
         if status in ("cancelled", "canceled"):
             aggregated[date_str]["canceled_units"] += total_units
-            aggregated[date_str]["canceled_sum"] += total_sum
+            aggregated[date_str]["canceled_sum"] += total_sum_seller
         elif status in ("delivered", "completed"):
             aggregated[date_str]["delivered_units"] += total_units
-            aggregated[date_str]["delivered_sum"] += total_sum
+            aggregated[date_str]["delivered_sum"] += total_sum_seller
+            # Для налога используем цену покупателя
+            aggregated[date_str]["taxable_delivered_sum"] += total_sum_buyer
+        # остальные статусы остаются только в "заказано"
 
     return aggregated
 
-# ---------- РЕКЛАМНЫЕ РАСХОДЫ ----------
 def get_performance_token():
     if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
         write_log("⚠️ OZON_PERFORMANCE_CLIENT_ID или CLIENT_SECRET не заданы!")
@@ -341,7 +365,6 @@ def fetch_advertising_expense(date_from, date_to):
         write_log(f"❌ Ошибка получения рекламных расходов: {e}")
         return None
 
-# ---------- ОСНОВНЫЕ ФУНКЦИИ ДЛЯ ОТЧЁТОВ ----------
 def get_metrics_for_date(date_str):
     today = get_moscow_today()
     start = (today - datetime.timedelta(days=183)).strftime("%Y-%m-%d")
@@ -352,22 +375,23 @@ def get_metrics_for_date(date_str):
     ad_expense = fetch_advertising_expense(date_str, date_str)
     metrics["ad_expense"] = ad_expense if ad_expense is not None else 0.0
 
-    # Обычный ДРР (от всех заказов)
+    # Обычный ДРР (от всех заказов по цене продавца)
     revenue = metrics.get("ordered_sum", 0)
     if revenue > 0 and ad_expense is not None:
         metrics["drr"] = (ad_expense / revenue) * 100
     else:
         metrics["drr"] = None
 
-    # Эффективный ДРР (от доставленных заказов)
+    # Эффективный ДРР (от доставленных заказов по цене продавца)
     delivered_revenue = metrics.get("delivered_sum", 0)
     if delivered_revenue > 0 and ad_expense is not None:
         metrics["effective_drr"] = (ad_expense / delivered_revenue) * 100
     else:
         metrics["effective_drr"] = None
 
-    # Налог (7% от суммы доставленных заказов)
-    metrics["tax"] = delivered_revenue * TAX_RATE
+    # Налог считаем от суммы доставленных по цене покупателя
+    taxable_delivered = metrics.get("taxable_delivered_sum", 0)
+    metrics["tax"] = taxable_delivered * TAX_RATE
 
     return metrics
 
@@ -381,6 +405,7 @@ def get_metrics_for_period(date_from, date_to):
         "delivered_sum": 0.0,
         "canceled_units": 0,
         "canceled_sum": 0.0,
+        "taxable_delivered_sum": 0.0,
     }
     for vals in agg.values():
         for key in total:
@@ -400,7 +425,7 @@ def get_metrics_for_period(date_from, date_to):
     else:
         total["effective_drr"] = None
 
-    total["tax"] = delivered_revenue * TAX_RATE
+    total["tax"] = total.get("taxable_delivered_sum", 0) * TAX_RATE
 
     return total
 
@@ -425,12 +450,12 @@ def get_current_metrics():
         "delivered_sum": 0.0,
         "canceled_units": 0,
         "canceled_sum": 0.0,
+        "taxable_delivered_sum": 0.0,
     }
     for vals in agg.values():
         for key in month_data:
             month_data[key] += vals.get(key, 0)
 
-    # Функция для расчёта ДРР, эффективного ДРР и налога
     def add_drr_and_tax(metrics, ad_expense):
         metrics["ad_expense"] = ad_expense if ad_expense is not None else 0.0
         revenue = metrics.get("ordered_sum", 0)
@@ -443,7 +468,7 @@ def get_current_metrics():
             metrics["effective_drr"] = (ad_expense / delivered_revenue) * 100
         else:
             metrics["effective_drr"] = None
-        metrics["tax"] = delivered_revenue * TAX_RATE
+        metrics["tax"] = metrics.get("taxable_delivered_sum", 0) * TAX_RATE
         return metrics
 
     ad_expense_today = fetch_advertising_expense(today_str, today_str)
@@ -457,13 +482,12 @@ def get_current_metrics():
 
     return today_data, yesterday_data, month_data
 
-# ---------- ФОРМАТИРОВАНИЕ ----------
 def format_metrics(metrics, title):
     if not metrics:
         return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
     has_data = False
     for key, val in metrics.items():
-        if key in ["drr", "effective_drr", "ad_expense", "tax"]:
+        if key in ["drr", "effective_drr", "ad_expense", "tax", "taxable_delivered_sum"]:
             continue
         if isinstance(val, (int, float)) and val != 0:
             has_data = True
@@ -491,7 +515,7 @@ def format_metrics(metrics, title):
         f"  ДРР (общий): {drr_text}\n"
         f"  ДРР (по доставленным): {eff_drr_text}\n\n"
         f"🧾 *Налоги*\n"
-        f"  Налог (7% от доставленных): {tax:,.2f} ₽"
+        f"  Налог (7% от оплаченной суммы): {tax:,.2f} ₽"
     )
 
 # ---------- КЛАВИАТУРЫ ----------
@@ -628,7 +652,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("❌ Нет доступа! Обратитесь к администратору.")
         return ConversationHandler.END
 
-    # ---------- КАЛЕНДАРЬ ВЫБОРА ДАТЫ ----------
     if data.startswith("date_"):
         if data == "date_cancel":
             await query.edit_message_text("Выбор даты отменён.")
@@ -664,7 +687,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("❌ Ошибка формата даты.")
             return WAITING_DATE_SINGLE
 
-    # ---------- ВЫБОР ПЕРИОДА ----------
     if data == "period_month":
         current_year = get_moscow_today().year
         years = list(range(current_year - 9, current_year + 1))
@@ -696,7 +718,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
         return ConversationHandler.END
 
-    # ---------- ВЫБОР ГОДА ДЛЯ МЕСЯЦА/КВАРТАЛА ----------
     if data.startswith("period_year_month_"):
         year = int(data.split("_")[-1])
         context.user_data['period_year'] = year
@@ -715,7 +736,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(f"Выберите квартал {year}:", reply_markup=InlineKeyboardMarkup(buttons))
         return WAITING_PERIOD_QUARTER
 
-    # ---------- ТОЛЬКО ГОД ----------
     if data.startswith("period_year_only_"):
         year = int(data.split("_")[-1])
         first_day = datetime.date(year, 1, 1)
@@ -726,7 +746,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
         return ConversationHandler.END
 
-    # ---------- МЕСЯЦ ----------
     if data.startswith("period_month_"):
         parts = data.split("_")
         month_num, year = int(parts[2]), int(parts[3])
@@ -742,7 +761,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
         return ConversationHandler.END
 
-    # ---------- КВАРТАЛ ----------
     if data.startswith("period_quarter_"):
         parts = data.split("_")
         q, year = int(parts[2]), int(parts[3])
@@ -760,7 +778,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
         return ConversationHandler.END
 
-    # ---------- ПРОИЗВОЛЬНЫЙ ПЕРИОД – НАЧАЛО ----------
     if data.startswith("start_"):
         if data == "start_cancel":
             await query.edit_message_text("Выбор периода отменён.")
@@ -796,7 +813,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("❌ Ошибка формата даты.")
             return WAITING_PERIOD_START
 
-    # ---------- ПРОИЗВОЛЬНЫЙ ПЕРИОД – КОНЕЦ ----------
     if data.startswith("end_"):
         if data == "end_cancel":
             await query.edit_message_text("Выбор периода отменён.")
