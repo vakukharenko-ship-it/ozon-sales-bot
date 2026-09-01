@@ -4,11 +4,11 @@ import json
 import os
 import time
 import re
-import requests
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+import calendar
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, MessageHandler,
-    filters, ConversationHandler
+    filters, ConversationHandler, CallbackQueryHandler
 )
 
 # ==================== КОНФИГУРАЦИЯ ====================
@@ -22,11 +22,15 @@ MANAGERS_FILE = "managers.json"
 LOG_FILE = "/app/data/ozon_log.txt"
 
 # Состояния для диалогов
-WAITING_DATE_SINGLE = 1
-WAITING_DATE_PERIOD_START = 2
-WAITING_DATE_PERIOD_END = 3
-WAITING_ADD_MANAGER = 4
-WAITING_REMOVE_MANAGER = 5
+WAITING_DATE_SINGLE = 1         # ожидание выбора даты через календарь
+WAITING_PERIOD_TYPE = 2         # выбор типа периода (месяц, квартал, год, произвольный)
+WAITING_PERIOD_START = 3        # ожидание начальной даты для произвольного периода
+WAITING_PERIOD_END = 4          # ожидание конечной даты
+WAITING_ADD_MANAGER = 5
+WAITING_REMOVE_MANAGER = 6
+WAITING_MONTH_SELECT = 7        # выбор месяца из списка
+WAITING_QUARTER_SELECT = 8      # выбор квартала
+WAITING_YEAR_SELECT = 9         # выбор года
 # =====================================================
 
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
@@ -73,41 +77,52 @@ def remove_manager(chat_id):
         return True
     return False
 
-def is_valid_date(date_str):
-    try:
-        datetime.datetime.strptime(date_str, "%Y-%m-%d")
-        return True
-    except ValueError:
-        return False
+# ---------- КАЛЕНДАРЬ ----------
+def create_calendar(year, month, callback_prefix):
+    """
+    Создаёт inline-клавиатуру для календаря на указанный месяц.
+    callback_prefix используется для различения действий (например, 'date_' или 'start_').
+    """
+    month_names = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+                   "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
+    keyboard = []
+    # Заголовок: месяц и год
+    header = f"{month_names[month-1]} {year}"
+    keyboard.append([InlineKeyboardButton(header, callback_data="ignore")])
+    # Дни недели
+    week_days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    row = [InlineKeyboardButton(day, callback_data="ignore") for day in week_days]
+    keyboard.append(row)
 
-# ---------- КЛАВИАТУРЫ ----------
-def main_admin_keyboard():
-    buttons = [
-        [KeyboardButton("📊 Отчёт")],
-        [KeyboardButton("⚙️ Администрирование")]
+    # Получаем первый день месяца и количество дней
+    first_day, num_days = calendar.monthrange(year, month)
+    # calendar.monthrange возвращает день недели для 1-го числа (0=понедельник, 6=воскресенье)
+    # в Python Monday=0, Sunday=6, но мы хотим понедельник = 0, поэтому оставляем как есть.
+    # Заполняем пустые ячейки до первого дня
+    row = []
+    for _ in range(first_day):
+        row.append(InlineKeyboardButton(" ", callback_data="ignore"))
+    for day in range(1, num_days + 1):
+        row.append(InlineKeyboardButton(str(day), callback_data=f"{callback_prefix}{year}-{month:02d}-{day:02d}"))
+        if len(row) == 7:
+            keyboard.append(row)
+            row = []
+    if row:
+        # Добиваем пустые ячейки
+        while len(row) < 7:
+            row.append(InlineKeyboardButton(" ", callback_data="ignore"))
+        keyboard.append(row)
+
+    # Кнопки навигации: < месяц, год >, < год
+    nav_row = [
+        InlineKeyboardButton("◀️", callback_data=f"{callback_prefix}prev_month_{year}_{month}"),
+        InlineKeyboardButton(" ", callback_data="ignore"),
+        InlineKeyboardButton("▶️", callback_data=f"{callback_prefix}next_month_{year}_{month}")
     ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-
-def main_user_keyboard():
-    buttons = [[KeyboardButton("📊 Отчёт")]]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-
-def reports_keyboard():
-    buttons = [
-        [KeyboardButton("📅 Текущие показатели")],
-        [KeyboardButton("📆 Выбрать дату")],
-        [KeyboardButton("📊 Выбрать период")],
-        [KeyboardButton("🔙 Назад")]
-    ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-
-def admin_keyboard():
-    buttons = [
-        [KeyboardButton("➕ Добавить менеджера"), KeyboardButton("➖ Удалить менеджера")],
-        [KeyboardButton("📋 Список менеджеров")],
-        [KeyboardButton("🔙 Назад")]
-    ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+    keyboard.append(nav_row)
+    # Кнопка "Отмена"
+    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data=f"{callback_prefix}cancel")])
+    return InlineKeyboardMarkup(keyboard)
 
 # ---------- ПОЛУЧЕНИЕ ДАННЫХ ИЗ OZON ----------
 def fetch_postings(date_from, date_to):
@@ -195,10 +210,10 @@ def aggregate_postings(postings, date_from=None, date_to=None):
 
 def get_metrics_for_date(date_str):
     today = datetime.date.today()
-    first_day = today.replace(day=1)
-    date_from = first_day.strftime("%Y-%m-%d")
-    date_to = today.strftime("%Y-%m-%d")
-    postings = fetch_postings(date_from, date_to)
+    # Загружаем данные за полгода, чтобы охватить любой день
+    start = (today - datetime.timedelta(days=183)).strftime("%Y-%m-%d")
+    end = today.strftime("%Y-%m-%d")
+    postings = fetch_postings(start, end)
     agg = aggregate_postings(postings, date_from=date_str, date_to=date_str)
     return agg.get(date_str, {})
 
@@ -260,7 +275,36 @@ def format_metrics(metrics, title):
         f"  Штук: {metrics.get('canceled_units', 0)}"
     )
 
-# ---------- ОБРАБОТЧИКИ ----------
+# ---------- КЛАВИАТУРЫ ----------
+def main_admin_keyboard():
+    buttons = [
+        [KeyboardButton("📊 Отчёт")],
+        [KeyboardButton("⚙️ Администрирование")]
+    ]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+def main_user_keyboard():
+    buttons = [[KeyboardButton("📊 Отчёт")]]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+def reports_keyboard():
+    buttons = [
+        [KeyboardButton("📅 Текущие показатели")],
+        [KeyboardButton("📆 Выбрать дату")],
+        [KeyboardButton("📊 Выбрать период")],
+        [KeyboardButton("🔙 Назад")]
+    ]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+def admin_keyboard():
+    buttons = [
+        [KeyboardButton("➕ Добавить менеджера"), KeyboardButton("➖ Удалить менеджера")],
+        [KeyboardButton("📋 Список менеджеров")],
+        [KeyboardButton("🔙 Назад")]
+    ]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+# ---------- ОБРАБОТЧИКИ КОМАНД ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id == ADMIN_CHAT_ID:
@@ -302,7 +346,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Используйте кнопки меню.")
 
-# ---------- ОБРАБОТЧИКИ ПОДМЕНЮ "ОТЧЁТ" (без диалогов) ----------
+# ---------- ОБРАБОТЧИК ПОДМЕНЮ "ОТЧЁТ" ----------
 async def handle_reports_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
@@ -322,6 +366,32 @@ async def handle_reports_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
+    if text == "📆 Выбрать дату":
+        # Показать календарь текущего месяца
+        now = datetime.date.today()
+        year, month = now.year, now.month
+        keyboard = create_calendar(year, month, "date_")
+        await update.message.reply_text(
+            "Выберите дату:",
+            reply_markup=keyboard
+        )
+        return WAITING_DATE_SINGLE
+
+    if text == "📊 Выбрать период":
+        # Предложить варианты выбора периода
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗓️ По месяцам", callback_data="period_month")],
+            [InlineKeyboardButton("📅 По кварталам", callback_data="period_quarter")],
+            [InlineKeyboardButton("📆 По годам", callback_data="period_year")],
+            [InlineKeyboardButton("📊 Произвольный период", callback_data="period_custom")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")]
+        ])
+        await update.message.reply_text(
+            "Выберите тип периода:",
+            reply_markup=keyboard
+        )
+        return WAITING_PERIOD_TYPE
+
     if text == "🔙 Назад":
         chat_id = update.effective_chat.id
         if chat_id == ADMIN_CHAT_ID:
@@ -336,11 +406,9 @@ async def handle_reports_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
         return
 
-    # Кнопки "📆 Выбрать дату" и "📊 Выбрать период" обрабатываются ConversationHandler'ами,
-    # поэтому сюда они не попадают.
-    await update.message.reply_text("Неизвестная команда в подменю.")
+    await update.message.reply_text("Неизвестная команда.")
 
-# ---------- ОБРАБОТЧИКИ ПОДМЕНЮ "АДМИНИСТРИРОВАНИЕ" (без диалогов) ----------
+# ---------- ОБРАБОТЧИК ПОДМЕНЮ "АДМИНИСТРИРОВАНИЕ" ----------
 async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id != ADMIN_CHAT_ID:
@@ -366,82 +434,288 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Кнопки "➕ Добавить менеджера" и "➖ Удалить менеджера" обрабатываются ConversationHandler'ами.
-    await update.message.reply_text("Неизвестная команда в администрировании.")
+    await update.message.reply_text("Неизвестная команда.")
 
-# ---------- ДИАЛОГИ ----------
-async def single_date_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Введите дату в формате ГГГГ-ММ-ДД (например, 2026-09-01):"
-    )
-    return WAITING_DATE_SINGLE
+# ---------- ОБРАБОТЧИКИ INLINE CALLBACK ----------
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    chat_id = update.effective_chat.id
 
-async def single_date_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    date_str = update.message.text.strip()
-    if not is_valid_date(date_str):
-        await update.message.reply_text(
-            "❌ Неверный формат. Введите дату в формате ГГГГ-ММ-ДД:"
+    # ----- Обработка календаря (выбор даты) -----
+    if data.startswith("date_"):
+        if data == "date_cancel":
+            await query.edit_message_text("Выбор даты отменён.")
+            # Вернуть меню отчётов
+            await query.message.reply_text(
+                "Выберите действие:",
+                reply_markup=reports_keyboard()
+            )
+            return ConversationHandler.END
+
+        parts = data.split("_")
+        if len(parts) == 4:  # date_prev_month_2025_05 или date_next_month_2025_05
+            action = parts[1]  # prev_month или next_month
+            year = int(parts[2])
+            month = int(parts[3])
+            if action == "prev_month":
+                if month == 1:
+                    month = 12
+                    year -= 1
+                else:
+                    month -= 1
+            elif action == "next_month":
+                if month == 12:
+                    month = 1
+                    year += 1
+                else:
+                    month += 1
+            # Обновить календарь
+            keyboard = create_calendar(year, month, "date_")
+            await query.edit_message_reply_markup(reply_markup=keyboard)
+            return WAITING_DATE_SINGLE
+
+        # Выбор конкретной даты: date_2025-05-01
+        date_str = data[5:]  # убираем "date_"
+        # Проверяем формат
+        if re.match(r"\d{4}-\d{2}-\d{2}", date_str):
+            metrics = get_metrics_for_date(date_str)
+            msg = format_metrics(metrics, f"Отчёт за {date_str}")
+            await query.edit_message_text(msg, parse_mode="Markdown")
+            await query.message.reply_text(
+                "Выберите действие:",
+                reply_markup=reports_keyboard()
+            )
+            return ConversationHandler.END
+        else:
+            await query.edit_message_text("Ошибка формата даты.")
+            return WAITING_DATE_SINGLE
+
+    # ----- Выбор периода (тип) -----
+    if data == "period_month":
+        # Список месяцев
+        months = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+                  "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
+        buttons = []
+        for i, name in enumerate(months, 1):
+            buttons.append([InlineKeyboardButton(name, callback_data=f"month_{i}")])
+        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")])
+        keyboard = InlineKeyboardMarkup(buttons)
+        await query.edit_message_text("Выберите месяц:", reply_markup=keyboard)
+        return WAITING_MONTH_SELECT
+
+    if data == "period_quarter":
+        quarters = ["1 квартал (янв-мар)", "2 квартал (апр-июн)", "3 квартал (июл-сен)", "4 квартал (окт-дек)"]
+        buttons = []
+        for i, name in enumerate(quarters, 1):
+            buttons.append([InlineKeyboardButton(name, callback_data=f"quarter_{i}")])
+        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")])
+        keyboard = InlineKeyboardMarkup(buttons)
+        await query.edit_message_text("Выберите квартал:", reply_markup=keyboard)
+        return WAITING_QUARTER_SELECT
+
+    if data == "period_year":
+        # Получаем год первой отгрузки (на основе данных) или текущий минус 5 лет
+        # Для простоты предлагаем последние 10 лет
+        current_year = datetime.date.today().year
+        years = list(range(current_year - 9, current_year + 1))
+        buttons = []
+        for y in years:
+            buttons.append([InlineKeyboardButton(str(y), callback_data=f"year_{y}")])
+        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")])
+        keyboard = InlineKeyboardMarkup(buttons)
+        await query.edit_message_text("Выберите год:", reply_markup=keyboard)
+        return WAITING_YEAR_SELECT
+
+    if data == "period_custom":
+        # Произвольный период: сначала выбрать начальную дату
+        now = datetime.date.today()
+        year, month = now.year, now.month
+        keyboard = create_calendar(year, month, "start_")
+        await query.edit_message_text("Выберите начальную дату:", reply_markup=keyboard)
+        return WAITING_PERIOD_START
+
+    if data == "period_cancel":
+        await query.edit_message_text("Выбор периода отменён.")
+        await query.message.reply_text(
+            "Выберите действие:",
+            reply_markup=reports_keyboard()
         )
-        return WAITING_DATE_SINGLE
+        return ConversationHandler.END
 
-    metrics = get_metrics_for_date(date_str)
-    msg = format_metrics(metrics, f"Отчёт за {date_str}")
-    await update.message.reply_text(msg, parse_mode="Markdown")
-    await update.message.reply_text(
-        "Выберите действие:",
-        reply_markup=reports_keyboard()
-    )
+    # ----- Обработка выбора месяца -----
+    if data.startswith("month_"):
+        month_num = int(data.split("_")[1])
+        year = datetime.date.today().year
+        # Формируем период: с 1-го числа месяца по последнее
+        first_day = datetime.date(year, month_num, 1)
+        if month_num == 12:
+            last_day = datetime.date(year, 12, 31)
+        else:
+            last_day = datetime.date(year, month_num+1, 1) - datetime.timedelta(days=1)
+        date_from = first_day.strftime("%Y-%m-%d")
+        date_to = last_day.strftime("%Y-%m-%d")
+        metrics = get_metrics_for_period(date_from, date_to)
+        msg = format_metrics(metrics, f"Месяц {first_day.strftime('%B %Y')}")
+        await query.edit_message_text(msg, parse_mode="Markdown")
+        await query.message.reply_text(
+            "Выберите действие:",
+            reply_markup=reports_keyboard()
+        )
+        return ConversationHandler.END
+
+    # ----- Обработка выбора квартала -----
+    if data.startswith("quarter_"):
+        q = int(data.split("_")[1])
+        year = datetime.date.today().year
+        # Определяем начало и конец квартала
+        start_month = (q-1)*3 + 1
+        end_month = q*3
+        first_day = datetime.date(year, start_month, 1)
+        if end_month == 12:
+            last_day = datetime.date(year, 12, 31)
+        else:
+            last_day = datetime.date(year, end_month+1, 1) - datetime.timedelta(days=1)
+        date_from = first_day.strftime("%Y-%m-%d")
+        date_to = last_day.strftime("%Y-%m-%d")
+        metrics = get_metrics_for_period(date_from, date_to)
+        msg = format_metrics(metrics, f"{q} квартал {year}")
+        await query.edit_message_text(msg, parse_mode="Markdown")
+        await query.message.reply_text(
+            "Выберите действие:",
+            reply_markup=reports_keyboard()
+        )
+        return ConversationHandler.END
+
+    # ----- Обработка выбора года -----
+    if data.startswith("year_"):
+        year = int(data.split("_")[1])
+        first_day = datetime.date(year, 1, 1)
+        last_day = datetime.date(year, 12, 31)
+        date_from = first_day.strftime("%Y-%m-%d")
+        date_to = last_day.strftime("%Y-%m-%d")
+        metrics = get_metrics_for_period(date_from, date_to)
+        msg = format_metrics(metrics, f"Год {year}")
+        await query.edit_message_text(msg, parse_mode="Markdown")
+        await query.message.reply_text(
+            "Выберите действие:",
+            reply_markup=reports_keyboard()
+        )
+        return ConversationHandler.END
+
+    # ----- Календарь для произвольного периода (начало) -----
+    if data.startswith("start_"):
+        if data == "start_cancel":
+            await query.edit_message_text("Выбор периода отменён.")
+            await query.message.reply_text(
+                "Выберите действие:",
+                reply_markup=reports_keyboard()
+            )
+            return ConversationHandler.END
+        parts = data.split("_")
+        if len(parts) == 4:
+            action = parts[1]
+            year = int(parts[2])
+            month = int(parts[3])
+            if action == "prev_month":
+                if month == 1:
+                    month = 12
+                    year -= 1
+                else:
+                    month -= 1
+            elif action == "next_month":
+                if month == 12:
+                    month = 1
+                    year += 1
+                else:
+                    month += 1
+            keyboard = create_calendar(year, month, "start_")
+            await query.edit_message_reply_markup(reply_markup=keyboard)
+            return WAITING_PERIOD_START
+        # Выбор конкретной даты начала
+        date_str = data[6:]  # убираем "start_"
+        if re.match(r"\d{4}-\d{2}-\d{2}", date_str):
+            context.user_data['period_start_date'] = date_str
+            # Теперь предложить календарь для конечной даты
+            now = datetime.date.today()
+            year, month = now.year, now.month
+            keyboard = create_calendar(year, month, "end_")
+            await query.edit_message_text(
+                f"Начало: {date_str}\nТеперь выберите конечную дату:",
+                reply_markup=keyboard
+            )
+            return WAITING_PERIOD_END
+        else:
+            await query.edit_message_text("Ошибка формата даты.")
+            return WAITING_PERIOD_START
+
+    # ----- Календарь для произвольного периода (конец) -----
+    if data.startswith("end_"):
+        if data == "end_cancel":
+            await query.edit_message_text("Выбор периода отменён.")
+            await query.message.reply_text(
+                "Выберите действие:",
+                reply_markup=reports_keyboard()
+            )
+            return ConversationHandler.END
+        parts = data.split("_")
+        if len(parts) == 4:
+            action = parts[1]
+            year = int(parts[2])
+            month = int(parts[3])
+            if action == "prev_month":
+                if month == 1:
+                    month = 12
+                    year -= 1
+                else:
+                    month -= 1
+            elif action == "next_month":
+                if month == 12:
+                    month = 1
+                    year += 1
+                else:
+                    month += 1
+            keyboard = create_calendar(year, month, "end_")
+            await query.edit_message_reply_markup(reply_markup=keyboard)
+            return WAITING_PERIOD_END
+        # Выбор конкретной даты конца
+        end_date_str = data[4:]  # убираем "end_"
+        if re.match(r"\d{4}-\d{2}-\d{2}", end_date_str):
+            start_date = context.user_data.get('period_start_date')
+            if not start_date:
+                await query.edit_message_text("Ошибка: не найдена начальная дата. Попробуйте снова.")
+                return ConversationHandler.END
+            if start_date > end_date_str:
+                await query.edit_message_text("❌ Начальная дата не может быть позже конечной. Попробуйте сначала.")
+                # Возвращаемся к выбору начала
+                now = datetime.date.today()
+                year, month = now.year, now.month
+                keyboard = create_calendar(year, month, "start_")
+                await query.message.reply_text(
+                    "Выберите начальную дату заново:",
+                    reply_markup=keyboard
+                )
+                return WAITING_PERIOD_START
+            metrics = get_metrics_for_period(start_date, end_date_str)
+            msg = format_metrics(metrics, f"Период {start_date} – {end_date_str}")
+            await query.edit_message_text(msg, parse_mode="Markdown")
+            await query.message.reply_text(
+                "Выберите действие:",
+                reply_markup=reports_keyboard()
+            )
+            # Очищаем данные
+            context.user_data.pop('period_start_date', None)
+            return ConversationHandler.END
+        else:
+            await query.edit_message_text("Ошибка формата даты.")
+            return WAITING_PERIOD_END
+
+    # Неизвестный колбэк
+    await query.edit_message_text("Неизвестная команда.")
     return ConversationHandler.END
 
-async def period_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Введите начальную дату в формате ГГГГ-ММ-ДД:"
-    )
-    return WAITING_DATE_PERIOD_START
-
-async def period_start_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    date_str = update.message.text.strip()
-    if not is_valid_date(date_str):
-        await update.message.reply_text(
-            "❌ Неверный формат. Введите начальную дату в формате ГГГГ-ММ-ДД:"
-        )
-        return WAITING_DATE_PERIOD_START
-
-    context.user_data['period_start'] = date_str
-    await update.message.reply_text(
-        "Введите конечную дату в формате ГГГГ-ММ-ДД:"
-    )
-    return WAITING_DATE_PERIOD_END
-
-async def period_end_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    end_date_str = update.message.text.strip()
-    if not is_valid_date(end_date_str):
-        await update.message.reply_text(
-            "❌ Неверный формат. Введите конечную дату в формате ГГГГ-ММ-ДД:"
-        )
-        return WAITING_DATE_PERIOD_END
-
-    start_date = context.user_data.get('period_start')
-    if start_date > end_date_str:
-        await update.message.reply_text(
-            "❌ Начальная дата не может быть позже конечной. Попробуйте снова."
-        )
-        context.user_data.pop('period_start', None)
-        await update.message.reply_text(
-            "Введите начальную дату в формате ГГГГ-ММ-ДД:"
-        )
-        return WAITING_DATE_PERIOD_START
-
-    metrics = get_metrics_for_period(start_date, end_date_str)
-    msg = format_metrics(metrics, f"Отчёт за период {start_date} – {end_date_str}")
-    await update.message.reply_text(msg, parse_mode="Markdown")
-    await update.message.reply_text(
-        "Выберите действие:",
-        reply_markup=reports_keyboard()
-    )
-    context.user_data.pop('period_start', None)
-    return ConversationHandler.END
-
+# ---------- ДИАЛОГИ ДЛЯ АДМИНИСТРИРОВАНИЯ ----------
 async def add_manager_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Введите ID пользователя (только цифры):"
@@ -534,39 +808,39 @@ def main():
     # Команда /start
     application.add_handler(CommandHandler("start", start))
 
-    # Обработчик главного меню (кнопки "Отчёт", "Администрирование")
+    # Обработчики главного меню и подменю
     application.add_handler(MessageHandler(
         filters.Text(["📊 Отчёт", "⚙️ Администрирование"]),
         handle_main_menu
     ))
-
-    # Обработчик подменю "Отчёт" (только "Текущие показатели" и "Назад")
     application.add_handler(MessageHandler(
         filters.Text(["📅 Текущие показатели", "🔙 Назад"]),
         handle_reports_menu
     ))
-
-    # Обработчик подменю "Администрирование" (только "Список менеджеров" и "Назад")
     application.add_handler(MessageHandler(
         filters.Text(["📋 Список менеджеров", "🔙 Назад"]),
         handle_admin_menu
     ))
 
-    # ConversationHandler для выбора даты
+    # ConversationHandler для выбора даты (кнопка "Выбрать дату")
     conv_date = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("📆 Выбрать дату"), single_date_start)],
+        entry_points=[MessageHandler(filters.Text("📆 Выбрать дату"), handle_reports_menu)],
         states={
-            WAITING_DATE_SINGLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, single_date_input)],
+            WAITING_DATE_SINGLE: [CallbackQueryHandler(handle_callback_query)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    # ConversationHandler для выбора периода
+    # ConversationHandler для выбора периода (кнопка "Выбрать период")
     conv_period = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("📊 Выбрать период"), period_start)],
+        entry_points=[MessageHandler(filters.Text("📊 Выбрать период"), handle_reports_menu)],
         states={
-            WAITING_DATE_PERIOD_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, period_start_input)],
-            WAITING_DATE_PERIOD_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, period_end_input)],
+            WAITING_PERIOD_TYPE: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_PERIOD_START: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_PERIOD_END: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_MONTH_SELECT: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_QUARTER_SELECT: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_YEAR_SELECT: [CallbackQueryHandler(handle_callback_query)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
@@ -593,6 +867,9 @@ def main():
     application.add_handler(conv_period)
     application.add_handler(conv_add_manager)
     application.add_handler(conv_remove_manager)
+
+    # Обработчик для всех остальных колбэков
+    application.add_handler(CallbackQueryHandler(handle_callback_query))
 
     # Планировщик автоматических отчётов
     async def scheduled_report(context):
