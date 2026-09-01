@@ -5,8 +5,6 @@ import os
 import requests
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, ConversationHandler
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
 
 # ---------------------- БЕЗОПАСНОЕ ПОЛУЧЕНИЕ КЛЮЧЕЙ ----------------------
 OZON_CLIENT_ID = os.getenv("OZON_CLIENT_ID")
@@ -108,33 +106,43 @@ def format_sales_message(period_name, analytics_data):
     )
     return message
 
-async def send_scheduled_report(app):
+async def send_scheduled_report(context):
+    """Функция, вызываемая по расписанию каждый час."""
+    # Проверяем текущий час по МСК
+    moscow_tz = datetime.timezone(datetime.timedelta(hours=3))
+    now = datetime.datetime.now(moscow_tz)
+    if not (9 <= now.hour <= 23):
+        return  # если не в рабочее время, ничего не делаем
+
     managers = load_managers()
     if not managers:
         return
+
     today = datetime.date.today()
     today_str = today.strftime("%Y-%m-%d")
     yesterday = today - datetime.timedelta(days=1)
     yesterday_str = yesterday.strftime("%Y-%m-%d")
     first_day_of_month = today.replace(day=1)
     month_start_str = first_day_of_month.strftime("%Y-%m-%d")
+
     data_today = get_ozon_analytics(today_str, today_str)
     data_yesterday = get_ozon_analytics(yesterday_str, yesterday_str)
     data_month = get_ozon_analytics(month_start_str, today_str)
+
     msg_today = format_sales_message("Сегодня", data_today)
     msg_yesterday = format_sales_message("Вчера", data_yesterday)
     msg_month = format_sales_message("Текущий месяц", data_month)
+
     for chat_id in managers:
         try:
-            await app.bot.send_message(chat_id=chat_id, text=msg_today, parse_mode="Markdown")
-            await app.bot.send_message(chat_id=chat_id, text=msg_yesterday, parse_mode="Markdown")
-            await app.bot.send_message(chat_id=chat_id, text=msg_month, parse_mode="Markdown")
+            await context.bot.send_message(chat_id=chat_id, text=msg_today, parse_mode="Markdown")
+            await context.bot.send_message(chat_id=chat_id, text=msg_yesterday, parse_mode="Markdown")
+            await context.bot.send_message(chat_id=chat_id, text=msg_month, parse_mode="Markdown")
         except Exception as e:
             print(f"Ошибка отправки для {chat_id}: {e}")
 
 # ---------- КЛАВИАТУРЫ ----------
 def get_admin_keyboard():
-    """Клавиатура для администратора."""
     buttons = [
         [KeyboardButton("📊 Отчёт"), KeyboardButton("👥 Менеджеры (кол-во)")],
         [KeyboardButton("➕ Добавить менеджера"), KeyboardButton("➖ Удалить менеджера")],
@@ -143,42 +151,33 @@ def get_admin_keyboard():
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 def get_user_keyboard():
-    """Клавиатура для обычного менеджера – только отчёт."""
-    buttons = [
-        [KeyboardButton("📊 Отчёт")]
-    ]
+    buttons = [[KeyboardButton("📊 Отчёт")]]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 # ---------- ОБРАБОТЧИКИ СООБЩЕНИЙ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Приветствие и показ клавиатуры в зависимости от роли."""
     chat_id = update.effective_chat.id
     if chat_id == ADMIN_CHAT_ID:
         await update.message.reply_text(
-            "👋 Добро пожаловать, администратор!\n"
-            "Используйте кнопки ниже для управления.",
+            "👋 Добро пожаловать, администратор!\nИспользуйте кнопки ниже для управления.",
             reply_markup=get_admin_keyboard()
         )
     elif is_manager(chat_id):
         await update.message.reply_text(
-            "👋 Здравствуйте, менеджер!\n"
-            "Нажмите кнопку «Отчёт» для получения статистики.",
+            "👋 Здравствуйте, менеджер!\nНажмите кнопку «Отчёт» для получения статистики.",
             reply_markup=get_user_keyboard()
         )
     else:
         await update.message.reply_text(
-            "🤖 Бот для статистики Ozon.\n"
-            "Доступ предоставляется только авторизованным менеджерам.\n"
+            "🤖 Бот для статистики Ozon.\nДоступ предоставляется только авторизованным менеджерам.\n"
             "Если вы менеджер, обратитесь к администратору для добавления.",
-            reply_markup=ReplyKeyboardMarkup([], resize_keyboard=True)  # убираем клавиатуру
+            reply_markup=ReplyKeyboardMarkup([], resize_keyboard=True)
         )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка нажатий на кнопки."""
     text = update.message.text
     chat_id = update.effective_chat.id
 
-    # ---- Отчёт ----
     if text == "📊 Отчёт":
         if not is_manager(chat_id):
             await update.message.reply_text("⛔ У вас нет доступа к этой информации.")
@@ -200,7 +199,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg_month, parse_mode="Markdown")
         return
 
-    # ---- Количество менеджеров (только для админа) ----
     if text == "👥 Менеджеры (кол-во)":
         if chat_id != ADMIN_CHAT_ID:
             await update.message.reply_text("⛔ Эта информация доступна только администратору.")
@@ -210,7 +208,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"📊 Количество авторизованных менеджеров: {count}")
         return
 
-    # ---- Админские кнопки (только для админа) ----
     if chat_id != ADMIN_CHAT_ID:
         await update.message.reply_text("⛔ Эта функция доступна только администратору.")
         return
@@ -232,10 +229,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(text_list)
         return
 
-    # Если неизвестная кнопка
     await update.message.reply_text("Неизвестная команда. Используйте кнопки.")
 
-# ---------- ОБРАБОТЧИКИ ВВОДА ID ----------
 async def add_manager_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     try:
@@ -276,8 +271,10 @@ def main():
 
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
+    # Регистрируем команды
     application.add_handler(CommandHandler("start", start))
 
+    # ConversationHandler для добавления/удаления
     conv_handler = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Text("➕ Добавить менеджера"), handle_message),
@@ -291,13 +288,19 @@ def main():
     )
     application.add_handler(conv_handler)
 
+    # Общий обработчик текстовых сообщений
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
-    scheduler.add_job(send_scheduled_report, CronTrigger(hour="9-23", minute="0"), args=[application])
-    scheduler.start()
+    # Настраиваем JobQueue для автоматических отчётов
+    job_queue = application.job_queue
+    if job_queue:
+        # Запускаем задачу каждые 60 минут
+        job_queue.run_repeating(send_scheduled_report, interval=60 * 60, first=0)
+        print("Планировщик запущен: отчёты каждый час с 9 до 23 по МСК.")
+    else:
+        print("JobQueue не доступен!")
 
-    print("Бот запущен. Отчёты отправляются менеджерам с 9 до 23 по МСК.")
+    print("Бот запущен.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
