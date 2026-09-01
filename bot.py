@@ -17,6 +17,8 @@ warnings.filterwarnings("ignore", category=PTBUserWarning)
 # ==================== КОНФИГУРАЦИЯ ====================
 OZON_CLIENT_ID = os.getenv("OZON_CLIENT_ID")
 OZON_API_KEY = os.getenv("OZON_API_KEY")
+OZON_PERFORMANCE_CLIENT_ID = os.getenv("OZON_PERFORMANCE_CLIENT_ID")
+OZON_PERFORMANCE_CLIENT_SECRET = os.getenv("OZON_PERFORMANCE_CLIENT_SECRET")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID = 6134182006  # ID администратора
 
@@ -160,7 +162,7 @@ def create_calendar(year, month, callback_prefix):
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data=f"{callback_prefix}cancel")])
     return InlineKeyboardMarkup(keyboard)
 
-# ---------- ЗАПРОСЫ К OZON ----------
+# ---------- ЗАПРОСЫ К OZON (SELLER API) ----------
 def fetch_postings(date_from, date_to):
     headers = {
         "Client-Id": OZON_CLIENT_ID,
@@ -244,13 +246,103 @@ def aggregate_postings(postings, date_from=None, date_to=None):
 
     return aggregated
 
+# ---------- ЗАПРОСЫ К OZON (PERFORMANCE API - РЕКЛАМА) ----------
+def get_performance_token():
+    """
+    Получает Bearer-токен для Performance API, используя Client ID и Client Secret.
+    """
+    if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
+        write_log("⚠️ OZON_PERFORMANCE_CLIENT_ID или CLIENT_SECRET не заданы!")
+        return None
+
+    url = "https://api-performance.ozon.ru/api/client/oauth/token"
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    data = {
+        "grant_type": "client_credentials",
+        "client_id": OZON_PERFORMANCE_CLIENT_ID,
+        "client_secret": OZON_PERFORMANCE_CLIENT_SECRET
+    }
+    try:
+        response = requests.post(url, headers=headers, data=data, timeout=15)
+        response.raise_for_status()
+        token_data = response.json()
+        token = token_data.get("access_token")
+        if token:
+            write_log("✅ Токен Performance API успешно получен.")
+            return token
+        else:
+            write_log(f"❌ Ошибка получения токена: {token_data}")
+            return None
+    except Exception as e:
+        write_log(f"❌ Ошибка при запросе токена: {e}")
+        return None
+
+def fetch_advertising_expense(date_from, date_to):
+    """
+    Получает сумму расходов на рекламу за период через Performance API.
+    Возвращает float или None в случае ошибки.
+    """
+    token = get_performance_token()
+    if not token:
+        write_log("⚠️ Не удалось получить токен. Рекламные расходы не будут отображаться.")
+        return None
+
+    url = "https://api-performance.ozon.ru/api/client/statistics/expense/json"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    params = {
+        "dateFrom": date_from,
+        "dateTo": date_to,
+    }
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=15)
+        if response.status_code == 429:
+            write_log("⚠️ 429 Too Many Requests (Performance API), ждём 10 сек")
+            time.sleep(10)
+            response = requests.get(url, headers=headers, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+
+        total_expense = 0.0
+        if isinstance(data, list):
+            for item in data:
+                expense = item.get("expense") or item.get("cost") or 0
+                try:
+                    total_expense += float(expense)
+                except:
+                    pass
+        elif isinstance(data, dict):
+            for key in ["expense", "cost", "total_expense", "total"]:
+                if key in data:
+                    try:
+                        total_expense = float(data[key])
+                        break
+                    except:
+                        pass
+        write_log(f"📊 Рекламные расходы за {date_from}–{date_to}: {total_expense:.2f} ₽")
+        return total_expense
+    except Exception as e:
+        write_log(f"❌ Ошибка получения рекламных расходов: {e}")
+        return None
+
+# ---------- ОСНОВНЫЕ ФУНКЦИИ ДЛЯ ОТЧЁТОВ ----------
 def get_metrics_for_date(date_str):
     today = get_moscow_today()
     start = (today - datetime.timedelta(days=183)).strftime("%Y-%m-%d")
     end = today.strftime("%Y-%m-%d")
     postings = fetch_postings(start, end)
     agg = aggregate_postings(postings, date_from=date_str, date_to=date_str)
-    return agg.get(date_str, {})
+    metrics = agg.get(date_str, {})
+    ad_expense = fetch_advertising_expense(date_str, date_str)
+    metrics["ad_expense"] = ad_expense if ad_expense is not None else 0.0
+    revenue = metrics.get("ordered_sum", 0)
+    if revenue > 0 and ad_expense is not None:
+        metrics["drr"] = (ad_expense / revenue) * 100
+    else:
+        metrics["drr"] = None
+    return metrics
 
 def get_metrics_for_period(date_from, date_to):
     postings = fetch_postings(date_from, date_to)
@@ -266,6 +358,13 @@ def get_metrics_for_period(date_from, date_to):
     for vals in agg.values():
         for key in total:
             total[key] += vals.get(key, 0)
+    ad_expense = fetch_advertising_expense(date_from, date_to)
+    total["ad_expense"] = ad_expense if ad_expense is not None else 0.0
+    revenue = total.get("ordered_sum", 0)
+    if revenue > 0 and ad_expense is not None:
+        total["drr"] = (ad_expense / revenue) * 100
+    else:
+        total["drr"] = None
     return total
 
 def get_current_metrics():
@@ -294,12 +393,52 @@ def get_current_metrics():
         for key in month_data:
             month_data[key] += vals.get(key, 0)
 
+    ad_expense_today = fetch_advertising_expense(today_str, today_str)
+    today_data["ad_expense"] = ad_expense_today if ad_expense_today is not None else 0.0
+    revenue_today = today_data.get("ordered_sum", 0)
+    if revenue_today > 0 and ad_expense_today is not None:
+        today_data["drr"] = (ad_expense_today / revenue_today) * 100
+    else:
+        today_data["drr"] = None
+
+    ad_expense_yesterday = fetch_advertising_expense(yesterday_str, yesterday_str)
+    yesterday_data["ad_expense"] = ad_expense_yesterday if ad_expense_yesterday is not None else 0.0
+    revenue_yesterday = yesterday_data.get("ordered_sum", 0)
+    if revenue_yesterday > 0 and ad_expense_yesterday is not None:
+        yesterday_data["drr"] = (ad_expense_yesterday / revenue_yesterday) * 100
+    else:
+        yesterday_data["drr"] = None
+
+    ad_expense_month = fetch_advertising_expense(date_from, date_to)
+    month_data["ad_expense"] = ad_expense_month if ad_expense_month is not None else 0.0
+    revenue_month = month_data.get("ordered_sum", 0)
+    if revenue_month > 0 and ad_expense_month is not None:
+        month_data["drr"] = (ad_expense_month / revenue_month) * 100
+    else:
+        month_data["drr"] = None
+
     return today_data, yesterday_data, month_data
 
 # ---------- ФОРМАТИРОВАНИЕ ----------
 def format_metrics(metrics, title):
-    if not metrics or all(v == 0 for v in metrics.values()):
+    if not metrics:
         return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
+    
+    # Проверяем, есть ли хоть какие-то числовые данные, кроме рекламных
+    has_data = False
+    for key, val in metrics.items():
+        if key in ["drr", "ad_expense"]:
+            continue
+        if isinstance(val, (int, float)) and val != 0:
+            has_data = True
+            break
+    if not has_data:
+        return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
+
+    ad_expense = metrics.get("ad_expense", 0)
+    drr = metrics.get("drr")
+    drr_text = f"{drr:.2f}%" if drr is not None else "∞"
+
     return (
         f"📊 *{title}*\n\n"
         f"🛒 *Заказано*\n  На сумму: {metrics.get('ordered_sum', 0):,.2f} ₽\n"
@@ -307,7 +446,9 @@ def format_metrics(metrics, title):
         f"📦 *Доставлено*\n  На сумму: {metrics.get('delivered_sum', 0):,.2f} ₽\n"
         f"  Штук: {metrics.get('delivered_units', 0)}\n\n"
         f"❌ *Отмены*\n  На сумму: {metrics.get('canceled_sum', 0):,.2f} ₽\n"
-        f"  Штук: {metrics.get('canceled_units', 0)}"
+        f"  Штук: {metrics.get('canceled_units', 0)}\n\n"
+        f"📢 *Реклама*\n  Расходы: {ad_expense:,.2f} ₽\n"
+        f"  ДРР: {drr_text}"
     )
 
 # ---------- КЛАВИАТУРЫ ----------
@@ -775,6 +916,9 @@ def main():
     if not all([OZON_CLIENT_ID, OZON_API_KEY, TELEGRAM_BOT_TOKEN]):
         write_log("❌ ОШИБКА: Не все переменные окружения установлены!")
         return
+
+    if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
+        write_log("⚠️ ВНИМАНИЕ: OZON_PERFORMANCE_CLIENT_ID или CLIENT_SECRET не заданы. Рекламные расходы не будут отображаться.")
 
     write_log("🚀 Запуск бота...")
     application = (Application.builder()
