@@ -32,6 +32,7 @@ ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 # ---------------------------------------------------
 
 OZON_ANALYTICS_URL = "https://api-seller.ozon.ru/v1/analytics/data"
+OZON_ORDER_LIST_URL = "https://api-seller.ozon.ru/v1/order/list"
 MANAGERS_FILE = "managers.json"
 LOG_FILE = "/app/data/ozon_log.txt"
 
@@ -83,60 +84,82 @@ def write_log(message):
     except Exception as e:
         print(f"⚠️ Не удалось записать в файл: {e}", flush=True)
 
-# ---------- ЗАПРОС К OZON API (ОДИН ЗАПРОС С ПОВТОРАМИ) ----------
-def get_ozon_monthly_analytics(date_from, date_to):
-    write_log(f"📤 Запрос к Ozon за период {date_from} – {date_to} (весь месяц)")
-
+# ---------- ЗАПРОС К АНАЛИТИКЕ (КОЛИЧЕСТВО) ----------
+def get_ozon_analytics(date_from, date_to, metric_names):
+    """Возвращает словарь {дата: {metric: значение}} для указанных метрик."""
     headers = {
         "Client-Id": OZON_CLIENT_ID,
         "Api-Key": OZON_API_KEY,
         "Content-Type": "application/json",
     }
-    metrics_list = [
-        "ordered_units",
-        "ordered_sum",
-        "delivered_units",
-        "delivered_sum",
-        "canceled_units",
-        "canceled_sum",
-    ]
     payload = {
         "date_from": date_from,
         "date_to": date_to,
-        "metrics": metrics_list,
+        "metrics": metric_names,
         "dimension": ["day"],
         "filters": [],
         "sort": [],
         "limit": 1000,
     }
-
     max_attempts = 5
     for attempt in range(max_attempts):
         try:
             response = requests.post(OZON_ANALYTICS_URL, headers=headers, json=payload, timeout=15)
             if response.status_code == 429:
-                wait = 10 * (attempt + 1)  # 10, 20, 30, 40, 50 секунд
-                write_log(f"⚠️ 429 Too Many Requests, повтор через {wait} сек (попытка {attempt+1}/{max_attempts})")
+                wait = 10 * (attempt + 1)
+                write_log(f"⚠️ 429, повтор через {wait} сек (попытка {attempt+1}/{max_attempts})")
                 time.sleep(wait)
                 continue
             response.raise_for_status()
             data = response.json()
-            write_log(f"📥 Ответ Ozon (код {response.status_code}) получен")
             if "result" in data and "data" in data["result"]:
                 return data["result"]["data"]
             else:
-                write_log("⚠️ Неожиданный формат: " + json.dumps(data, ensure_ascii=False)[:300])
+                write_log("⚠️ Неожиданный формат аналитики")
                 return None
-        except requests.exceptions.RequestException as e:
-            write_log(f"❌ Ошибка запроса: {e}")
+        except Exception as e:
+            write_log(f"❌ Ошибка аналитики: {e}")
             if attempt == max_attempts - 1:
                 return None
             time.sleep(5)
-        except Exception as e:
-            write_log(f"❌ Ошибка обработки: {e}")
-            return None
     return None
 
+# ---------- ЗАПРОС К СПИСКУ ЗАКАЗОВ (СУММЫ) ----------
+def get_ozon_orders(date_from, date_to):
+    """Возвращает список заказов за период."""
+    headers = {
+        "Client-Id": OZON_CLIENT_ID,
+        "Api-Key": OZON_API_KEY,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "date_from": date_from,
+        "date_to": date_to,
+        "statuses": [],  # все статусы
+        "limit": 1000,
+        "offset": 0,
+        "sort": {"key": "created_at", "direction": "ASC"},
+    }
+    all_orders = []
+    while True:
+        try:
+            response = requests.post(OZON_ORDER_LIST_URL, headers=headers, json=payload, timeout=15)
+            if response.status_code == 429:
+                time.sleep(10)
+                continue
+            response.raise_for_status()
+            data = response.json()
+            orders = data.get("result", {}).get("items", [])
+            all_orders.extend(orders)
+            if len(orders) < payload["limit"]:
+                break
+            payload["offset"] += payload["limit"]
+        except Exception as e:
+            write_log(f"❌ Ошибка получения заказов: {e}")
+            break
+    return all_orders
+
+# ---------- ИЗВЛЕЧЕНИЕ ДАННЫХ ----------
 def extract_metrics_from_day_data(day_data, metric_names):
     if not day_data or "metrics" not in day_data:
         return {name: 0 for name in metric_names}
@@ -144,6 +167,80 @@ def extract_metrics_from_day_data(day_data, metric_names):
     while len(values) < len(metric_names):
         values.append(0)
     return dict(zip(metric_names, values))
+
+def get_quantities(date_from, date_to):
+    """Возвращает словарь {дата: {ordered_units, delivered_units, canceled_units}}."""
+    metric_names = ["ordered_units", "delivered_units", "canceled_units"]
+    rows = get_ozon_analytics(date_from, date_to, metric_names)
+    if rows is None:
+        return {}
+    result = {}
+    for row in rows:
+        if "dimensions" in row and len(row["dimensions"]) > 0:
+            date_str = row["dimensions"][0].get("id", "")
+            if date_str:
+                result[date_str] = extract_metrics_from_day_data(row, metric_names)
+    return result
+
+def get_amounts(date_from, date_to):
+    """Возвращает словарь {дата: {ordered_sum, delivered_sum, canceled_sum}}."""
+    orders = get_ozon_orders(date_from, date_to)
+    amounts = {}
+    for order in orders:
+        created_at = order.get("created_at", "")
+        if created_at:
+            date_str = created_at[:10]  # YYYY-MM-DD
+            if date_str not in amounts:
+                amounts[date_str] = {"ordered_sum": 0, "delivered_sum": 0, "canceled_sum": 0}
+            total_price = float(order.get("total_price", 0))
+            status = order.get("status", "")
+            # По статусу распределяем суммы
+            if status in ["cancelled", "canceled"]:
+                amounts[date_str]["canceled_sum"] += total_price
+            elif status in ["delivered", "completed"]:
+                amounts[date_str]["delivered_sum"] += total_price
+            else:
+                amounts[date_str]["ordered_sum"] += total_price
+    return amounts
+
+def get_full_report():
+    today = datetime.date.today()
+    first_day = today.replace(day=1)
+    date_from = first_day.strftime("%Y-%m-%d")
+    date_to = today.strftime("%Y-%m-%d")
+
+    # Получаем количества
+    quantities = get_quantities(date_from, date_to)
+    # Получаем суммы
+    amounts = get_amounts(date_from, date_to)
+
+    # Объединяем
+    all_dates = set(quantities.keys()) | set(amounts.keys())
+    full_data = {}
+    for d in all_dates:
+        full_data[d] = {
+            "ordered_units": quantities.get(d, {}).get("ordered_units", 0),
+            "delivered_units": quantities.get(d, {}).get("delivered_units", 0),
+            "canceled_units": quantities.get(d, {}).get("canceled_units", 0),
+            "ordered_sum": amounts.get(d, {}).get("ordered_sum", 0),
+            "delivered_sum": amounts.get(d, {}).get("delivered_sum", 0),
+            "canceled_sum": amounts.get(d, {}).get("canceled_sum", 0),
+        }
+
+    today_str = today.strftime("%Y-%m-%d")
+    yesterday_str = (today - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+
+    today_data = full_data.get(today_str, {})
+    yesterday_data = full_data.get(yesterday_str, {})
+
+    # Суммируем за месяц
+    month_data = {"ordered_units": 0, "delivered_units": 0, "canceled_units": 0,
+                  "ordered_sum": 0, "delivered_sum": 0, "canceled_sum": 0}
+    for d, vals in full_data.items():
+        for key in month_data:
+            month_data[key] += vals.get(key, 0)
+
+    return today_data, yesterday_data, month_data
 
 def format_sales_message(period_name, metrics_dict):
     if not metrics_dict:
@@ -157,37 +254,6 @@ def format_sales_message(period_name, metrics_dict):
         f"❌ *Отмены*\n  На сумму: {metrics_dict.get('canceled_sum', 0):,.2f} ₽\n"
         f"  Штук: {metrics_dict.get('canceled_units', 0)}"
     )
-
-def get_full_report():
-    today = datetime.date.today()
-    first_day = today.replace(day=1)
-    date_from = first_day.strftime("%Y-%m-%d")
-    date_to = today.strftime("%Y-%m-%d")
-
-    data_rows = get_ozon_monthly_analytics(date_from, date_to)
-    if data_rows is None:
-        return None, None, None
-
-    metrics_names = ["ordered_units", "ordered_sum", "delivered_units", "delivered_sum", "canceled_units", "canceled_sum"]
-    daily_data = {}
-    for row in data_rows:
-        if "dimensions" in row and len(row["dimensions"]) > 0:
-            date_str = row["dimensions"][0].get("id", "")
-            if date_str:
-                daily_data[date_str] = extract_metrics_from_day_data(row, metrics_names)
-
-    today_str = today.strftime("%Y-%m-%d")
-    yesterday_str = (today - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-
-    today_metrics = daily_data.get(today_str, {})
-    yesterday_metrics = daily_data.get(yesterday_str, {})
-
-    month_metrics = {name: 0 for name in metrics_names}
-    for day_metrics in daily_data.values():
-        for name in metrics_names:
-            month_metrics[name] += day_metrics.get(name, 0)
-
-    return today_metrics, yesterday_metrics, month_metrics
 
 # ---------- РАССЫЛКА ПО РАСПИСАНИЮ ----------
 async def send_scheduled_report(context):
