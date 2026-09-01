@@ -26,7 +26,7 @@ OZON_POSTING_FBO_URL = "https://api-seller.ozon.ru/v2/posting/fbo/list"
 MANAGERS_FILE = "managers.json"
 LOG_FILE = "/app/data/ozon_log.txt"
 
-# Состояния
+# Состояния для диалогов
 WAITING_DATE_SINGLE = 1
 WAITING_PERIOD_TYPE = 2
 WAITING_PERIOD_START = 3
@@ -197,11 +197,6 @@ def fetch_postings(date_from, date_to):
     return all_postings
 
 def aggregate_postings(postings, date_from=None, date_to=None):
-    """
-    Агрегирует отгрузки по дням.
-    Для метрик продаж (заказано, доставлено, отмены) используется цена продавца (old_price, если есть, иначе price).
-    Для налога используется цена покупателя (price).
-    """
     aggregated = {}
     for posting in postings:
         created_at = posting.get("created_at", "")
@@ -215,18 +210,16 @@ def aggregate_postings(postings, date_from=None, date_to=None):
 
         products = posting.get("products", [])
         total_units = 0
-        total_sum_seller = 0.0   # сумма по цене продавца (для метрик)
-        total_sum_buyer = 0.0    # сумма по цене покупателя (для налога)
+        total_sum_seller = 0.0
+        total_sum_buyer = 0.0
         for product in products:
             qty = int(product.get("quantity", 0))
-            # Цена покупателя (фактическая оплата)
             price_buyer_str = product.get("price", "0")
             try:
                 price_buyer = float(price_buyer_str)
             except:
                 price_buyer = 0.0
-            # Цена продавца (базовая). Используем old_price, если есть, иначе price_buyer
-            price_seller_str = product.get("old_price")  # может быть None
+            price_seller_str = product.get("old_price")
             if price_seller_str is not None:
                 try:
                     price_seller = float(price_seller_str)
@@ -241,31 +234,25 @@ def aggregate_postings(postings, date_from=None, date_to=None):
         status = posting.get("status", "")
         if date_str not in aggregated:
             aggregated[date_str] = {
-                # Метрики продаж (по цене продавца)
                 "ordered_units": 0,
                 "ordered_sum": 0.0,
                 "delivered_units": 0,
                 "delivered_sum": 0.0,
                 "canceled_units": 0,
                 "canceled_sum": 0.0,
-                # Для налога (по цене покупателя)
                 "taxable_delivered_sum": 0.0,
             }
 
-        # Все отгрузки добавляем в "заказано" (по цене продавца)
         aggregated[date_str]["ordered_units"] += total_units
         aggregated[date_str]["ordered_sum"] += total_sum_seller
 
-        # По статусу распределяем в доставленные/отмены (по цене продавца)
         if status in ("cancelled", "canceled"):
             aggregated[date_str]["canceled_units"] += total_units
             aggregated[date_str]["canceled_sum"] += total_sum_seller
         elif status in ("delivered", "completed"):
             aggregated[date_str]["delivered_units"] += total_units
             aggregated[date_str]["delivered_sum"] += total_sum_seller
-            # Для налога используем цену покупателя
             aggregated[date_str]["taxable_delivered_sum"] += total_sum_buyer
-        # остальные статусы остаются только в "заказано"
 
     return aggregated
 
@@ -574,13 +561,14 @@ async def debug_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     posting_number = args[0]
 
-    # 1. Получаем отгрузку
-    url_posting = "https://api-seller.ozon.ru/v2/posting/fbo/get"
     headers = {
         "Client-Id": OZON_CLIENT_ID,
         "Api-Key": OZON_API_KEY,
         "Content-Type": "application/json",
     }
+
+    # 1. Получаем отгрузку
+    url_posting = "https://api-seller.ozon.ru/v2/posting/fbo/get"
     payload_posting = {"posting_number": posting_number}
     try:
         response = requests.post(url_posting, headers=headers, json=payload_posting, timeout=15)
@@ -608,28 +596,29 @@ async def debug_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg += f"  premium_price: {product.get('premium_price')}\n"
             msg += "\n"
 
-        # 2. Получаем финансовые данные через /v2/finance/realization
+        # 2. Получаем финансовые данные через /v2/finance/realization (исправленный запрос)
         url_finance = "https://api-seller.ozon.ru/v2/finance/realization"
         payload_finance = {
             "filter": {
                 "posting_number": posting_number
-            },
-            "limit": 1,
-            "offset": 0
+            }
         }
         try:
             response_finance = requests.post(url_finance, headers=headers, json=payload_finance, timeout=15)
-            response_finance.raise_for_status()
-            data_finance = response_finance.json()
-            finance_items = data_finance.get("result", {}).get("items", [])
-            if finance_items:
-                msg += "💰 Финансовые данные:\n"
-                fin = finance_items[0]
-                msg += json.dumps(fin, indent=2, ensure_ascii=False)
+            if response_finance.status_code != 200:
+                msg += f"❌ Ошибка получения финансов: код {response_finance.status_code}\n"
+                msg += f"Текст ошибки: {response_finance.text[:200]}\n"
             else:
-                msg += "💰 Финансовые данные: не найдены.\n"
+                data_finance = response_finance.json()
+                finance_items = data_finance.get("result", {}).get("items", [])
+                if finance_items:
+                    msg += "💰 Финансовые данные:\n"
+                    fin = finance_items[0]
+                    msg += json.dumps(fin, indent=2, ensure_ascii=False)
+                else:
+                    msg += "💰 Финансовые данные: не найдены.\n"
         except Exception as e:
-            msg += f"❌ Ошибка получения финансовых данных: {e}\n"
+            msg += f"❌ Исключение при запросе финансов: {e}\n"
 
         # Обрежем, если слишком длинное
         if len(msg) > 4000:
