@@ -1,4 +1,3 @@
-import asyncio
 import datetime
 import json
 import os
@@ -22,6 +21,7 @@ OZON_POSTING_FBO_URL = "https://api-seller.ozon.ru/v2/posting/fbo/list"
 MANAGERS_FILE = "managers.json"
 LOG_FILE = "/app/data/ozon_log.txt"
 
+# Состояния для диалогов
 WAITING_DATE_SINGLE = 1
 WAITING_PERIOD_TYPE = 2
 WAITING_PERIOD_START = 3
@@ -33,6 +33,7 @@ WAITING_QUARTER_SELECT = 8
 WAITING_YEAR_SELECT = 9
 # =====================================================
 
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
 def write_log(message):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     full_msg = f"[{timestamp}] {message}"
@@ -76,6 +77,7 @@ def remove_manager(chat_id):
         return True
     return False
 
+# ---------- КАЛЕНДАРЬ ----------
 def create_calendar(year, month, callback_prefix):
     month_names = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
                    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
@@ -109,6 +111,7 @@ def create_calendar(year, month, callback_prefix):
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data=f"{callback_prefix}cancel")])
     return InlineKeyboardMarkup(keyboard)
 
+# ---------- ПОЛУЧЕНИЕ ДАННЫХ ИЗ OZON ----------
 def fetch_postings(date_from, date_to):
     headers = {
         "Client-Id": OZON_CLIENT_ID,
@@ -244,6 +247,7 @@ def get_current_metrics():
 
     return today_data, yesterday_data, month_data
 
+# ---------- ФОРМАТИРОВАНИЕ ----------
 def format_metrics(metrics, title):
     if not metrics or all(v == 0 for v in metrics.values()):
         return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
@@ -257,6 +261,7 @@ def format_metrics(metrics, title):
         f"  Штук: {metrics.get('canceled_units', 0)}"
     )
 
+# ---------- КЛАВИАТУРЫ ----------
 def main_admin_keyboard():
     buttons = [
         [KeyboardButton("📊 Отчёт")],
@@ -285,6 +290,7 @@ def admin_keyboard():
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
+# ---------- ОБРАБОТЧИКИ КОМАНД ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id == ADMIN_CHAT_ID:
@@ -412,11 +418,13 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Неизвестная команда.")
 
+# ---------- ОБРАБОТЧИКИ INLINE CALLBACK ----------
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
 
+    # ----- Календарь (выбор даты) -----
     if data.startswith("date_"):
         if data == "date_cancel":
             await query.edit_message_text("Выбор даты отменён.")
@@ -447,6 +455,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_reply_markup(reply_markup=keyboard)
             return WAITING_DATE_SINGLE
 
+        # Выбор конкретной даты: date_2025-05-01
         date_str = data[5:]
         if re.match(r"\d{4}-\d{2}-\d{2}", date_str):
             metrics = get_metrics_for_date(date_str)
@@ -461,6 +470,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("Ошибка формата даты.")
             return WAITING_DATE_SINGLE
 
+    # ----- Выбор периода -----
     if data == "period_month":
         months = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
                   "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
@@ -499,6 +509,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return ConversationHandler.END
 
+    # ----- Месяц, квартал, год -----
     if data.startswith("month_"):
         month_num = int(data.split("_")[1])
         year = datetime.date.today().year
@@ -554,6 +565,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return ConversationHandler.END
 
+    # ----- Календарь для произвольного периода (начало) -----
     if data.startswith("start_"):
         if data == "start_cancel":
             await query.edit_message_text("Выбор периода отменён.")
@@ -597,6 +609,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("Ошибка формата даты.")
             return WAITING_PERIOD_START
 
+    # ----- Календарь для произвольного периода (конец) -----
     if data.startswith("end_"):
         if data == "end_cancel":
             await query.edit_message_text("Выбор периода отменён.")
@@ -657,6 +670,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text("Неизвестная команда.")
     return ConversationHandler.END
 
+# ---------- ДИАЛОГИ ДЛЯ АДМИНИСТРИРОВАНИЯ ----------
 async def add_manager_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Введите ID пользователя (только цифры):"
@@ -729,6 +743,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
+# ---------- ЗАПУСК ----------
 def main():
     if not all([OZON_CLIENT_ID, OZON_API_KEY, TELEGRAM_BOT_TOKEN]) or ADMIN_CHAT_ID == 0:
         write_log("❌ ОШИБКА: Не все переменные окружения установлены!")
@@ -760,7 +775,7 @@ def main():
         handle_admin_menu
     ))
 
-    # ConversationHandler для выбора даты (без per_message, чтобы избежать предупреждений)
+    # ConversationHandler для выбора даты (без per_message)
     conv_date = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📆 Выбрать дату"), handle_reports_menu)],
         states={
@@ -769,6 +784,7 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    # ConversationHandler для выбора периода
     conv_period = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📊 Выбрать период"), handle_reports_menu)],
         states={
@@ -803,8 +819,10 @@ def main():
     application.add_handler(conv_add_manager)
     application.add_handler(conv_remove_manager)
 
+    # Обработчик всех callback-запросов
     application.add_handler(CallbackQueryHandler(handle_callback_query))
 
+    # Планировщик автоматических отчётов
     async def scheduled_report(context):
         moscow_tz = datetime.timezone(datetime.timedelta(hours=3))
         now = datetime.datetime.now(moscow_tz)
