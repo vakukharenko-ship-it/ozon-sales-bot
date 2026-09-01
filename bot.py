@@ -83,7 +83,7 @@ def write_log(message):
     except Exception as e:
         print(f"⚠️ Не удалось записать в файл: {e}", flush=True)
 
-# ---------- ЗАПРОС К OZON API (ОДИН ЗАПРОС ЗА МЕСЯЦ) ----------
+# ---------- ЗАПРОС К OZON API (ОДИН ЗАПРОС С ПОВТОРАМИ) ----------
 def get_ozon_monthly_analytics(date_from, date_to):
     write_log(f"📤 Запрос к Ozon за период {date_from} – {date_to} (весь месяц)")
 
@@ -104,19 +104,20 @@ def get_ozon_monthly_analytics(date_from, date_to):
         "date_from": date_from,
         "date_to": date_to,
         "metrics": metrics_list,
-        "dimension": ["day"],        # ✅ Правильный формат
+        "dimension": ["day"],
         "filters": [],
         "sort": [],
         "limit": 1000,
     }
 
-    # Повторяем запрос при ошибке 429
-    for attempt in range(3):
+    max_attempts = 5
+    for attempt in range(max_attempts):
         try:
             response = requests.post(OZON_ANALYTICS_URL, headers=headers, json=payload, timeout=15)
             if response.status_code == 429:
-                write_log(f"⚠️ 429 Too Many Requests, повтор через 5 сек (попытка {attempt+1})")
-                time.sleep(5)
+                wait = 10 * (attempt + 1)  # 10, 20, 30, 40, 50 секунд
+                write_log(f"⚠️ 429 Too Many Requests, повтор через {wait} сек (попытка {attempt+1}/{max_attempts})")
+                time.sleep(wait)
                 continue
             response.raise_for_status()
             data = response.json()
@@ -128,9 +129,9 @@ def get_ozon_monthly_analytics(date_from, date_to):
                 return None
         except requests.exceptions.RequestException as e:
             write_log(f"❌ Ошибка запроса: {e}")
-            if attempt == 2:
+            if attempt == max_attempts - 1:
                 return None
-            time.sleep(2)
+            time.sleep(5)
         except Exception as e:
             write_log(f"❌ Ошибка обработки: {e}")
             return None
