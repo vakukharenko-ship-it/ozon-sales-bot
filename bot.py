@@ -347,12 +347,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(chat_id):
         name = user.first_name if user.first_name else ""
         greeting = get_greeting(name)
-        await update.message.reply_text(f"{greeting}\n👋 Добро пожаловать, администратор!", reply_markup=main_admin_keyboard())
+        await update.message.reply_text(greeting, reply_markup=main_admin_keyboard())
     elif is_manager(chat_id):
         manager = get_manager_info(chat_id)
         name = manager.get("first_name") if manager and manager.get("first_name") else user.first_name or ""
         greeting = get_greeting(name)
-        await update.message.reply_text(f"{greeting}\n👋 Добро пожаловать, менеджер!", reply_markup=main_user_keyboard())
+        await update.message.reply_text(greeting, reply_markup=main_user_keyboard())
     else:
         await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.", reply_markup=ReplyKeyboardRemove())
 
