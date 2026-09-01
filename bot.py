@@ -597,20 +597,28 @@ async def debug_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += "\n"
 
         # 2. Получаем финансовые данные через /v2/finance/realization
-        # Извлекаем год из created_at (первые 4 символа)
+        # Извлекаем год из created_at
         try:
             year = int(created_at[:4]) if created_at and len(created_at) >= 4 else datetime.datetime.now().year
         except:
             year = datetime.datetime.now().year
         msg += f"📅 Год для финансового запроса: {year}\n"
 
+        # Формируем даты для фильтра: весь год
+        date_from = f"{year}-01-01"
+        date_to = f"{year}-12-31"
+
         url_finance = "https://api-seller.ozon.ru/v2/finance/realization"
         payload_finance = {
             "filter": {
                 "posting_number": posting_number,
-                "year": year
+                "year": year,
+                "date_from": date_from,
+                "date_to": date_to
             }
         }
+        msg += f"📤 Запрос финансов: {json.dumps(payload_finance, ensure_ascii=False)}\n"
+
         try:
             response_finance = requests.post(url_finance, headers=headers, json=payload_finance, timeout=15)
             if response_finance.status_code != 200:
