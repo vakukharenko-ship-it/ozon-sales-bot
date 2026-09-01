@@ -5,11 +5,16 @@ import time
 import re
 import calendar
 import requests
+import warnings
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, MessageHandler,
     filters, ConversationHandler, CallbackQueryHandler
 )
+from telegram.warnings import PTBUserWarning
+
+# Подавляем несущественные предупреждения PTB
+warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== КОНФИГУРАЦИЯ ====================
 OZON_CLIENT_ID = os.getenv("OZON_CLIENT_ID")
@@ -305,7 +310,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text(
-            "Доступ запрещён.",
+            "❌ Нет доступа! Обратитесь к администратору.",
             reply_markup=ReplyKeyboardRemove()
         )
 
@@ -314,6 +319,10 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     if text == "📊 Отчёт":
+        # Проверяем, есть ли доступ к отчётам
+        if not (chat_id == ADMIN_CHAT_ID or is_manager(chat_id)):
+            await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.")
+            return
         await update.message.reply_text(
             "Выберите тип отчёта:",
             reply_markup=reports_keyboard()
@@ -334,6 +343,27 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_reports_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
+    chat_id = update.effective_chat.id
+
+    # Все действия в подменю отчётов требуют прав менеджера или администратора
+    if text == "🔙 Назад":
+        # Возврат в главное меню без проверки прав
+        if chat_id == ADMIN_CHAT_ID:
+            await update.message.reply_text(
+                "Главное меню",
+                reply_markup=main_admin_keyboard()
+            )
+        else:
+            await update.message.reply_text(
+                "Главное меню",
+                reply_markup=main_user_keyboard()
+            )
+        return
+
+    # Для всех остальных пунктов проверяем права
+    if not (chat_id == ADMIN_CHAT_ID or is_manager(chat_id)):
+        await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.")
+        return
 
     if text == "📅 Текущие показатели":
         today_m, yesterday_m, month_m = get_current_metrics()
@@ -375,20 +405,6 @@ async def handle_reports_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return WAITING_PERIOD_TYPE
 
-    if text == "🔙 Назад":
-        chat_id = update.effective_chat.id
-        if chat_id == ADMIN_CHAT_ID:
-            await update.message.reply_text(
-                "Главное меню",
-                reply_markup=main_admin_keyboard()
-            )
-        else:
-            await update.message.reply_text(
-                "Главное меню",
-                reply_markup=main_user_keyboard()
-            )
-        return
-
     await update.message.reply_text("Неизвестная команда.")
 
 async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -423,6 +439,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     data = query.data
+    chat_id = update.effective_chat.id
+
+    # Проверяем права доступа для всех callback'ов, кроме отмены
+    if not (chat_id == ADMIN_CHAT_ID or is_manager(chat_id)):
+        await query.edit_message_text("❌ Нет доступа! Обратитесь к администратору.")
+        return ConversationHandler.END
 
     # ----- Календарь (выбор даты) -----
     if data.startswith("date_"):
@@ -767,7 +789,7 @@ def main():
         handle_main_menu
     ))
     application.add_handler(MessageHandler(
-        filters.Text(["📅 Текущие показатели", "🔙 Назад"]),
+        filters.Text(["📅 Текущие показатели", "📆 Выбрать дату", "📊 Выбрать период", "🔙 Назад"]),
         handle_reports_menu
     ))
     application.add_handler(MessageHandler(
@@ -775,7 +797,7 @@ def main():
         handle_admin_menu
     ))
 
-    # ConversationHandler для выбора даты (без per_message)
+    # ConversationHandler для выбора даты
     conv_date = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📆 Выбрать дату"), handle_reports_menu)],
         states={
