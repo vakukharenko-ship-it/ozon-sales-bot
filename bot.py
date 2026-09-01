@@ -283,7 +283,7 @@ def get_performance_token():
 def fetch_advertising_expense(date_from, date_to):
     """
     Получает сумму расходов на рекламу за период через Performance API.
-    С расширенным логированием для отладки.
+    Парсит поле moneySpent в массиве rows.
     """
     token = get_performance_token()
     if not token:
@@ -309,10 +309,24 @@ def fetch_advertising_expense(date_from, date_to):
         write_log(f"📥 Статус ответа Performance API: {response.status_code}")
         response.raise_for_status()
         data = response.json()
-        write_log(f"📥 Ответ Performance API: {json.dumps(data, ensure_ascii=False)[:500]}")  # первые 500 символов
+        write_log(f"📥 Ответ Performance API: {json.dumps(data, ensure_ascii=False)[:500]}")
 
         total_expense = 0.0
-        if isinstance(data, list):
+        # Ожидаемый формат: {"rows": [{"moneySpent": "2186,74", ...}, ...]}
+        if isinstance(data, dict) and "rows" in data:
+            rows = data["rows"]
+            if isinstance(rows, list):
+                for item in rows:
+                    money_spent_str = item.get("moneySpent")
+                    if money_spent_str is not None:
+                        # Заменяем запятую на точку и преобразуем в float
+                        try:
+                            money_spent = float(money_spent_str.replace(",", "."))
+                            total_expense += money_spent
+                        except:
+                            pass
+        # Альтернативные форматы (на случай, если структура изменится)
+        elif isinstance(data, list):
             for item in data:
                 expense = item.get("expense") or item.get("cost") or 0
                 try:
