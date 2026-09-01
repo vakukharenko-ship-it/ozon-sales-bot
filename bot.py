@@ -6,12 +6,12 @@ import requests
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, ConversationHandler
 
-# ---------------------- БЕЗОПАСНОЕ ПОЛУЧЕНИЕ КЛЮЧЕЙ ----------------------
+# ---------------------- КЛЮЧИ ----------------------
 OZON_CLIENT_ID = os.getenv("OZON_CLIENT_ID")
 OZON_API_KEY = os.getenv("OZON_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
-# -------------------------------------------------------------------------
+# ---------------------------------------------------
 
 OZON_ANALYTICS_URL = "https://api-seller.ozon.ru/v1/analytics/data"
 MANAGERS_FILE = "managers.json"
@@ -51,8 +51,8 @@ def remove_manager(chat_id):
         save_managers(managers)
         return True
     return False
-# ------------------------------------------------
 
+# ---------- ЗАПРОС К OZON API ----------
 def get_ozon_analytics(date_from, date_to):
     headers = {
         "Client-Id": OZON_CLIENT_ID,
@@ -75,22 +75,34 @@ def get_ozon_analytics(date_from, date_to):
         "sort": [],
         "limit": 1000,
     }
+
+    print(f"📤 Запрос к Ozon за период {date_from} – {date_to}")  # ОТЛАДКА
+
     try:
-        response = requests.post(OZON_ANALYTICS_URL, headers=headers, json=payload, timeout=10)
+        response = requests.post(OZON_ANALYTICS_URL, headers=headers, json=payload, timeout=15)
         response.raise_for_status()
         data = response.json()
+
+        # ПЕЧАТАЕМ ОТВЕТ В ЛОГИ (важно!)
+        print(f"📥 Ответ Ozon: {json.dumps(data, indent=2, ensure_ascii=False)[:1000]}")  # первые 1000 символов
+
         if isinstance(data, dict) and "result" in data:
             return data
         else:
+            print("⚠️ Неожиданный формат ответа:", data)
             return None
-    except:
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Ошибка запроса: {e}")
+        return None
+    except Exception as e:
+        print(f"❌ Ошибка обработки: {e}")
         return None
 
 def format_sales_message(period_name, analytics_data):
     if not isinstance(analytics_data, dict) or "result" not in analytics_data:
         return f"❌ Нет данных за {period_name}."
     result = analytics_data["result"]
-    if not isinstance(result, list):
+    if not isinstance(result, list) or len(result) == 0:
         return f"❌ Нет данных за {period_name}."
     total_ordered_units = 0
     total_ordered_sum = 0
@@ -115,6 +127,7 @@ def format_sales_message(period_name, analytics_data):
     )
     return message
 
+# ---------- РАССЫЛКА ПО РАСПИСАНИЮ ----------
 async def send_scheduled_report(context):
     moscow_tz = datetime.timezone(datetime.timedelta(hours=3))
     now = datetime.datetime.now(moscow_tz)
@@ -141,7 +154,7 @@ async def send_scheduled_report(context):
             await context.bot.send_message(chat_id=chat_id, text=msg_yesterday, parse_mode="Markdown")
             await context.bot.send_message(chat_id=chat_id, text=msg_month, parse_mode="Markdown")
         except Exception as e:
-            print(f"Ошибка отправки для {chat_id}: {e}")
+            print(f"❌ Ошибка отправки для {chat_id}: {e}")
 
 # ---------- КЛАВИАТУРЫ ----------
 def get_admin_keyboard():
@@ -254,10 +267,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- ЗАПУСК ----------
 def main():
     if not all([OZON_CLIENT_ID, OZON_API_KEY, TELEGRAM_BOT_TOKEN]) or ADMIN_CHAT_ID == 0:
-        print("ОШИБКА: Не все переменные установлены!")
+        print("❌ ОШИБКА: Не все переменные установлены!")
         return
 
-    # Создаём приложение с увеличенными таймаутами
     application = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
@@ -283,16 +295,14 @@ def main():
     application.add_handler(conv)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # JobQueue
     job_queue = application.job_queue
     if job_queue:
         job_queue.run_repeating(send_scheduled_report, interval=60*60, first=0)
-        print("Планировщик запущен.")
+        print("✅ Планировщик запущен.")
     else:
-        print("JobQueue не доступен!")
+        print("⚠️ JobQueue не доступен!")
 
-    print("Бот запущен.")
-    # Запускаем polling с обработкой ошибок
+    print("🚀 Бот запущен.")
     application.run_polling(allowed_updates=Update.ALL_TYPES, timeout=30)
 
 if __name__ == "__main__":
