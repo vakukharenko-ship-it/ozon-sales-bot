@@ -154,6 +154,8 @@ def aggregate_postings(postings):
     "Отмены" = только со статусами cancelled/canceled.
     """
     aggregated = {}
+    status_stats = {}  # для отладки: сколько штук в каждом статусе
+    total_units_all = 0
     for posting in postings:
         metrics = extract_posting_metrics(posting)
         date_str = metrics["date"]
@@ -175,6 +177,10 @@ def aggregate_postings(postings):
         status = metrics["status"]
         units = metrics["units"]
         sum_val = metrics["sum"]
+        total_units_all += units
+        # Собираем статистику по статусам
+        status_stats[status] = status_stats.get(status, 0) + units
+
         # Отдельно добавляем в доставленные или отменённые
         if status in ["cancelled", "canceled"]:
             aggregated[date_str]["canceled_units"] += units
@@ -183,6 +189,10 @@ def aggregate_postings(postings):
             aggregated[date_str]["delivered_units"] += units
             aggregated[date_str]["delivered_sum"] += sum_val
         # Остальные статусы не добавляются в доставленные/отмены, но уже учтены в "заказано"
+
+    # Логируем статистику по статусам
+    write_log(f"📊 Статистика по статусам (штук): {status_stats}")
+    write_log(f"📊 Всего штук во всех отгрузках: {total_units_all}")
     return aggregated
 
 def get_full_report():
@@ -190,6 +200,7 @@ def get_full_report():
     first_day = today.replace(day=1)
     date_from = first_day.strftime("%Y-%m-%d")
     date_to = today.strftime("%Y-%m-%d")
+    write_log(f"📅 Запрос за период: {date_from} – {date_to}")
 
     postings = get_all_postings(date_from, date_to)
     agg = aggregate_postings(postings)
@@ -212,6 +223,8 @@ def get_full_report():
     for date, vals in agg.items():
         for key in month_data:
             month_data[key] += vals.get(key, 0)
+
+    write_log(f"📊 За месяц: ordered_units={month_data['ordered_units']}, delivered_units={month_data['delivered_units']}, canceled_units={month_data['canceled_units']}")
 
     return today_data, yesterday_data, month_data
 
