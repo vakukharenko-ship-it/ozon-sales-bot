@@ -9,7 +9,6 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 # ---------------------- ПРОВЕРКА ПЕРЕМЕННЫХ ----------------------
 def check_env():
-    """Проверяет наличие всех переменных и выводит информацию."""
     env_vars = {
         "OZON_CLIENT_ID": os.getenv("OZON_CLIENT_ID"),
         "OZON_API_KEY": os.getenv("OZON_API_KEY"),
@@ -33,7 +32,7 @@ ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 
 OZON_ANALYTICS_URL = "https://api-seller.ozon.ru/v1/analytics/data"
 MANAGERS_FILE = "managers.json"
-LOG_FILE = "/app/data/ozon_log.txt"  # файл для подробных логов
+LOG_FILE = "/app/data/ozon_log.txt"
 
 WAITING_FOR_ADD_ID = 1
 WAITING_FOR_REMOVE_ID = 2
@@ -73,7 +72,6 @@ def remove_manager(chat_id):
 
 # ---------- ЗАПИСЬ В ЛОГ-ФАЙЛ ----------
 def write_log(message):
-    """Записывает сообщение в файл и выводит в консоль."""
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     full_msg = f"[{timestamp}] {message}"
     print(full_msg, flush=True)
@@ -201,6 +199,7 @@ def get_user_keyboard():
 # ---------- ОБРАБОТЧИКИ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    write_log(f"👤 Команда /start от {chat_id}")
     if chat_id == ADMIN_CHAT_ID:
         await update.message.reply_text("👋 Администратор!", reply_markup=get_admin_keyboard())
     elif is_manager(chat_id):
@@ -209,14 +208,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Доступ запрещён.", reply_markup=ReplyKeyboardMarkup([], resize_keyboard=True))
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
     chat_id = update.effective_chat.id
+    text = update.message.text
+    # Логируем ВСЕ входящие сообщения
+    write_log(f"📩 Получено сообщение от {chat_id}: '{text}'")
 
     if text == "📊 Отчёт":
+        write_log(f"📊 Пользователь {chat_id} запросил отчёт")
         if not is_manager(chat_id):
             await update.message.reply_text("⛔ Нет доступа.")
             return
-        write_log(f"👤 Пользователь {chat_id} запросил отчёт")
         today = datetime.date.today()
         today_str = today.strftime("%Y-%m-%d")
         yesterday = today - datetime.timedelta(days=1)
@@ -296,7 +297,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- ЗАПУСК ----------
 def main():
-    # Проверяем переменные
     if not check_env():
         write_log("❌ ОШИБКА: Не все переменные окружения установлены! Бот не запустится.")
         return
