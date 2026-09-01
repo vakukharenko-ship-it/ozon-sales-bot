@@ -248,9 +248,6 @@ def aggregate_postings(postings, date_from=None, date_to=None):
 
 # ---------- ЗАПРОСЫ К OZON (PERFORMANCE API - РЕКЛАМА) ----------
 def get_performance_token():
-    """
-    Получает Bearer-токен для Performance API через эндпоинт /api/client/token.
-    """
     if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
         write_log("⚠️ OZON_PERFORMANCE_CLIENT_ID или CLIENT_SECRET не заданы!")
         return None
@@ -281,10 +278,6 @@ def get_performance_token():
         return None
 
 def fetch_advertising_expense(date_from, date_to):
-    """
-    Получает сумму расходов на рекламу за период через Performance API.
-    Парсит поле moneySpent в массиве rows.
-    """
     token = get_performance_token()
     if not token:
         write_log("⚠️ Не удалось получить токен. Рекламные расходы не будут отображаться.")
@@ -312,20 +305,17 @@ def fetch_advertising_expense(date_from, date_to):
         write_log(f"📥 Ответ Performance API: {json.dumps(data, ensure_ascii=False)[:500]}")
 
         total_expense = 0.0
-        # Ожидаемый формат: {"rows": [{"moneySpent": "2186,74", ...}, ...]}
         if isinstance(data, dict) and "rows" in data:
             rows = data["rows"]
             if isinstance(rows, list):
                 for item in rows:
                     money_spent_str = item.get("moneySpent")
                     if money_spent_str is not None:
-                        # Заменяем запятую на точку и преобразуем в float
                         try:
                             money_spent = float(money_spent_str.replace(",", "."))
                             total_expense += money_spent
                         except:
                             pass
-        # Альтернативные форматы (на случай, если структура изменится)
         elif isinstance(data, list):
             for item in data:
                 expense = item.get("expense") or item.get("cost") or 0
@@ -444,7 +434,6 @@ def format_metrics(metrics, title):
     if not metrics:
         return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
     
-    # Проверяем, есть ли хоть какие-то числовые данные, кроме рекламных
     has_data = False
     for key, val in metrics.items():
         if key in ["drr", "ad_expense"]:
@@ -620,35 +609,61 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("❌ Нет доступа! Обратитесь к администратору.")
         return ConversationHandler.END
 
-    # Обработка календаря (дата)
+    # ---------- КАЛЕНДАРЬ ДЛЯ ВЫБОРА ДАТЫ (префикс "date_") ----------
     if data.startswith("date_"):
         if data == "date_cancel":
             await query.edit_message_text("Выбор даты отменён.")
             await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
             return ConversationHandler.END
-        parts = data.split("_")
-        if len(parts) == 4 and parts[1] in ("prev_month", "next_month"):
-            action, year, month = parts[1], int(parts[2]), int(parts[3])
-            if action == "prev_month":
-                month -= 1
-                if month == 0: month, year = 12, year-1
+
+        # Проверяем навигацию: prev_month или next_month
+        if "prev_month" in data or "next_month" in data:
+            parts = data.split("_")
+            # parts должно быть ['date', 'prev_month', 'YEAR', 'MONTH']
+            if len(parts) == 4:
+                action = parts[1]  # 'prev_month' или 'next_month'
+                try:
+                    year = int(parts[2])
+                    month = int(parts[3])
+                except ValueError:
+                    await query.edit_message_text("❌ Ошибка в данных навигации.")
+                    return WAITING_DATE_SINGLE
+
+                # Корректируем месяц
+                if action == "prev_month":
+                    month -= 1
+                    if month == 0:
+                        month = 12
+                        year -= 1
+                elif action == "next_month":
+                    month += 1
+                    if month == 13:
+                        month = 1
+                        year += 1
+                else:
+                    await query.edit_message_text("❌ Неизвестное действие.")
+                    return WAITING_DATE_SINGLE
+
+                keyboard = create_calendar(year, month, "date_")
+                await query.edit_message_reply_markup(reply_markup=keyboard)
+                return WAITING_DATE_SINGLE
             else:
-                month += 1
-                if month == 13: month, year = 1, year+1
-            keyboard = create_calendar(year, month, "date_")
-            await query.edit_message_reply_markup(reply_markup=keyboard)
-            return WAITING_DATE_SINGLE
-        date_str = data[5:]
+                await query.edit_message_text("❌ Ошибка формата навигации.")
+                return WAITING_DATE_SINGLE
+
+        # Если не навигация, пробуем распарсить дату
+        date_str = data[5:]  # убираем "date_"
         if re.match(r"\d{4}-\d{2}-\d{2}", date_str):
             metrics = get_metrics_for_date(date_str)
             msg = format_metrics(metrics, f"Отчёт за {date_str}")
             await query.edit_message_text(msg, parse_mode="Markdown")
             await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
             return ConversationHandler.END
-        await query.edit_message_text("Ошибка формата даты.")
-        return WAITING_DATE_SINGLE
+        else:
+            await query.edit_message_text("❌ Ошибка формата даты.")
+            return WAITING_DATE_SINGLE
 
-    # Выбор периода (общее)
+    # ---------- ВЫБОР ПЕРИОДА (общие действия) ----------
     if data == "period_month":
         current_year = get_moscow_today().year
         years = list(range(current_year - 9, current_year + 1))
@@ -684,7 +699,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
         return ConversationHandler.END
 
-    # Выбор года для месяца
+    # ---------- ВЫБОР ГОДА ДЛЯ МЕСЯЦА ----------
     if data.startswith("period_year_month_"):
         year = int(data.split("_")[-1])
         context.user_data['period_year'] = year
@@ -695,7 +710,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(f"Выберите месяц {year}:", reply_markup=InlineKeyboardMarkup(buttons))
         return WAITING_PERIOD_MONTH
 
-    # Выбор года для квартала
+    # ---------- ВЫБОР ГОДА ДЛЯ КВАРТАЛА ----------
     if data.startswith("period_year_quarter_"):
         year = int(data.split("_")[-1])
         context.user_data['period_year'] = year
@@ -705,7 +720,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(f"Выберите квартал {year}:", reply_markup=InlineKeyboardMarkup(buttons))
         return WAITING_PERIOD_QUARTER
 
-    # Только год
+    # ---------- ТОЛЬКО ГОД ----------
     if data.startswith("period_year_only_"):
         year = int(data.split("_")[-1])
         first_day = datetime.date(year, 1, 1)
@@ -716,7 +731,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
         return ConversationHandler.END
 
-    # Месяц после выбора года
+    # ---------- МЕСЯЦ ПОСЛЕ ВЫБОРА ГОДА ----------
     if data.startswith("period_month_"):
         parts = data.split("_")
         month_num, year = int(parts[2]), int(parts[3])
@@ -732,7 +747,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
         return ConversationHandler.END
 
-    # Квартал после выбора года
+    # ---------- КВАРТАЛ ПОСЛЕ ВЫБОРА ГОДА ----------
     if data.startswith("period_quarter_"):
         parts = data.split("_")
         q, year = int(parts[2]), int(parts[3])
@@ -750,57 +765,102 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
         return ConversationHandler.END
 
-    # Произвольный период – начало
+    # ---------- ПРОИЗВОЛЬНЫЙ ПЕРИОД – НАЧАЛО (префикс "start_") ----------
     if data.startswith("start_"):
         if data == "start_cancel":
             await query.edit_message_text("Выбор периода отменён.")
             await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
             return ConversationHandler.END
-        parts = data.split("_")
-        if len(parts) == 4 and parts[1] in ("prev_month", "next_month"):
-            action, year, month = parts[1], int(parts[2]), int(parts[3])
-            if action == "prev_month":
-                month -= 1
-                if month == 0: month, year = 12, year-1
+
+        if "prev_month" in data or "next_month" in data:
+            parts = data.split("_")
+            if len(parts) == 4:
+                action = parts[1]
+                try:
+                    year = int(parts[2])
+                    month = int(parts[3])
+                except ValueError:
+                    await query.edit_message_text("❌ Ошибка в данных навигации.")
+                    return WAITING_PERIOD_START
+
+                if action == "prev_month":
+                    month -= 1
+                    if month == 0:
+                        month = 12
+                        year -= 1
+                elif action == "next_month":
+                    month += 1
+                    if month == 13:
+                        month = 1
+                        year += 1
+                else:
+                    await query.edit_message_text("❌ Неизвестное действие.")
+                    return WAITING_PERIOD_START
+
+                keyboard = create_calendar(year, month, "start_")
+                await query.edit_message_reply_markup(reply_markup=keyboard)
+                return WAITING_PERIOD_START
             else:
-                month += 1
-                if month == 13: month, year = 1, year+1
-            keyboard = create_calendar(year, month, "start_")
-            await query.edit_message_reply_markup(reply_markup=keyboard)
-            return WAITING_PERIOD_START
-        date_str = data[6:]
+                await query.edit_message_text("❌ Ошибка формата навигации.")
+                return WAITING_PERIOD_START
+
+        # Парсим дату начала
+        date_str = data[6:]  # убираем "start_"
         if re.match(r"\d{4}-\d{2}-\d{2}", date_str):
             context.user_data['period_start_date'] = date_str
             now = get_moscow_today()
             keyboard = create_calendar(now.year, now.month, "end_")
             await query.edit_message_text(f"Начало: {date_str}\nТеперь выберите конечную дату:", reply_markup=keyboard)
             return WAITING_PERIOD_END
-        await query.edit_message_text("Ошибка формата даты.")
-        return WAITING_PERIOD_START
+        else:
+            await query.edit_message_text("❌ Ошибка формата даты.")
+            return WAITING_PERIOD_START
 
-    # Произвольный период – конец
+    # ---------- ПРОИЗВОЛЬНЫЙ ПЕРИОД – КОНЕЦ (префикс "end_") ----------
     if data.startswith("end_"):
         if data == "end_cancel":
             await query.edit_message_text("Выбор периода отменён.")
             await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
             return ConversationHandler.END
-        parts = data.split("_")
-        if len(parts) == 4 and parts[1] in ("prev_month", "next_month"):
-            action, year, month = parts[1], int(parts[2]), int(parts[3])
-            if action == "prev_month":
-                month -= 1
-                if month == 0: month, year = 12, year-1
+
+        if "prev_month" in data or "next_month" in data:
+            parts = data.split("_")
+            if len(parts) == 4:
+                action = parts[1]
+                try:
+                    year = int(parts[2])
+                    month = int(parts[3])
+                except ValueError:
+                    await query.edit_message_text("❌ Ошибка в данных навигации.")
+                    return WAITING_PERIOD_END
+
+                if action == "prev_month":
+                    month -= 1
+                    if month == 0:
+                        month = 12
+                        year -= 1
+                elif action == "next_month":
+                    month += 1
+                    if month == 13:
+                        month = 1
+                        year += 1
+                else:
+                    await query.edit_message_text("❌ Неизвестное действие.")
+                    return WAITING_PERIOD_END
+
+                keyboard = create_calendar(year, month, "end_")
+                await query.edit_message_reply_markup(reply_markup=keyboard)
+                return WAITING_PERIOD_END
             else:
-                month += 1
-                if month == 13: month, year = 1, year+1
-            keyboard = create_calendar(year, month, "end_")
-            await query.edit_message_reply_markup(reply_markup=keyboard)
-            return WAITING_PERIOD_END
-        end_date_str = data[4:]
+                await query.edit_message_text("❌ Ошибка формата навигации.")
+                return WAITING_PERIOD_END
+
+        # Парсим дату конца
+        end_date_str = data[4:]  # убираем "end_"
         if re.match(r"\d{4}-\d{2}-\d{2}", end_date_str):
             start_date = context.user_data.get('period_start_date')
             if not start_date:
-                await query.edit_message_text("Ошибка: начальная дата не найдена. Попробуйте снова.")
+                await query.edit_message_text("❌ Ошибка: начальная дата не найдена. Попробуйте снова.")
                 return ConversationHandler.END
             if start_date > end_date_str:
                 await query.edit_message_text("❌ Начальная дата позже конечной. Попробуйте сначала.")
@@ -814,10 +874,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
             context.user_data.pop('period_start_date', None)
             return ConversationHandler.END
-        await query.edit_message_text("Ошибка формата даты.")
-        return WAITING_PERIOD_END
+        else:
+            await query.edit_message_text("❌ Ошибка формата даты.")
+            return WAITING_PERIOD_END
 
-    await query.edit_message_text("Неизвестная команда.")
+    await query.edit_message_text("❌ Неизвестная команда.")
     return ConversationHandler.END
 
 # ---------- АДМИНИСТРИРОВАНИЕ ----------
