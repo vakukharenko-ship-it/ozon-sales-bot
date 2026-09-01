@@ -596,13 +596,13 @@ async def debug_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg += f"  premium_price: {product.get('premium_price')}\n"
             msg += "\n"
 
-        # 2. Получаем финансовые данные через /v2/finance/realization (с указанием года)
-        # Извлекаем год из created_at
+        # 2. Получаем финансовые данные через /v2/finance/realization
+        # Извлекаем год из created_at (первые 4 символа)
         try:
-            created_dt = datetime.datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-            year = created_dt.year
+            year = int(created_at[:4]) if created_at and len(created_at) >= 4 else datetime.datetime.now().year
         except:
             year = datetime.datetime.now().year
+        msg += f"📅 Год для финансового запроса: {year}\n"
 
         url_finance = "https://api-seller.ozon.ru/v2/finance/realization"
         payload_finance = {
