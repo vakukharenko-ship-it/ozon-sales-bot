@@ -38,6 +38,9 @@ WAITING_PERIOD_YEAR = 8
 WAITING_PERIOD_MONTH = 9
 WAITING_PERIOD_QUARTER = 10
 WAITING_YEAR_SELECT = 11
+
+# Ставка налога (7%)
+TAX_RATE = 0.07
 # =====================================================
 
 def write_log(message):
@@ -363,6 +366,9 @@ def get_metrics_for_date(date_str):
     else:
         metrics["effective_drr"] = None
 
+    # Налог (7% от суммы доставленных заказов)
+    metrics["tax"] = delivered_revenue * TAX_RATE
+
     return metrics
 
 def get_metrics_for_period(date_from, date_to):
@@ -394,6 +400,8 @@ def get_metrics_for_period(date_from, date_to):
     else:
         total["effective_drr"] = None
 
+    total["tax"] = delivered_revenue * TAX_RATE
+
     return total
 
 def get_current_metrics():
@@ -422,8 +430,8 @@ def get_current_metrics():
         for key in month_data:
             month_data[key] += vals.get(key, 0)
 
-    # Функция для расчёта ДРР и эффективного ДРР
-    def add_drr(metrics, ad_expense):
+    # Функция для расчёта ДРР, эффективного ДРР и налога
+    def add_drr_and_tax(metrics, ad_expense):
         metrics["ad_expense"] = ad_expense if ad_expense is not None else 0.0
         revenue = metrics.get("ordered_sum", 0)
         if revenue > 0 and ad_expense is not None:
@@ -435,16 +443,17 @@ def get_current_metrics():
             metrics["effective_drr"] = (ad_expense / delivered_revenue) * 100
         else:
             metrics["effective_drr"] = None
+        metrics["tax"] = delivered_revenue * TAX_RATE
         return metrics
 
     ad_expense_today = fetch_advertising_expense(today_str, today_str)
-    today_data = add_drr(today_data, ad_expense_today)
+    today_data = add_drr_and_tax(today_data, ad_expense_today)
 
     ad_expense_yesterday = fetch_advertising_expense(yesterday_str, yesterday_str)
-    yesterday_data = add_drr(yesterday_data, ad_expense_yesterday)
+    yesterday_data = add_drr_and_tax(yesterday_data, ad_expense_yesterday)
 
     ad_expense_month = fetch_advertising_expense(date_from, date_to)
-    month_data = add_drr(month_data, ad_expense_month)
+    month_data = add_drr_and_tax(month_data, ad_expense_month)
 
     return today_data, yesterday_data, month_data
 
@@ -454,7 +463,7 @@ def format_metrics(metrics, title):
         return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
     has_data = False
     for key, val in metrics.items():
-        if key in ["drr", "effective_drr", "ad_expense"]:
+        if key in ["drr", "effective_drr", "ad_expense", "tax"]:
             continue
         if isinstance(val, (int, float)) and val != 0:
             has_data = True
@@ -465,6 +474,7 @@ def format_metrics(metrics, title):
     ad_expense = metrics.get("ad_expense", 0)
     drr = metrics.get("drr")
     eff_drr = metrics.get("effective_drr")
+    tax = metrics.get("tax", 0)
     drr_text = f"{drr:.2f}%" if drr is not None else "∞"
     eff_drr_text = f"{eff_drr:.2f}%" if eff_drr is not None else "∞"
 
@@ -479,7 +489,9 @@ def format_metrics(metrics, title):
         f"📢 *Реклама*\n"
         f"  Расходы: {ad_expense:,.2f} ₽\n"
         f"  ДРР (общий): {drr_text}\n"
-        f"  ДРР (по доставленным): {eff_drr_text}"
+        f"  ДРР (по доставленным): {eff_drr_text}\n\n"
+        f"🧾 *Налоги*\n"
+        f"  Налог (7% от доставленных): {tax:,.2f} ₽"
     )
 
 # ---------- КЛАВИАТУРЫ ----------
