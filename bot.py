@@ -85,7 +85,6 @@ def write_log(message):
 
 # ---------- ПОЛУЧЕНИЕ ОТГРУЗОК FBO ----------
 def get_all_postings(date_from, date_to):
-    """Возвращает список всех отгрузок за период."""
     headers = {
         "Client-Id": OZON_CLIENT_ID,
         "Api-Key": OZON_API_KEY,
@@ -94,7 +93,7 @@ def get_all_postings(date_from, date_to):
     payload = {
         "date_from": date_from,
         "date_to": date_to,
-        "status": "",          # все статусы
+        "status": "",
         "limit": 1000,
         "offset": 0,
     }
@@ -122,13 +121,6 @@ def get_all_postings(date_from, date_to):
     return all_postings
 
 def extract_posting_metrics(posting):
-    """
-    Извлекает из одной отгрузки:
-      - общее количество товаров (сумма quantity)
-      - общую сумму (сумма price * quantity)
-      - статус отгрузки
-      - дату создания (created_at)
-    """
     products = posting.get("products", [])
     total_units = 0
     total_sum = 0.0
@@ -144,7 +136,7 @@ def extract_posting_metrics(posting):
     status = posting.get("status", "")
     created_at = posting.get("created_at", "")
     if created_at:
-        date_str = created_at[:10]  # YYYY-MM-DD
+        date_str = created_at[:10]
     else:
         date_str = None
     return {
@@ -156,8 +148,10 @@ def extract_posting_metrics(posting):
 
 def aggregate_postings(postings):
     """
-    Агрегирует отгрузки по дням и статусам.
-    Возвращает словарь {date: {metrics}}
+    Агрегирует отгрузки по дням.
+    "Заказано" = сумма всех отгрузок (независимо от статуса).
+    "Доставлено" = только со статусами delivered/completed.
+    "Отмены" = только со статусами cancelled/canceled.
     """
     aggregated = {}
     for posting in postings:
@@ -174,18 +168,21 @@ def aggregate_postings(postings):
                 "canceled_units": 0,
                 "canceled_sum": 0.0,
             }
+        # Все отгрузки добавляем в "заказано"
+        aggregated[date_str]["ordered_units"] += metrics["units"]
+        aggregated[date_str]["ordered_sum"] += metrics["sum"]
+
         status = metrics["status"]
         units = metrics["units"]
         sum_val = metrics["sum"]
+        # Отдельно добавляем в доставленные или отменённые
         if status in ["cancelled", "canceled"]:
             aggregated[date_str]["canceled_units"] += units
             aggregated[date_str]["canceled_sum"] += sum_val
         elif status in ["delivered", "completed"]:
             aggregated[date_str]["delivered_units"] += units
             aggregated[date_str]["delivered_sum"] += sum_val
-        else:
-            aggregated[date_str]["ordered_units"] += units
-            aggregated[date_str]["ordered_sum"] += sum_val
+        # Остальные статусы не добавляются в доставленные/отмены, но уже учтены в "заказано"
     return aggregated
 
 def get_full_report():
