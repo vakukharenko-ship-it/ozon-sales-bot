@@ -2,9 +2,27 @@ import asyncio
 import datetime
 import json
 import os
+import sys
 import requests
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, ConversationHandler
+
+# ---------------------- ПРОВЕРКА ПЕРЕМЕННЫХ ----------------------
+def check_env():
+    """Проверяет наличие всех переменных и выводит информацию."""
+    env_vars = {
+        "OZON_CLIENT_ID": os.getenv("OZON_CLIENT_ID"),
+        "OZON_API_KEY": os.getenv("OZON_API_KEY"),
+        "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN"),
+        "ADMIN_CHAT_ID": os.getenv("ADMIN_CHAT_ID"),
+    }
+    print("🔍 Проверка переменных окружения:", flush=True)
+    for name, value in env_vars.items():
+        if value:
+            print(f"   ✅ {name} задан (длина: {len(value)})", flush=True)
+        else:
+            print(f"   ❌ {name} НЕ ЗАДАН!", flush=True)
+    return all(env_vars.values())
 
 # ---------------------- КЛЮЧИ ----------------------
 OZON_CLIENT_ID = os.getenv("OZON_CLIENT_ID")
@@ -15,6 +33,7 @@ ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 
 OZON_ANALYTICS_URL = "https://api-seller.ozon.ru/v1/analytics/data"
 MANAGERS_FILE = "managers.json"
+LOG_FILE = "/app/data/ozon_log.txt"  # файл для подробных логов
 
 WAITING_FOR_ADD_ID = 1
 WAITING_FOR_REMOVE_ID = 2
@@ -52,8 +71,23 @@ def remove_manager(chat_id):
         return True
     return False
 
+# ---------- ЗАПИСЬ В ЛОГ-ФАЙЛ ----------
+def write_log(message):
+    """Записывает сообщение в файл и выводит в консоль."""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    full_msg = f"[{timestamp}] {message}"
+    print(full_msg, flush=True)
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(full_msg + "\n")
+    except Exception as e:
+        print(f"⚠️ Не удалось записать в файл: {e}", flush=True)
+
 # ---------- ЗАПРОС К OZON API ----------
 def get_ozon_analytics(date_from, date_to):
+    write_log(f"📤 Запрос к Ozon за период {date_from} – {date_to}")
+
     headers = {
         "Client-Id": OZON_CLIENT_ID,
         "Api-Key": OZON_API_KEY,
@@ -76,26 +110,21 @@ def get_ozon_analytics(date_from, date_to):
         "limit": 1000,
     }
 
-    print(f"📤 Запрос к Ozon за период {date_from} – {date_to}")  # ОТЛАДКА
-
     try:
         response = requests.post(OZON_ANALYTICS_URL, headers=headers, json=payload, timeout=15)
         response.raise_for_status()
         data = response.json()
-
-        # ПЕЧАТАЕМ ОТВЕТ В ЛОГИ (важно!)
-        print(f"📥 Ответ Ozon: {json.dumps(data, indent=2, ensure_ascii=False)[:1000]}")  # первые 1000 символов
-
+        write_log(f"📥 Ответ Ozon (код {response.status_code}): {json.dumps(data, indent=2, ensure_ascii=False)[:1500]}")
         if isinstance(data, dict) and "result" in data:
             return data
         else:
-            print("⚠️ Неожиданный формат ответа:", data)
+            write_log("⚠️ Неожиданный формат ответа")
             return None
     except requests.exceptions.RequestException as e:
-        print(f"❌ Ошибка запроса: {e}")
+        write_log(f"❌ Ошибка запроса: {e}")
         return None
     except Exception as e:
-        print(f"❌ Ошибка обработки: {e}")
+        write_log(f"❌ Ошибка обработки: {e}")
         return None
 
 def format_sales_message(period_name, analytics_data):
@@ -154,7 +183,7 @@ async def send_scheduled_report(context):
             await context.bot.send_message(chat_id=chat_id, text=msg_yesterday, parse_mode="Markdown")
             await context.bot.send_message(chat_id=chat_id, text=msg_month, parse_mode="Markdown")
         except Exception as e:
-            print(f"❌ Ошибка отправки для {chat_id}: {e}")
+            write_log(f"❌ Ошибка отправки для {chat_id}: {e}")
 
 # ---------- КЛАВИАТУРЫ ----------
 def get_admin_keyboard():
@@ -187,6 +216,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_manager(chat_id):
             await update.message.reply_text("⛔ Нет доступа.")
             return
+        write_log(f"👤 Пользователь {chat_id} запросил отчёт")
         today = datetime.date.today()
         today_str = today.strftime("%Y-%m-%d")
         yesterday = today - datetime.timedelta(days=1)
@@ -266,9 +296,16 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- ЗАПУСК ----------
 def main():
-    if not all([OZON_CLIENT_ID, OZON_API_KEY, TELEGRAM_BOT_TOKEN]) or ADMIN_CHAT_ID == 0:
-        print("❌ ОШИБКА: Не все переменные установлены!")
+    # Проверяем переменные
+    if not check_env():
+        write_log("❌ ОШИБКА: Не все переменные окружения установлены! Бот не запустится.")
         return
+
+    if not all([OZON_CLIENT_ID, OZON_API_KEY, TELEGRAM_BOT_TOKEN]) or ADMIN_CHAT_ID == 0:
+        write_log("❌ ОШИБКА: Одна из переменных пуста или ADMIN_CHAT_ID = 0!")
+        return
+
+    write_log("🚀 Бот запускается...")
 
     application = (
         Application.builder()
@@ -298,11 +335,11 @@ def main():
     job_queue = application.job_queue
     if job_queue:
         job_queue.run_repeating(send_scheduled_report, interval=60*60, first=0)
-        print("✅ Планировщик запущен.")
+        write_log("✅ Планировщик запущен.")
     else:
-        print("⚠️ JobQueue не доступен!")
+        write_log("⚠️ JobQueue не доступен!")
 
-    print("🚀 Бот запущен.")
+    write_log("🚀 Бот готов к работе.")
     application.run_polling(allowed_updates=Update.ALL_TYPES, timeout=30)
 
 if __name__ == "__main__":
