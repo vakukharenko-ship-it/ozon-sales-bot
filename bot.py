@@ -54,10 +54,6 @@ def remove_manager(chat_id):
 # ------------------------------------------------
 
 def get_ozon_analytics(date_from, date_to):
-    """
-    Запрашивает аналитику у Ozon API.
-    Возвращает словарь с данными или None в случае ошибки.
-    """
     headers = {
         "Client-Id": OZON_CLIENT_ID,
         "Api-Key": OZON_API_KEY,
@@ -77,47 +73,32 @@ def get_ozon_analytics(date_from, date_to):
         "dimension": ["day"],
         "filters": [],
         "sort": [],
-        "limit": 1000,  # Добавлено для гарантии получения данных
+        "limit": 1000,
     }
     try:
         response = requests.post(OZON_ANALYTICS_URL, headers=headers, json=payload, timeout=10)
         response.raise_for_status()
         data = response.json()
-        # Проверяем, что пришёл ожидаемый ответ
         if isinstance(data, dict) and "result" in data:
             return data
         else:
-            print(f"Неожиданный формат ответа: {data}")
             return None
-    except requests.exceptions.RequestException as e:
-        print(f"Ошибка запроса к Ozon API: {e}")
-        return None
-    except ValueError as e:
-        print(f"Ошибка парсинга JSON: {e}")
+    except:
         return None
 
 def format_sales_message(period_name, analytics_data):
-    """
-    Форматирует данные аналитики в читаемое сообщение.
-    Если данные отсутствуют или некорректны, возвращает сообщение об ошибке.
-    """
-    # Проверяем, что analytics_data — словарь и содержит ключ "result"
     if not isinstance(analytics_data, dict) or "result" not in analytics_data:
         return f"❌ Нет данных за {period_name}."
-
     result = analytics_data["result"]
     if not isinstance(result, list):
         return f"❌ Нет данных за {period_name}."
-
     total_ordered_units = 0
     total_ordered_sum = 0
     total_delivered_units = 0
     total_delivered_sum = 0
     total_canceled_units = 0
     total_canceled_sum = 0
-
     for row in result:
-        # Каждая строка — словарь
         if not isinstance(row, dict):
             continue
         total_ordered_units += row.get("ordered_units", 0)
@@ -126,7 +107,6 @@ def format_sales_message(period_name, analytics_data):
         total_delivered_sum += row.get("delivered_sum", 0)
         total_canceled_units += row.get("canceled_units", 0)
         total_canceled_sum += row.get("canceled_sum", 0)
-
     message = (
         f"📊 *{period_name}*\n\n"
         f"🛒 *Заказано*\n  На сумму: {total_ordered_sum:,.2f} ₽\n  Штук: {total_ordered_units}\n\n"
@@ -136,31 +116,25 @@ def format_sales_message(period_name, analytics_data):
     return message
 
 async def send_scheduled_report(context):
-    """Функция, вызываемая по расписанию каждый час."""
     moscow_tz = datetime.timezone(datetime.timedelta(hours=3))
     now = datetime.datetime.now(moscow_tz)
     if not (9 <= now.hour <= 23):
         return
-
     managers = load_managers()
     if not managers:
         return
-
     today = datetime.date.today()
     today_str = today.strftime("%Y-%m-%d")
     yesterday = today - datetime.timedelta(days=1)
     yesterday_str = yesterday.strftime("%Y-%m-%d")
     first_day_of_month = today.replace(day=1)
     month_start_str = first_day_of_month.strftime("%Y-%m-%d")
-
     data_today = get_ozon_analytics(today_str, today_str)
     data_yesterday = get_ozon_analytics(yesterday_str, yesterday_str)
     data_month = get_ozon_analytics(month_start_str, today_str)
-
     msg_today = format_sales_message("Сегодня", data_today)
     msg_yesterday = format_sales_message("Вчера", data_yesterday)
     msg_month = format_sales_message("Текущий месяц", data_month)
-
     for chat_id in managers:
         try:
             await context.bot.send_message(chat_id=chat_id, text=msg_today, parse_mode="Markdown")
@@ -182,25 +156,15 @@ def get_user_keyboard():
     buttons = [[KeyboardButton("📊 Отчёт")]]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
-# ---------- ОБРАБОТЧИКИ СООБЩЕНИЙ ----------
+# ---------- ОБРАБОТЧИКИ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id == ADMIN_CHAT_ID:
-        await update.message.reply_text(
-            "👋 Добро пожаловать, администратор!\nИспользуйте кнопки ниже для управления.",
-            reply_markup=get_admin_keyboard()
-        )
+        await update.message.reply_text("👋 Администратор!", reply_markup=get_admin_keyboard())
     elif is_manager(chat_id):
-        await update.message.reply_text(
-            "👋 Здравствуйте, менеджер!\nНажмите кнопку «Отчёт» для получения статистики.",
-            reply_markup=get_user_keyboard()
-        )
+        await update.message.reply_text("👋 Менеджер!", reply_markup=get_user_keyboard())
     else:
-        await update.message.reply_text(
-            "🤖 Бот для статистики Ozon.\nДоступ предоставляется только авторизованным менеджерам.\n"
-            "Если вы менеджер, обратитесь к администратору для добавления.",
-            reply_markup=ReplyKeyboardMarkup([], resize_keyboard=True)
-        )
+        await update.message.reply_text("Доступ запрещён.", reply_markup=ReplyKeyboardMarkup([], resize_keyboard=True))
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -208,7 +172,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "📊 Отчёт":
         if not is_manager(chat_id):
-            await update.message.reply_text("⛔ У вас нет доступа к этой информации.")
+            await update.message.reply_text("⛔ Нет доступа.")
             return
         today = datetime.date.today()
         today_str = today.strftime("%Y-%m-%d")
@@ -229,79 +193,83 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "👥 Менеджеры (кол-во)":
         if chat_id != ADMIN_CHAT_ID:
-            await update.message.reply_text("⛔ Эта информация доступна только администратору.")
+            await update.message.reply_text("⛔ Только для админа.")
             return
         managers = load_managers()
-        count = len(managers)
-        await update.message.reply_text(f"📊 Количество авторизованных менеджеров: {count}")
+        await update.message.reply_text(f"📊 Менеджеров: {len(managers)}")
         return
 
     if chat_id != ADMIN_CHAT_ID:
-        await update.message.reply_text("⛔ Эта функция доступна только администратору.")
+        await update.message.reply_text("⛔ Только для админа.")
         return
 
     if text == "➕ Добавить менеджера":
-        await update.message.reply_text("Введите ID пользователя, которого хотите добавить (только цифры):")
+        await update.message.reply_text("Введите ID:")
         return WAITING_FOR_ADD_ID
 
     if text == "➖ Удалить менеджера":
-        await update.message.reply_text("Введите ID пользователя, которого хотите удалить (только цифры):")
+        await update.message.reply_text("Введите ID:")
         return WAITING_FOR_REMOVE_ID
 
     if text == "📋 Список менеджеров":
         managers = load_managers()
         if not managers:
-            await update.message.reply_text("Список менеджеров пуст.")
+            await update.message.reply_text("Список пуст.")
         else:
-            text_list = "📋 Список ID всех менеджеров:\n" + "\n".join(str(m) for m in managers)
-            await update.message.reply_text(text_list)
+            await update.message.reply_text("📋 " + "\n".join(str(m) for m in managers))
         return
 
-    await update.message.reply_text("Неизвестная команда. Используйте кнопки.")
+    await update.message.reply_text("Неизвестно.")
 
 async def add_manager_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
     try:
-        user_id = int(text.strip())
+        user_id = int(update.message.text.strip())
     except ValueError:
-        await update.message.reply_text("❌ ID должен быть числом. Попробуйте снова.")
+        await update.message.reply_text("❌ Ошибка, введите число.")
         return WAITING_FOR_ADD_ID
     if add_manager(user_id):
-        await update.message.reply_text(f"✅ Менеджер с ID {user_id} добавлен в список.")
+        await update.message.reply_text(f"✅ Добавлен {user_id}.")
     else:
-        await update.message.reply_text(f"⚠️ Менеджер с ID {user_id} уже есть в списке.")
-    await update.message.reply_text("Что дальше?", reply_markup=get_admin_keyboard())
+        await update.message.reply_text(f"⚠️ Уже есть.")
+    await update.message.reply_text("Готово.", reply_markup=get_admin_keyboard())
     return ConversationHandler.END
 
 async def remove_manager_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
     try:
-        user_id = int(text.strip())
+        user_id = int(update.message.text.strip())
     except ValueError:
-        await update.message.reply_text("❌ ID должен быть числом. Попробуйте снова.")
+        await update.message.reply_text("❌ Ошибка, введите число.")
         return WAITING_FOR_REMOVE_ID
     if remove_manager(user_id):
-        await update.message.reply_text(f"✅ Менеджер с ID {user_id} удалён из списка.")
+        await update.message.reply_text(f"✅ Удалён {user_id}.")
     else:
-        await update.message.reply_text(f"❌ Менеджер с ID {user_id} не найден в списке.")
-    await update.message.reply_text("Что дальше?", reply_markup=get_admin_keyboard())
+        await update.message.reply_text(f"❌ Не найден.")
+    await update.message.reply_text("Готово.", reply_markup=get_admin_keyboard())
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Действие отменено.", reply_markup=get_admin_keyboard())
+    await update.message.reply_text("Отменено.", reply_markup=get_admin_keyboard())
     return ConversationHandler.END
 
 # ---------- ЗАПУСК ----------
 def main():
     if not all([OZON_CLIENT_ID, OZON_API_KEY, TELEGRAM_BOT_TOKEN]) or ADMIN_CHAT_ID == 0:
-        print("ОШИБКА: Не все переменные окружения установлены или ADMIN_CHAT_ID не задан!")
+        print("ОШИБКА: Не все переменные установлены!")
         return
 
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # Создаём приложение с увеличенными таймаутами
+    application = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", start))
 
-    conv_handler = ConversationHandler(
+    conv = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Text("➕ Добавить менеджера"), handle_message),
             MessageHandler(filters.Text("➖ Удалить менеджера"), handle_message),
@@ -312,20 +280,20 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-    application.add_handler(conv_handler)
-
+    application.add_handler(conv)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Настраиваем JobQueue
+    # JobQueue
     job_queue = application.job_queue
     if job_queue:
-        job_queue.run_repeating(send_scheduled_report, interval=60 * 60, first=0)
-        print("Планировщик запущен: отчёты каждый час с 9 до 23 по МСК.")
+        job_queue.run_repeating(send_scheduled_report, interval=60*60, first=0)
+        print("Планировщик запущен.")
     else:
-        print("JobQueue не доступен! Убедитесь, что установлен python-telegram-bot[job-queue].")
+        print("JobQueue не доступен!")
 
     print("Бот запущен.")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Запускаем polling с обработкой ошибок
+    application.run_polling(allowed_updates=Update.ALL_TYPES, timeout=30)
 
 if __name__ == "__main__":
     main()
