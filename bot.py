@@ -32,7 +32,7 @@ ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 # ---------------------------------------------------
 
 OZON_ANALYTICS_URL = "https://api-seller.ozon.ru/v1/analytics/data"
-OZON_POSTING_FBO_URL = "https://api-seller.ozon.ru/v2/posting/fbo/list"  # ✅ актуальный эндпоинт для FBO
+OZON_POSTING_FBO_URL = "https://api-seller.ozon.ru/v2/posting/fbo/list"
 MANAGERS_FILE = "managers.json"
 LOG_FILE = "/app/data/ozon_log.txt"
 
@@ -86,7 +86,6 @@ def write_log(message):
 
 # ---------- ЗАПРОС К АНАЛИТИКЕ (КОЛИЧЕСТВО) ----------
 def get_ozon_analytics(date_from, date_to, metric_names):
-    """Возвращает словарь {дата: {metric: значение}} для указанных метрик."""
     headers = {
         "Client-Id": OZON_CLIENT_ID,
         "Api-Key": OZON_API_KEY,
@@ -135,7 +134,7 @@ def get_ozon_postings(date_from, date_to):
     payload = {
         "date_from": date_from,
         "date_to": date_to,
-        "status": "",          # все статусы
+        "status": "",
         "limit": 1000,
         "offset": 0,
     }
@@ -149,6 +148,9 @@ def get_ozon_postings(date_from, date_to):
             response.raise_for_status()
             data = response.json()
             postings = data.get("result", [])
+            if postings and not all_postings:
+                # Логируем структуру первой отгрузки для отладки
+                write_log(f"🔍 Пример отгрузки (первая): {json.dumps(postings[0], indent=2, ensure_ascii=False)[:1500]}")
             all_postings.extend(postings)
             if len(postings) < payload["limit"]:
                 break
@@ -156,6 +158,7 @@ def get_ozon_postings(date_from, date_to):
         except Exception as e:
             write_log(f"❌ Ошибка получения отгрузок FBO: {e}")
             break
+    write_log(f"📦 Всего получено отгрузок: {len(all_postings)}")
     return all_postings
 
 def extract_metrics_from_day_data(day_data, metric_names):
@@ -167,7 +170,6 @@ def extract_metrics_from_day_data(day_data, metric_names):
     return dict(zip(metric_names, values))
 
 def get_quantities(date_from, date_to):
-    """Возвращает словарь {дата: {ordered_units, delivered_units, canceled_units}}."""
     metric_names = ["ordered_units", "delivered_units", "canceled_units"]
     rows = get_ozon_analytics(date_from, date_to, metric_names)
     if rows is None:
@@ -181,29 +183,41 @@ def get_quantities(date_from, date_to):
     return result
 
 def get_amounts(date_from, date_to):
-    """Возвращает словарь {дата: {ordered_sum, delivered_sum, canceled_sum}} на основе отгрузок FBO."""
+    """
+    Извлекает суммы из отгрузок FBO.
+    Пытается найти сумму в полях:
+      - total_price (общая сумма)
+      - если нет, суммирует products[].price
+    """
     postings = get_ozon_postings(date_from, date_to)
     amounts = {}
     for posting in postings:
-        # Дата создания отгрузки
         created_at = posting.get("created_at", "")
         if not created_at:
             continue
-        date_str = created_at[:10]  # YYYY-MM-DD
+        date_str = created_at[:10]
         if date_str not in amounts:
             amounts[date_str] = {"ordered_sum": 0, "delivered_sum": 0, "canceled_sum": 0}
 
-        # Общая сумма заказа в отгрузке
-        total_price = float(posting.get("total_price", 0))
-        status = posting.get("status", "")
-
-        # Распределяем по статусу отгрузки
-        if status in ["cancelled", "canceled"]:
-            amounts[date_str]["canceled_sum"] += total_price
-        elif status in ["delivered", "completed"]:
-            amounts[date_str]["delivered_sum"] += total_price
+        # Ищем сумму
+        total = 0
+        if "total_price" in posting and posting["total_price"] is not None:
+            total = float(posting["total_price"])
         else:
-            amounts[date_str]["ordered_sum"] += total_price
+            # Если total_price нет, суммируем цены товаров
+            products = posting.get("products", [])
+            for product in products:
+                price = product.get("price", 0)
+                quantity = product.get("quantity", 1)
+                total += float(price) * int(quantity)
+
+        status = posting.get("status", "")
+        if status in ["cancelled", "canceled"]:
+            amounts[date_str]["canceled_sum"] += total
+        elif status in ["delivered", "completed"]:
+            amounts[date_str]["delivered_sum"] += total
+        else:
+            amounts[date_str]["ordered_sum"] += total
 
     return amounts
 
@@ -213,12 +227,9 @@ def get_full_report():
     date_from = first_day.strftime("%Y-%m-%d")
     date_to = today.strftime("%Y-%m-%d")
 
-    # Получаем количества
     quantities = get_quantities(date_from, date_to)
-    # Получаем суммы
     amounts = get_amounts(date_from, date_to)
 
-    # Объединяем
     all_dates = set(quantities.keys()) | set(amounts.keys())
     full_data = {}
     for d in all_dates:
@@ -237,7 +248,6 @@ def get_full_report():
     today_data = full_data.get(today_str, {})
     yesterday_data = full_data.get(yesterday_str, {})
 
-    # Суммируем за месяц
     month_data = {"ordered_units": 0, "delivered_units": 0, "canceled_units": 0,
                   "ordered_sum": 0, "delivered_sum": 0, "canceled_sum": 0}
     for d, vals in full_data.items():
