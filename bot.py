@@ -22,9 +22,9 @@ MANAGERS_FILE = "managers.json"
 LOG_FILE = "/app/data/ozon_log.txt"
 
 # Состояния для диалогов
-WAITING_DATE_SINGLE = 1          # для выбора конкретной даты
-WAITING_DATE_PERIOD_START = 2   # для периода: ожидание начальной даты
-WAITING_DATE_PERIOD_END = 3     # для периода: ожидание конечной даты
+WAITING_DATE_SINGLE = 1
+WAITING_DATE_PERIOD_START = 2
+WAITING_DATE_PERIOD_END = 3
 WAITING_ADD_MANAGER = 4
 WAITING_REMOVE_MANAGER = 5
 # =====================================================
@@ -74,7 +74,6 @@ def remove_manager(chat_id):
     return False
 
 def is_valid_date(date_str):
-    """Проверяет формат ГГГГ-ММ-ДД и существование даты."""
     try:
         datetime.datetime.strptime(date_str, "%Y-%m-%d")
         return True
@@ -112,7 +111,6 @@ def admin_keyboard():
 
 # ---------- ПОЛУЧЕНИЕ ДАННЫХ ИЗ OZON ----------
 def fetch_postings(date_from, date_to):
-    """Загружает все отгрузки FBO за указанный период."""
     headers = {
         "Client-Id": OZON_CLIENT_ID,
         "Api-Key": OZON_API_KEY,
@@ -148,18 +146,12 @@ def fetch_postings(date_from, date_to):
     return all_postings
 
 def aggregate_postings(postings, date_from=None, date_to=None):
-    """
-    Агрегирует отгрузки по дням.
-    Если заданы date_from/date_to, фильтрует отгрузки по дате создания.
-    Возвращает словарь {дата: метрики}.
-    """
     aggregated = {}
     for posting in postings:
         created_at = posting.get("created_at", "")
         if not created_at:
             continue
         date_str = created_at[:10]
-        # Если задан фильтр по датам – проверяем
         if date_from and date_str < date_from:
             continue
         if date_to and date_str > date_to:
@@ -198,15 +190,10 @@ def aggregate_postings(postings, date_from=None, date_to=None):
         elif status in ("delivered", "completed"):
             aggregated[date_str]["delivered_units"] += total_units
             aggregated[date_str]["delivered_sum"] += total_sum
-        # остальные статусы остаются только в "заказано"
 
     return aggregated
 
 def get_metrics_for_date(date_str):
-    """
-    Возвращает метрики за конкретный день (суммарно за этот день).
-    """
-    # Загружаем данные за месяц, чтобы охватить один день
     today = datetime.date.today()
     first_day = today.replace(day=1)
     date_from = first_day.strftime("%Y-%m-%d")
@@ -216,12 +203,8 @@ def get_metrics_for_date(date_str):
     return agg.get(date_str, {})
 
 def get_metrics_for_period(date_from, date_to):
-    """
-    Возвращает суммарные метрики за период (с date_from по date_to включительно).
-    """
     postings = fetch_postings(date_from, date_to)
     agg = aggregate_postings(postings, date_from=date_from, date_to=date_to)
-    # Суммируем по всем дням
     total = {
         "ordered_units": 0,
         "ordered_sum": 0.0,
@@ -236,7 +219,6 @@ def get_metrics_for_period(date_from, date_to):
     return total
 
 def get_current_metrics():
-    """Возвращает три словаря: сегодня, вчера, текущий месяц."""
     today = datetime.date.today()
     first_day = today.replace(day=1)
     date_from = first_day.strftime("%Y-%m-%d")
@@ -250,7 +232,6 @@ def get_current_metrics():
     today_data = agg.get(today_str, {})
     yesterday_data = agg.get(yesterday_str, {})
 
-    # Суммируем за месяц
     month_data = {
         "ordered_units": 0,
         "ordered_sum": 0.0,
@@ -265,9 +246,8 @@ def get_current_metrics():
 
     return today_data, yesterday_data, month_data
 
-# ---------- ФОРМАТИРОВАНИЕ СООБЩЕНИЙ ----------
+# ---------- ФОРМАТИРОВАНИЕ ----------
 def format_metrics(metrics, title):
-    """Форматирует словарь метрик в читаемое сообщение."""
     if not metrics or all(v == 0 for v in metrics.values()):
         return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
     return (
@@ -280,7 +260,7 @@ def format_metrics(metrics, title):
         f"  Штук: {metrics.get('canceled_units', 0)}"
     )
 
-# ---------- ОБРАБОТЧИКИ КОМАНД ----------
+# ---------- ОБРАБОТЧИКИ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id == ADMIN_CHAT_ID:
@@ -299,7 +279,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=ReplyKeyboardRemove()
         )
 
-# ---------- ОБРАБОТЧИК ГЛАВНОГО МЕНЮ (ОБЩИЙ) ----------
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat_id = update.effective_chat.id
@@ -321,10 +300,9 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Если пришло что-то другое – игнорируем или напоминаем
     await update.message.reply_text("Используйте кнопки меню.")
 
-# ---------- ОБРАБОТЧИКИ ПОДМЕНЮ "ОТЧЁТ" ----------
+# ---------- ОБРАБОТЧИКИ ПОДМЕНЮ "ОТЧЁТ" (без диалогов) ----------
 async def handle_reports_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
@@ -344,20 +322,7 @@ async def handle_reports_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    if text == "📆 Выбрать дату":
-        await update.message.reply_text(
-            "Введите дату в формате ГГГГ-ММ-ДД (например, 2026-09-01):"
-        )
-        return WAITING_DATE_SINGLE
-
-    if text == "📊 Выбрать период":
-        await update.message.reply_text(
-            "Введите начальную дату в формате ГГГГ-ММ-ДД:"
-        )
-        return WAITING_DATE_PERIOD_START
-
     if text == "🔙 Назад":
-        # Возврат в главное меню
         chat_id = update.effective_chat.id
         if chat_id == ADMIN_CHAT_ID:
             await update.message.reply_text(
@@ -371,29 +336,69 @@ async def handle_reports_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
         return
 
-    # Если неизвестная кнопка – игнорируем
-    await update.message.reply_text("Неизвестная команда. Используйте кнопки.")
+    # Кнопки "📆 Выбрать дату" и "📊 Выбрать период" обрабатываются ConversationHandler'ами,
+    # поэтому сюда они не попадают.
+    await update.message.reply_text("Неизвестная команда в подменю.")
 
-# ---------- ДИАЛОГ ВЫБОРА ДАТЫ ----------
+# ---------- ОБРАБОТЧИКИ ПОДМЕНЮ "АДМИНИСТРИРОВАНИЕ" (без диалогов) ----------
+async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id != ADMIN_CHAT_ID:
+        await update.message.reply_text("⛔ Только для администратора.")
+        return
+
+    text = update.message.text
+
+    if text == "📋 Список менеджеров":
+        managers = load_managers()
+        if not managers:
+            await update.message.reply_text("Список менеджеров пуст.")
+        else:
+            await update.message.reply_text(
+                "📋 Список ID менеджеров:\n" + "\n".join(str(m) for m in managers)
+            )
+        return
+
+    if text == "🔙 Назад":
+        await update.message.reply_text(
+            "Главное меню",
+            reply_markup=main_admin_keyboard()
+        )
+        return
+
+    # Кнопки "➕ Добавить менеджера" и "➖ Удалить менеджера" обрабатываются ConversationHandler'ами.
+    await update.message.reply_text("Неизвестная команда в администрировании.")
+
+# ---------- ДИАЛОГИ ----------
+async def single_date_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Введите дату в формате ГГГГ-ММ-ДД (например, 2026-09-01):"
+    )
+    return WAITING_DATE_SINGLE
+
 async def single_date_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     date_str = update.message.text.strip()
     if not is_valid_date(date_str):
         await update.message.reply_text(
-            "❌ Неверный формат. Введите дату в формате ГГГГ-ММ-ДД (например, 2026-09-01):"
+            "❌ Неверный формат. Введите дату в формате ГГГГ-ММ-ДД:"
         )
         return WAITING_DATE_SINGLE
 
     metrics = get_metrics_for_date(date_str)
     msg = format_metrics(metrics, f"Отчёт за {date_str}")
     await update.message.reply_text(msg, parse_mode="Markdown")
-    # Возвращаемся в подменю отчётов
     await update.message.reply_text(
         "Выберите действие:",
         reply_markup=reports_keyboard()
     )
     return ConversationHandler.END
 
-# ---------- ДИАЛОГ ВЫБОРА ПЕРИОДА ----------
+async def period_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Введите начальную дату в формате ГГГГ-ММ-ДД:"
+    )
+    return WAITING_DATE_PERIOD_START
+
 async def period_start_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     date_str = update.message.text.strip()
     if not is_valid_date(date_str):
@@ -421,7 +426,6 @@ async def period_end_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "❌ Начальная дата не может быть позже конечной. Попробуйте снова."
         )
-        # Очищаем и начинаем заново
         context.user_data.pop('period_start', None)
         await update.message.reply_text(
             "Введите начальную дату в формате ГГГГ-ММ-ДД:"
@@ -435,51 +439,15 @@ async def period_end_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Выберите действие:",
         reply_markup=reports_keyboard()
     )
-    # Очищаем данные пользователя
     context.user_data.pop('period_start', None)
     return ConversationHandler.END
 
-# ---------- ОБРАБОТЧИКИ ПОДМЕНЮ "АДМИНИСТРИРОВАНИЕ" ----------
-async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if chat_id != ADMIN_CHAT_ID:
-        await update.message.reply_text("⛔ Только для администратора.")
-        return
+async def add_manager_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Введите ID пользователя (только цифры):"
+    )
+    return WAITING_ADD_MANAGER
 
-    text = update.message.text
-    if text == "➕ Добавить менеджера":
-        await update.message.reply_text(
-            "Введите ID пользователя (только цифры):"
-        )
-        return WAITING_ADD_MANAGER
-
-    if text == "➖ Удалить менеджера":
-        await update.message.reply_text(
-            "Введите ID пользователя (только цифры):"
-        )
-        return WAITING_REMOVE_MANAGER
-
-    if text == "📋 Список менеджеров":
-        managers = load_managers()
-        if not managers:
-            await update.message.reply_text("Список менеджеров пуст.")
-        else:
-            await update.message.reply_text(
-                "📋 Список ID менеджеров:\n" + "\n".join(str(m) for m in managers)
-            )
-        return
-
-    if text == "🔙 Назад":
-        await update.message.reply_text(
-            "Главное меню",
-            reply_markup=main_admin_keyboard()
-        )
-        return
-
-    # Если неизвестная кнопка
-    await update.message.reply_text("Неизвестная команда. Используйте кнопки.")
-
-# ---------- ДИАЛОГ ДОБАВЛЕНИЯ/УДАЛЕНИЯ МЕНЕДЖЕРА ----------
 async def add_manager_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id != ADMIN_CHAT_ID:
@@ -503,6 +471,12 @@ async def add_manager_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=admin_keyboard()
     )
     return ConversationHandler.END
+
+async def remove_manager_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Введите ID пользователя (только цифры):"
+    )
+    return WAITING_REMOVE_MANAGER
 
 async def remove_manager_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -528,7 +502,6 @@ async def remove_manager_input(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     return ConversationHandler.END
 
-# ---------- ОТМЕНА ДИАЛОГОВ ----------
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id == ADMIN_CHAT_ID:
@@ -567,30 +540,30 @@ def main():
         handle_main_menu
     ))
 
-    # Обработчик подменю "Отчёт"
+    # Обработчик подменю "Отчёт" (только "Текущие показатели" и "Назад")
     application.add_handler(MessageHandler(
-        filters.Text(["📅 Текущие показатели", "📆 Выбрать дату", "📊 Выбрать период", "🔙 Назад"]),
+        filters.Text(["📅 Текущие показатели", "🔙 Назад"]),
         handle_reports_menu
     ))
 
-    # Обработчик подменю "Администрирование"
+    # Обработчик подменю "Администрирование" (только "Список менеджеров" и "Назад")
     application.add_handler(MessageHandler(
-        filters.Text(["➕ Добавить менеджера", "➖ Удалить менеджера", "📋 Список менеджеров", "🔙 Назад"]),
+        filters.Text(["📋 Список менеджеров", "🔙 Назад"]),
         handle_admin_menu
     ))
 
-    # ConversationHandler для диалога выбора даты
+    # ConversationHandler для выбора даты
     conv_date = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("📆 Выбрать дату"), handle_reports_menu)],
+        entry_points=[MessageHandler(filters.Text("📆 Выбрать дату"), single_date_start)],
         states={
             WAITING_DATE_SINGLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, single_date_input)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    # ConversationHandler для диалога выбора периода
+    # ConversationHandler для выбора периода
     conv_period = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("📊 Выбрать период"), handle_reports_menu)],
+        entry_points=[MessageHandler(filters.Text("📊 Выбрать период"), period_start)],
         states={
             WAITING_DATE_PERIOD_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, period_start_input)],
             WAITING_DATE_PERIOD_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, period_end_input)],
@@ -600,7 +573,7 @@ def main():
 
     # ConversationHandler для добавления менеджера
     conv_add_manager = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("➕ Добавить менеджера"), handle_admin_menu)],
+        entry_points=[MessageHandler(filters.Text("➕ Добавить менеджера"), add_manager_start)],
         states={
             WAITING_ADD_MANAGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_manager_input)],
         },
@@ -609,7 +582,7 @@ def main():
 
     # ConversationHandler для удаления менеджера
     conv_remove_manager = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("➖ Удалить менеджера"), handle_admin_menu)],
+        entry_points=[MessageHandler(filters.Text("➖ Удалить менеджера"), remove_manager_start)],
         states={
             WAITING_REMOVE_MANAGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_manager_input)],
         },
