@@ -125,7 +125,6 @@ def get_ozon_analytics(date_from, date_to, metric_names):
 
 # ---------- ЗАПРОС К СПИСКУ ОТГРУЗОК FBO (СУММЫ) ----------
 def get_ozon_postings(date_from, date_to):
-    """Возвращает список отгрузок FBO за период."""
     headers = {
         "Client-Id": OZON_CLIENT_ID,
         "Api-Key": OZON_API_KEY,
@@ -149,7 +148,6 @@ def get_ozon_postings(date_from, date_to):
             data = response.json()
             postings = data.get("result", [])
             if postings and not all_postings:
-                # Логируем структуру первой отгрузки для отладки
                 write_log(f"🔍 Пример отгрузки (первая): {json.dumps(postings[0], indent=2, ensure_ascii=False)[:1500]}")
             all_postings.extend(postings)
             if len(postings) < payload["limit"]:
@@ -184,13 +182,12 @@ def get_quantities(date_from, date_to):
 
 def get_amounts(date_from, date_to):
     """
-    Извлекает суммы из отгрузок FBO.
-    Пытается найти сумму в полях:
-      - total_price (общая сумма)
-      - если нет, суммирует products[].price
+    Извлекает суммы из отгрузок FBO, суммируя price * quantity по товарам.
+    Логирует первые 5 отгрузок для отладки.
     """
     postings = get_ozon_postings(date_from, date_to)
     amounts = {}
+    log_count = 0
     for posting in postings:
         created_at = posting.get("created_at", "")
         if not created_at:
@@ -199,17 +196,21 @@ def get_amounts(date_from, date_to):
         if date_str not in amounts:
             amounts[date_str] = {"ordered_sum": 0, "delivered_sum": 0, "canceled_sum": 0}
 
-        # Ищем сумму
-        total = 0
-        if "total_price" in posting and posting["total_price"] is not None:
-            total = float(posting["total_price"])
-        else:
-            # Если total_price нет, суммируем цены товаров
-            products = posting.get("products", [])
-            for product in products:
-                price = product.get("price", 0)
-                quantity = product.get("quantity", 1)
-                total += float(price) * int(quantity)
+        # Вычисляем сумму по товарам
+        total = 0.0
+        products = posting.get("products", [])
+        for product in products:
+            price_str = product.get("price", "0")
+            try:
+                price = float(price_str)
+            except:
+                price = 0.0
+            quantity = product.get("quantity", 1)
+            try:
+                qty = int(quantity)
+            except:
+                qty = 1
+            total += price * qty
 
         status = posting.get("status", "")
         if status in ["cancelled", "canceled"]:
@@ -218,6 +219,11 @@ def get_amounts(date_from, date_to):
             amounts[date_str]["delivered_sum"] += total
         else:
             amounts[date_str]["ordered_sum"] += total
+
+        # Логируем первые 5 отгрузок для проверки
+        if log_count < 5:
+            write_log(f"🔍 Отгрузка #{log_count+1}: дата={date_str}, статус={status}, сумма={total:.2f}")
+            log_count += 1
 
     return amounts
 
