@@ -375,21 +375,18 @@ def get_metrics_for_date(date_str):
     ad_expense = fetch_advertising_expense(date_str, date_str)
     metrics["ad_expense"] = ad_expense if ad_expense is not None else 0.0
 
-    # Обычный ДРР (от всех заказов по цене продавца)
     revenue = metrics.get("ordered_sum", 0)
     if revenue > 0 and ad_expense is not None:
         metrics["drr"] = (ad_expense / revenue) * 100
     else:
         metrics["drr"] = None
 
-    # Эффективный ДРР (от доставленных заказов по цене продавца)
     delivered_revenue = metrics.get("delivered_sum", 0)
     if delivered_revenue > 0 and ad_expense is not None:
         metrics["effective_drr"] = (ad_expense / delivered_revenue) * 100
     else:
         metrics["effective_drr"] = None
 
-    # Налог считаем от суммы доставленных по цене покупателя
     taxable_delivered = metrics.get("taxable_delivered_sum", 0)
     metrics["tax"] = taxable_delivered * TAX_RATE
 
@@ -547,7 +544,7 @@ def admin_keyboard():
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
-# ---------- ОБРАБОТЧИКИ ----------
+# ---------- ОБРАБОТЧИКИ КОМАНД ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
@@ -562,6 +559,66 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(greeting, reply_markup=main_user_keyboard())
     else:
         await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.", reply_markup=ReplyKeyboardRemove())
+
+# ---------- ОТЛАДОЧНАЯ КОМАНДА ДЛЯ ПРОСМОТРА ЦЕН ПО ЗАКАЗУ ----------
+async def debug_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает полную структуру отгрузки для указанного номера заказа (только для админа)."""
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await update.message.reply_text("⛔ Только для администратора.")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Укажите номер отгрузки: /debug_order 08928221-0180-1")
+        return
+
+    posting_number = args[0]
+    url = "https://api-seller.ozon.ru/v2/posting/fbo/get"
+    headers = {
+        "Client-Id": OZON_CLIENT_ID,
+        "Api-Key": OZON_API_KEY,
+        "Content-Type": "application/json",
+    }
+    payload = {"posting_number": posting_number}
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        # Формируем читаемый вывод
+        result = data.get("result", {})
+        if not result:
+            await update.message.reply_text("❌ Отгрузка не найдена.")
+            return
+        # Выводим только важные поля: продукты с ценами, статус, даты
+        products = result.get("products", [])
+        status = result.get("status")
+        created_at = result.get("created_at")
+        msg = f"📦 Отгрузка {posting_number}\nСтатус: {status}\nСоздана: {created_at}\n\n"
+        for idx, product in enumerate(products, 1):
+            msg += f"Товар #{idx}:\n"
+            msg += f"  SKU: {product.get('sku')}\n"
+            msg += f"  Название: {product.get('name')}\n"
+            msg += f"  Количество: {product.get('quantity')}\n"
+            msg += f"  price (цена покупателя): {product.get('price')}\n"
+            msg += f"  old_price (цена продавца, если есть): {product.get('old_price')}\n"
+            # Добавим другие возможные поля, если они есть
+            if 'marketing_price' in product:
+                msg += f"  marketing_price: {product.get('marketing_price')}\n"
+            if 'premium_price' in product:
+                msg += f"  premium_price: {product.get('premium_price')}\n"
+            msg += "\n"
+        # Также покажем financial_data, если есть
+        financial = result.get("financial_data", {})
+        if financial:
+            msg += "💰 Финансовые данные:\n"
+            msg += json.dumps(financial, indent=2, ensure_ascii=False)
+        # Обрежем, если слишком длинное
+        if len(msg) > 4000:
+            msg = msg[:4000] + "\n...(обрезано)"
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
 
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -975,6 +1032,8 @@ def main():
                    .build())
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("debug_order", debug_order))
+
     application.add_handler(MessageHandler(filters.Text(["📊 Отчёт", "⚙️ Администрирование"]), handle_main_menu))
     application.add_handler(MessageHandler(filters.Text(["📅 Текущие показатели", "📆 Выбрать дату", "📊 Выбрать период", "🔙 Назад"]), handle_reports_menu))
     application.add_handler(MessageHandler(filters.Text(["📋 Список менеджеров", "🔙 Назад"]), handle_admin_menu))
