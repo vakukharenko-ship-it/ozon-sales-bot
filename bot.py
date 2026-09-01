@@ -3,6 +3,7 @@ import datetime
 import json
 import os
 import sys
+import time
 import requests
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, ConversationHandler
@@ -82,77 +83,128 @@ def write_log(message):
     except Exception as e:
         print(f"⚠️ Не удалось записать в файл: {e}", flush=True)
 
-# ---------- ЗАПРОС К OZON API ----------
-def get_ozon_analytics(date_from, date_to):
-    write_log(f"📤 Запрос к Ozon за период {date_from} – {date_to}")
+# ---------- ЗАПРОС К OZON API (ОДИН ЗАПРОС ЗА МЕСЯЦ) ----------
+def get_ozon_monthly_analytics(date_from, date_to):
+    """
+    Делает один запрос к Ozon за весь период (месяц) и возвращает словарь с данными по дням.
+    """
+    write_log(f"📤 Запрос к Ozon за период {date_from} – {date_to} (весь месяц)")
 
     headers = {
         "Client-Id": OZON_CLIENT_ID,
         "Api-Key": OZON_API_KEY,
         "Content-Type": "application/json",
     }
+    # Передаём метрики в том порядке, в котором будем их потом читать
+    metrics_list = [
+        "ordered_units",
+        "ordered_sum",
+        "delivered_units",
+        "delivered_sum",
+        "canceled_units",
+        "canceled_sum",
+    ]
     payload = {
         "date_from": date_from,
         "date_to": date_to,
-        "metrics": [
-            "ordered_units",
-            "ordered_sum",
-            "delivered_units",
-            "delivered_sum",
-            "canceled_units",
-            "canceled_sum",
-        ],
-        "dimension": ["day"],
+        "metrics": metrics_list,
+        "dimension": [{"type": "day"}],   # правильный формат
         "filters": [],
         "sort": [],
         "limit": 1000,
     }
 
-    try:
-        response = requests.post(OZON_ANALYTICS_URL, headers=headers, json=payload, timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        write_log(f"📥 Ответ Ozon (код {response.status_code}): {json.dumps(data, indent=2, ensure_ascii=False)[:1500]}")
-        if isinstance(data, dict) and "result" in data:
-            return data
-        else:
-            write_log("⚠️ Неожиданный формат ответа")
+    # Повторяем запрос при ошибке 429
+    for attempt in range(3):
+        try:
+            response = requests.post(OZON_ANALYTICS_URL, headers=headers, json=payload, timeout=15)
+            if response.status_code == 429:
+                write_log(f"⚠️ Получен 429 Too Many Requests, повтор через 5 сек (попытка {attempt+1})")
+                time.sleep(5)
+                continue
+            response.raise_for_status()
+            data = response.json()
+            write_log(f"📥 Ответ Ozon (код {response.status_code}) получен")
+            # Проверяем структуру
+            if "result" in data and "data" in data["result"]:
+                return data["result"]["data"]
+            else:
+                write_log("⚠️ Неожиданный формат ответа: " + json.dumps(data, ensure_ascii=False)[:300])
+                return None
+        except requests.exceptions.RequestException as e:
+            write_log(f"❌ Ошибка запроса: {e}")
+            if attempt == 2:
+                return None
+            time.sleep(2)
+        except Exception as e:
+            write_log(f"❌ Ошибка обработки: {e}")
             return None
-    except requests.exceptions.RequestException as e:
-        write_log(f"❌ Ошибка запроса: {e}")
-        return None
-    except Exception as e:
-        write_log(f"❌ Ошибка обработки: {e}")
-        return None
+    return None
 
-def format_sales_message(period_name, analytics_data):
-    if not isinstance(analytics_data, dict) or "result" not in analytics_data:
+def extract_metrics_from_day_data(day_data, metric_names):
+    """
+    Из данных за один день (словарь с 'dimensions' и 'metrics') извлекает значения
+    в виде словаря {имя_метрики: значение}.
+    """
+    if not day_data or "metrics" not in day_data:
+        return {name: 0 for name in metric_names}
+    values = day_data["metrics"]
+    # Если значений меньше, чем метрик, дополняем нулями
+    while len(values) < len(metric_names):
+        values.append(0)
+    return dict(zip(metric_names, values))
+
+def format_sales_message(period_name, metrics_dict):
+    """Формирует сообщение из словаря с метриками."""
+    if not metrics_dict:
         return f"❌ Нет данных за {period_name}."
-    result = analytics_data["result"]
-    if not isinstance(result, list) or len(result) == 0:
-        return f"❌ Нет данных за {period_name}."
-    total_ordered_units = 0
-    total_ordered_sum = 0
-    total_delivered_units = 0
-    total_delivered_sum = 0
-    total_canceled_units = 0
-    total_canceled_sum = 0
-    for row in result:
-        if not isinstance(row, dict):
-            continue
-        total_ordered_units += row.get("ordered_units", 0)
-        total_ordered_sum += row.get("ordered_sum", 0)
-        total_delivered_units += row.get("delivered_units", 0)
-        total_delivered_sum += row.get("delivered_sum", 0)
-        total_canceled_units += row.get("canceled_units", 0)
-        total_canceled_sum += row.get("canceled_sum", 0)
-    message = (
+    return (
         f"📊 *{period_name}*\n\n"
-        f"🛒 *Заказано*\n  На сумму: {total_ordered_sum:,.2f} ₽\n  Штук: {total_ordered_units}\n\n"
-        f"📦 *Доставлено*\n  На сумму: {total_delivered_sum:,.2f} ₽\n  Штук: {total_delivered_units}\n\n"
-        f"❌ *Отмены*\n  На сумму: {total_canceled_sum:,.2f} ₽\n  Штук: {total_canceled_units}"
+        f"🛒 *Заказано*\n  На сумму: {metrics_dict.get('ordered_sum', 0):,.2f} ₽\n"
+        f"  Штук: {metrics_dict.get('ordered_units', 0)}\n\n"
+        f"📦 *Доставлено*\n  На сумму: {metrics_dict.get('delivered_sum', 0):,.2f} ₽\n"
+        f"  Штук: {metrics_dict.get('delivered_units', 0)}\n\n"
+        f"❌ *Отмены*\n  На сумму: {metrics_dict.get('canceled_sum', 0):,.2f} ₽\n"
+        f"  Штук: {metrics_dict.get('canceled_units', 0)}"
     )
-    return message
+
+# ---------- ОСНОВНАЯ ФУНКЦИЯ ПОЛУЧЕНИЯ ОТЧЁТА ----------
+def get_full_report():
+    """
+    Делает один запрос за месяц и возвращает три словаря: today, yesterday, month.
+    """
+    today = datetime.date.today()
+    first_day = today.replace(day=1)
+    date_from = first_day.strftime("%Y-%m-%d")
+    date_to = today.strftime("%Y-%m-%d")
+
+    data_rows = get_ozon_monthly_analytics(date_from, date_to)
+    if data_rows is None:
+        return None, None, None
+
+    # Преобразуем данные в словарь {дата: {metric: value}}
+    metrics_names = ["ordered_units", "ordered_sum", "delivered_units", "delivered_sum", "canceled_units", "canceled_sum"]
+    daily_data = {}
+    for row in data_rows:
+        if "dimensions" in row and len(row["dimensions"]) > 0:
+            date_str = row["dimensions"][0].get("id", "")
+            if date_str:
+                daily_data[date_str] = extract_metrics_from_day_data(row, metrics_names)
+
+    # Получаем сегодня, вчера
+    today_str = today.strftime("%Y-%m-%d")
+    yesterday_str = (today - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+
+    today_metrics = daily_data.get(today_str, {})
+    yesterday_metrics = daily_data.get(yesterday_str, {})
+
+    # Суммируем все за месяц
+    month_metrics = {name: 0 for name in metrics_names}
+    for day_metrics in daily_data.values():
+        for name in metrics_names:
+            month_metrics[name] += day_metrics.get(name, 0)
+
+    return today_metrics, yesterday_metrics, month_metrics
 
 # ---------- РАССЫЛКА ПО РАСПИСАНИЮ ----------
 async def send_scheduled_report(context):
@@ -163,18 +215,12 @@ async def send_scheduled_report(context):
     managers = load_managers()
     if not managers:
         return
-    today = datetime.date.today()
-    today_str = today.strftime("%Y-%m-%d")
-    yesterday = today - datetime.timedelta(days=1)
-    yesterday_str = yesterday.strftime("%Y-%m-%d")
-    first_day_of_month = today.replace(day=1)
-    month_start_str = first_day_of_month.strftime("%Y-%m-%d")
-    data_today = get_ozon_analytics(today_str, today_str)
-    data_yesterday = get_ozon_analytics(yesterday_str, yesterday_str)
-    data_month = get_ozon_analytics(month_start_str, today_str)
-    msg_today = format_sales_message("Сегодня", data_today)
-    msg_yesterday = format_sales_message("Вчера", data_yesterday)
-    msg_month = format_sales_message("Текущий месяц", data_month)
+
+    today_m, yesterday_m, month_m = get_full_report()
+    msg_today = format_sales_message("Сегодня", today_m)
+    msg_yesterday = format_sales_message("Вчера", yesterday_m)
+    msg_month = format_sales_message("Текущий месяц", month_m)
+
     for chat_id in managers:
         try:
             await context.bot.send_message(chat_id=chat_id, text=msg_today, parse_mode="Markdown")
@@ -210,7 +256,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = update.message.text
-    # Логируем ВСЕ входящие сообщения
     write_log(f"📩 Получено сообщение от {chat_id}: '{text}'")
 
     if text == "📊 Отчёт":
@@ -218,18 +263,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_manager(chat_id):
             await update.message.reply_text("⛔ Нет доступа.")
             return
-        today = datetime.date.today()
-        today_str = today.strftime("%Y-%m-%d")
-        yesterday = today - datetime.timedelta(days=1)
-        yesterday_str = yesterday.strftime("%Y-%m-%d")
-        first_day_of_month = today.replace(day=1)
-        month_start_str = first_day_of_month.strftime("%Y-%m-%d")
-        data_today = get_ozon_analytics(today_str, today_str)
-        data_yesterday = get_ozon_analytics(yesterday_str, yesterday_str)
-        data_month = get_ozon_analytics(month_start_str, today_str)
-        msg_today = format_sales_message("Сегодня", data_today)
-        msg_yesterday = format_sales_message("Вчера", data_yesterday)
-        msg_month = format_sales_message("Текущий месяц", data_month)
+        today_m, yesterday_m, month_m = get_full_report()
+        msg_today = format_sales_message("Сегодня", today_m)
+        msg_yesterday = format_sales_message("Вчера", yesterday_m)
+        msg_month = format_sales_message("Текущий месяц", month_m)
         await update.message.reply_text(msg_today, parse_mode="Markdown")
         await update.message.reply_text(msg_yesterday, parse_mode="Markdown")
         await update.message.reply_text(msg_month, parse_mode="Markdown")
