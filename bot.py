@@ -121,6 +121,11 @@ def get_greeting(name):
     else:
         return f"{part}, уважаемый пользователь!"
 
+def get_moscow_today():
+    """Возвращает текущую дату в московском часовом поясе."""
+    moscow_tz = datetime.timezone(datetime.timedelta(hours=3))
+    return datetime.datetime.now(moscow_tz).date()
+
 # ---------- КАЛЕНДАРЬ ----------
 def create_calendar(year, month, callback_prefix):
     month_names = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
@@ -240,7 +245,7 @@ def aggregate_postings(postings, date_from=None, date_to=None):
     return aggregated
 
 def get_metrics_for_date(date_str):
-    today = datetime.date.today()
+    today = get_moscow_today()
     start = (today - datetime.timedelta(days=183)).strftime("%Y-%m-%d")
     end = today.strftime("%Y-%m-%d")
     postings = fetch_postings(start, end)
@@ -264,7 +269,7 @@ def get_metrics_for_period(date_from, date_to):
     return total
 
 def get_current_metrics():
-    today = datetime.date.today()
+    today = get_moscow_today()
     first_day = today.replace(day=1)
     date_from = first_day.strftime("%Y-%m-%d")
     date_to = today.strftime("%Y-%m-%d")
@@ -337,10 +342,9 @@ def admin_keyboard():
 # ---------- ОБРАБОТЧИКИ КОМАНД ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    user = update.effective_user  # содержит first_name, username и т.д.
+    user = update.effective_user
 
     if is_admin(chat_id):
-        # Для администратора используем его имя из Telegram
         name = user.first_name if user.first_name else ""
         greeting = get_greeting(name)
         await update.message.reply_text(f"{greeting}\n👋 Добро пожаловать, администратор!", reply_markup=main_admin_keyboard())
@@ -395,7 +399,7 @@ async def handle_reports_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if text == "📆 Выбрать дату":
-        now = datetime.date.today()
+        now = get_moscow_today()
         keyboard = create_calendar(now.year, now.month, "date_")
         await update.message.reply_text("Выберите дату:", reply_markup=keyboard)
         return WAITING_DATE_SINGLE
@@ -485,7 +489,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     # Выбор периода (общее)
     if data == "period_month":
-        current_year = datetime.date.today().year
+        current_year = get_moscow_today().year
         years = list(range(current_year - 9, current_year + 1))
         buttons = [[InlineKeyboardButton(str(y), callback_data=f"period_year_month_{y}")] for y in years]
         buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")])
@@ -493,7 +497,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         return WAITING_PERIOD_YEAR
 
     if data == "period_quarter":
-        current_year = datetime.date.today().year
+        current_year = get_moscow_today().year
         years = list(range(current_year - 9, current_year + 1))
         buttons = [[InlineKeyboardButton(str(y), callback_data=f"period_year_quarter_{y}")] for y in years]
         buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")])
@@ -501,7 +505,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         return WAITING_PERIOD_YEAR
 
     if data == "period_year":
-        current_year = datetime.date.today().year
+        current_year = get_moscow_today().year
         years = list(range(current_year - 9, current_year + 1))
         buttons = [[InlineKeyboardButton(str(y), callback_data=f"period_year_only_{y}")] for y in years]
         buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")])
@@ -509,7 +513,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         return WAITING_YEAR_SELECT
 
     if data == "period_custom":
-        now = datetime.date.today()
+        now = get_moscow_today()
         keyboard = create_calendar(now.year, now.month, "start_")
         await query.edit_message_text("Выберите начальную дату:", reply_markup=keyboard)
         return WAITING_PERIOD_START
@@ -606,7 +610,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         date_str = data[6:]
         if re.match(r"\d{4}-\d{2}-\d{2}", date_str):
             context.user_data['period_start_date'] = date_str
-            now = datetime.date.today()
+            now = get_moscow_today()
             keyboard = create_calendar(now.year, now.month, "end_")
             await query.edit_message_text(f"Начало: {date_str}\nТеперь выберите конечную дату:", reply_markup=keyboard)
             return WAITING_PERIOD_END
@@ -639,7 +643,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 return ConversationHandler.END
             if start_date > end_date_str:
                 await query.edit_message_text("❌ Начальная дата позже конечной. Попробуйте сначала.")
-                now = datetime.date.today()
+                now = get_moscow_today()
                 keyboard = create_calendar(now.year, now.month, "start_")
                 await query.message.reply_text("Выберите начальную дату заново:", reply_markup=keyboard)
                 return WAITING_PERIOD_START
@@ -655,7 +659,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text("Неизвестная команда.")
     return ConversationHandler.END
 
-# ---------- АДМИНИСТРИРОВАНИЕ (добавление/удаление) ----------
+# ---------- АДМИНИСТРИРОВАНИЕ ----------
 async def add_manager_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Введите ID (число) или username (без @):")
     return WAITING_ADD_MANAGER
