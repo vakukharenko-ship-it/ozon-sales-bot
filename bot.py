@@ -74,6 +74,7 @@ def get_ozon_analytics(date_from, date_to):
         "dimension": ["day"],
         "filters": [],
         "sort": [],
+        "limit": 1000,
     }
     try:
         response = requests.post(OZON_ANALYTICS_URL, headers=headers, json=payload)
