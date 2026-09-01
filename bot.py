@@ -16,7 +16,6 @@ ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 OZON_ANALYTICS_URL = "https://api-seller.ozon.ru/v1/analytics/data"
 MANAGERS_FILE = "managers.json"
 
-# Состояния для диалога ввода ID
 WAITING_FOR_ADD_ID = 1
 WAITING_FOR_REMOVE_ID = 2
 
@@ -55,6 +54,10 @@ def remove_manager(chat_id):
 # ------------------------------------------------
 
 def get_ozon_analytics(date_from, date_to):
+    """
+    Запрашивает аналитику у Ozon API.
+    Возвращает словарь с данными или None в случае ошибки.
+    """
     headers = {
         "Client-Id": OZON_CLIENT_ID,
         "Api-Key": OZON_API_KEY,
@@ -74,31 +77,56 @@ def get_ozon_analytics(date_from, date_to):
         "dimension": ["day"],
         "filters": [],
         "sort": [],
-        "limit": 1000,
+        "limit": 1000,  # Добавлено для гарантии получения данных
     }
     try:
-        response = requests.post(OZON_ANALYTICS_URL, headers=headers, json=payload)
+        response = requests.post(OZON_ANALYTICS_URL, headers=headers, json=payload, timeout=10)
         response.raise_for_status()
-        return response.json()
-    except:
+        data = response.json()
+        # Проверяем, что пришёл ожидаемый ответ
+        if isinstance(data, dict) and "result" in data:
+            return data
+        else:
+            print(f"Неожиданный формат ответа: {data}")
+            return None
+    except requests.exceptions.RequestException as e:
+        print(f"Ошибка запроса к Ozon API: {e}")
+        return None
+    except ValueError as e:
+        print(f"Ошибка парсинга JSON: {e}")
         return None
 
 def format_sales_message(period_name, analytics_data):
-    if not analytics_data or "result" not in analytics_data:
+    """
+    Форматирует данные аналитики в читаемое сообщение.
+    Если данные отсутствуют или некорректны, возвращает сообщение об ошибке.
+    """
+    # Проверяем, что analytics_data — словарь и содержит ключ "result"
+    if not isinstance(analytics_data, dict) or "result" not in analytics_data:
         return f"❌ Нет данных за {period_name}."
+
+    result = analytics_data["result"]
+    if not isinstance(result, list):
+        return f"❌ Нет данных за {period_name}."
+
     total_ordered_units = 0
     total_ordered_sum = 0
     total_delivered_units = 0
     total_delivered_sum = 0
     total_canceled_units = 0
     total_canceled_sum = 0
-    for row in analytics_data["result"]:
+
+    for row in result:
+        # Каждая строка — словарь
+        if not isinstance(row, dict):
+            continue
         total_ordered_units += row.get("ordered_units", 0)
         total_ordered_sum += row.get("ordered_sum", 0)
         total_delivered_units += row.get("delivered_units", 0)
         total_delivered_sum += row.get("delivered_sum", 0)
         total_canceled_units += row.get("canceled_units", 0)
         total_canceled_sum += row.get("canceled_sum", 0)
+
     message = (
         f"📊 *{period_name}*\n\n"
         f"🛒 *Заказано*\n  На сумму: {total_ordered_sum:,.2f} ₽\n  Штук: {total_ordered_units}\n\n"
@@ -109,11 +137,10 @@ def format_sales_message(period_name, analytics_data):
 
 async def send_scheduled_report(context):
     """Функция, вызываемая по расписанию каждый час."""
-    # Проверяем текущий час по МСК
     moscow_tz = datetime.timezone(datetime.timedelta(hours=3))
     now = datetime.datetime.now(moscow_tz)
     if not (9 <= now.hour <= 23):
-        return  # если не в рабочее время, ничего не делаем
+        return
 
     managers = load_managers()
     if not managers:
@@ -272,10 +299,8 @@ def main():
 
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Регистрируем команды
     application.add_handler(CommandHandler("start", start))
 
-    # ConversationHandler для добавления/удаления
     conv_handler = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Text("➕ Добавить менеджера"), handle_message),
@@ -289,17 +314,15 @@ def main():
     )
     application.add_handler(conv_handler)
 
-    # Общий обработчик текстовых сообщений
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Настраиваем JobQueue для автоматических отчётов
+    # Настраиваем JobQueue
     job_queue = application.job_queue
     if job_queue:
-        # Запускаем задачу каждые 60 минут
         job_queue.run_repeating(send_scheduled_report, interval=60 * 60, first=0)
         print("Планировщик запущен: отчёты каждый час с 9 до 23 по МСК.")
     else:
-        print("JobQueue не доступен!")
+        print("JobQueue не доступен! Убедитесь, что установлен python-telegram-bot[job-queue].")
 
     print("Бот запущен.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
