@@ -241,7 +241,7 @@ def aggregate_postings(postings, date_from=None, date_to=None):
 
     return aggregated
 
-# ---------- РЕКЛАМНЫЕ РАСХОДЫ (С УЧЁТОМ ЧАСОВЫХ ПОЯСОВ) ----------
+# ---------- РЕКЛАМНЫЕ РАСХОДЫ ----------
 def get_performance_token():
     if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
         write_log("⚠️ OZON_PERFORMANCE_CLIENT_ID или CLIENT_SECRET не заданы!")
@@ -273,11 +273,6 @@ def get_performance_token():
         return None
 
 def fetch_advertising_expense(date_from, date_to):
-    """
-    Получает сумму расходов на рекламу за период.
-    Для учёта часовых поясов запрашивает диапазон с запасом в 1 день,
-    затем фильтрует строки, попадающие в исходный диапазон по дате из ответа.
-    """
     token = get_performance_token()
     if not token:
         write_log("⚠️ Не удалось получить токен. Рекламные расходы не будут отображаться.")
@@ -288,7 +283,6 @@ def fetch_advertising_expense(date_from, date_to):
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-    # Расширяем диапазон на 1 день в обе стороны
     start_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d") - datetime.timedelta(days=1)
     end_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d") + datetime.timedelta(days=1)
     params = {
@@ -298,7 +292,7 @@ def fetch_advertising_expense(date_from, date_to):
     try:
         response = requests.get(url, headers=headers, params=params, timeout=15)
         if response.status_code == 429:
-            write_log("⚠️ 429 Too Many Requests (Performance API), ждём 10 сек")
+            write_log("⚠️ 429 Too Many Requests, ждём 10 сек")
             time.sleep(10)
             response = requests.get(url, headers=headers, params=params, timeout=15)
 
@@ -315,7 +309,6 @@ def fetch_advertising_expense(date_from, date_to):
                     item_date = item.get("date")
                     if item_date and len(item_date) >= 10:
                         item_date_str = item_date[:10]
-                        # Фильтруем только те строки, где дата попадает в исходный диапазон
                         if date_from <= item_date_str <= date_to:
                             money_spent_str = item.get("moneySpent")
                             if money_spent_str is not None:
@@ -324,7 +317,6 @@ def fetch_advertising_expense(date_from, date_to):
                                     total_expense += money_spent
                                 except:
                                     pass
-        # Альтернативные форматы (на случай изменения структуры)
         elif isinstance(data, list):
             for item in data:
                 expense = item.get("expense") or item.get("cost") or 0
@@ -346,7 +338,7 @@ def fetch_advertising_expense(date_from, date_to):
         write_log(f"❌ Ошибка получения рекламных расходов: {e}")
         return None
 
-# ---------- ФУНКЦИИ ОТЧЁТОВ ----------
+# ---------- ОСНОВНЫЕ ФУНКЦИИ ДЛЯ ОТЧЁТОВ ----------
 def get_metrics_for_date(date_str):
     today = get_moscow_today()
     start = (today - datetime.timedelta(days=183)).strftime("%Y-%m-%d")
@@ -356,11 +348,21 @@ def get_metrics_for_date(date_str):
     metrics = agg.get(date_str, {})
     ad_expense = fetch_advertising_expense(date_str, date_str)
     metrics["ad_expense"] = ad_expense if ad_expense is not None else 0.0
+
+    # Обычный ДРР (от всех заказов)
     revenue = metrics.get("ordered_sum", 0)
     if revenue > 0 and ad_expense is not None:
         metrics["drr"] = (ad_expense / revenue) * 100
     else:
         metrics["drr"] = None
+
+    # Эффективный ДРР (от доставленных заказов)
+    delivered_revenue = metrics.get("delivered_sum", 0)
+    if delivered_revenue > 0 and ad_expense is not None:
+        metrics["effective_drr"] = (ad_expense / delivered_revenue) * 100
+    else:
+        metrics["effective_drr"] = None
+
     return metrics
 
 def get_metrics_for_period(date_from, date_to):
@@ -379,11 +381,19 @@ def get_metrics_for_period(date_from, date_to):
             total[key] += vals.get(key, 0)
     ad_expense = fetch_advertising_expense(date_from, date_to)
     total["ad_expense"] = ad_expense if ad_expense is not None else 0.0
+
     revenue = total.get("ordered_sum", 0)
     if revenue > 0 and ad_expense is not None:
         total["drr"] = (ad_expense / revenue) * 100
     else:
         total["drr"] = None
+
+    delivered_revenue = total.get("delivered_sum", 0)
+    if delivered_revenue > 0 and ad_expense is not None:
+        total["effective_drr"] = (ad_expense / delivered_revenue) * 100
+    else:
+        total["effective_drr"] = None
+
     return total
 
 def get_current_metrics():
@@ -412,38 +422,39 @@ def get_current_metrics():
         for key in month_data:
             month_data[key] += vals.get(key, 0)
 
+    # Функция для расчёта ДРР и эффективного ДРР
+    def add_drr(metrics, ad_expense):
+        metrics["ad_expense"] = ad_expense if ad_expense is not None else 0.0
+        revenue = metrics.get("ordered_sum", 0)
+        if revenue > 0 and ad_expense is not None:
+            metrics["drr"] = (ad_expense / revenue) * 100
+        else:
+            metrics["drr"] = None
+        delivered_revenue = metrics.get("delivered_sum", 0)
+        if delivered_revenue > 0 and ad_expense is not None:
+            metrics["effective_drr"] = (ad_expense / delivered_revenue) * 100
+        else:
+            metrics["effective_drr"] = None
+        return metrics
+
     ad_expense_today = fetch_advertising_expense(today_str, today_str)
-    today_data["ad_expense"] = ad_expense_today if ad_expense_today is not None else 0.0
-    revenue_today = today_data.get("ordered_sum", 0)
-    if revenue_today > 0 and ad_expense_today is not None:
-        today_data["drr"] = (ad_expense_today / revenue_today) * 100
-    else:
-        today_data["drr"] = None
+    today_data = add_drr(today_data, ad_expense_today)
 
     ad_expense_yesterday = fetch_advertising_expense(yesterday_str, yesterday_str)
-    yesterday_data["ad_expense"] = ad_expense_yesterday if ad_expense_yesterday is not None else 0.0
-    revenue_yesterday = yesterday_data.get("ordered_sum", 0)
-    if revenue_yesterday > 0 and ad_expense_yesterday is not None:
-        yesterday_data["drr"] = (ad_expense_yesterday / revenue_yesterday) * 100
-    else:
-        yesterday_data["drr"] = None
+    yesterday_data = add_drr(yesterday_data, ad_expense_yesterday)
 
     ad_expense_month = fetch_advertising_expense(date_from, date_to)
-    month_data["ad_expense"] = ad_expense_month if ad_expense_month is not None else 0.0
-    revenue_month = month_data.get("ordered_sum", 0)
-    if revenue_month > 0 and ad_expense_month is not None:
-        month_data["drr"] = (ad_expense_month / revenue_month) * 100
-    else:
-        month_data["drr"] = None
+    month_data = add_drr(month_data, ad_expense_month)
 
     return today_data, yesterday_data, month_data
 
+# ---------- ФОРМАТИРОВАНИЕ ----------
 def format_metrics(metrics, title):
     if not metrics:
         return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
     has_data = False
     for key, val in metrics.items():
-        if key in ["drr", "ad_expense"]:
+        if key in ["drr", "effective_drr", "ad_expense"]:
             continue
         if isinstance(val, (int, float)) and val != 0:
             has_data = True
@@ -453,7 +464,9 @@ def format_metrics(metrics, title):
 
     ad_expense = metrics.get("ad_expense", 0)
     drr = metrics.get("drr")
+    eff_drr = metrics.get("effective_drr")
     drr_text = f"{drr:.2f}%" if drr is not None else "∞"
+    eff_drr_text = f"{eff_drr:.2f}%" if eff_drr is not None else "∞"
 
     return (
         f"📊 *{title}*\n\n"
@@ -463,8 +476,10 @@ def format_metrics(metrics, title):
         f"  Штук: {metrics.get('delivered_units', 0)}\n\n"
         f"❌ *Отмены*\n  На сумму: {metrics.get('canceled_sum', 0):,.2f} ₽\n"
         f"  Штук: {metrics.get('canceled_units', 0)}\n\n"
-        f"📢 *Реклама*\n  Расходы: {ad_expense:,.2f} ₽\n"
-        f"  ДРР: {drr_text}"
+        f"📢 *Реклама*\n"
+        f"  Расходы: {ad_expense:,.2f} ₽\n"
+        f"  ДРР (общий): {drr_text}\n"
+        f"  ДРР (по доставленным): {eff_drr_text}"
     )
 
 # ---------- КЛАВИАТУРЫ ----------
