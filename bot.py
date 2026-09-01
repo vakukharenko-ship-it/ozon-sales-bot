@@ -283,6 +283,7 @@ def get_performance_token():
 def fetch_advertising_expense(date_from, date_to):
     """
     Получает сумму расходов на рекламу за период через Performance API.
+    С расширенным логированием для отладки.
     """
     token = get_performance_token()
     if not token:
@@ -304,8 +305,11 @@ def fetch_advertising_expense(date_from, date_to):
             write_log("⚠️ 429 Too Many Requests (Performance API), ждём 10 сек")
             time.sleep(10)
             response = requests.get(url, headers=headers, params=params, timeout=15)
+
+        write_log(f"📥 Статус ответа Performance API: {response.status_code}")
         response.raise_for_status()
         data = response.json()
+        write_log(f"📥 Ответ Performance API: {json.dumps(data, ensure_ascii=False)[:500]}")  # первые 500 символов
 
         total_expense = 0.0
         if isinstance(data, list):
