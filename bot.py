@@ -154,7 +154,7 @@ def aggregate_postings(postings):
     "Отмены" = только со статусами cancelled/canceled.
     """
     aggregated = {}
-    status_stats = {}  # для отладки: сколько штук в каждом статусе
+    status_stats = {}
     total_units_all = 0
     for posting in postings:
         metrics = extract_posting_metrics(posting)
@@ -178,19 +178,15 @@ def aggregate_postings(postings):
         units = metrics["units"]
         sum_val = metrics["sum"]
         total_units_all += units
-        # Собираем статистику по статусам
         status_stats[status] = status_stats.get(status, 0) + units
 
-        # Отдельно добавляем в доставленные или отменённые
         if status in ["cancelled", "canceled"]:
             aggregated[date_str]["canceled_units"] += units
             aggregated[date_str]["canceled_sum"] += sum_val
         elif status in ["delivered", "completed"]:
             aggregated[date_str]["delivered_units"] += units
             aggregated[date_str]["delivered_sum"] += sum_val
-        # Остальные статусы не добавляются в доставленные/отмены, но уже учтены в "заказано"
 
-    # Логируем статистику по статусам
     write_log(f"📊 Статистика по статусам (штук): {status_stats}")
     write_log(f"📊 Всего штук во всех отгрузках: {total_units_all}")
     return aggregated
@@ -205,13 +201,20 @@ def get_full_report():
     postings = get_all_postings(date_from, date_to)
     agg = aggregate_postings(postings)
 
+    # Фильтруем агрегацию по датам текущего месяца
+    # (потому что API иногда возвращает отгрузки за все даты)
+    filtered_agg = {}
+    for date_str, vals in agg.items():
+        if date_from <= date_str <= date_to:
+            filtered_agg[date_str] = vals
+
     today_str = today.strftime("%Y-%m-%d")
     yesterday_str = (today - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
 
-    today_data = agg.get(today_str, {})
-    yesterday_data = agg.get(yesterday_str, {})
+    today_data = filtered_agg.get(today_str, {})
+    yesterday_data = filtered_agg.get(yesterday_str, {})
 
-    # Суммируем за месяц
+    # Суммируем за месяц только по отфильтрованным датам
     month_data = {
         "ordered_units": 0,
         "ordered_sum": 0.0,
@@ -220,11 +223,12 @@ def get_full_report():
         "canceled_units": 0,
         "canceled_sum": 0.0,
     }
-    for date, vals in agg.items():
+    for date, vals in filtered_agg.items():
         for key in month_data:
             month_data[key] += vals.get(key, 0)
 
-    write_log(f"📊 За месяц: ordered_units={month_data['ordered_units']}, delivered_units={month_data['delivered_units']}, canceled_units={month_data['canceled_units']}")
+    write_log(f"📊 За месяц (отфильтровано): ordered_units={month_data['ordered_units']}, "
+              f"delivered_units={month_data['delivered_units']}, canceled_units={month_data['canceled_units']}")
 
     return today_data, yesterday_data, month_data
 
