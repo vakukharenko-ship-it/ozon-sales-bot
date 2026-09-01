@@ -85,9 +85,6 @@ def write_log(message):
 
 # ---------- ЗАПРОС К OZON API (ОДИН ЗАПРОС ЗА МЕСЯЦ) ----------
 def get_ozon_monthly_analytics(date_from, date_to):
-    """
-    Делает один запрос к Ozon за весь период (месяц) и возвращает словарь с данными по дням.
-    """
     write_log(f"📤 Запрос к Ozon за период {date_from} – {date_to} (весь месяц)")
 
     headers = {
@@ -95,7 +92,6 @@ def get_ozon_monthly_analytics(date_from, date_to):
         "Api-Key": OZON_API_KEY,
         "Content-Type": "application/json",
     }
-    # Передаём метрики в том порядке, в котором будем их потом читать
     metrics_list = [
         "ordered_units",
         "ordered_sum",
@@ -108,7 +104,7 @@ def get_ozon_monthly_analytics(date_from, date_to):
         "date_from": date_from,
         "date_to": date_to,
         "metrics": metrics_list,
-        "dimension": [{"type": "day"}],   # правильный формат
+        "dimension": ["day"],        # ✅ Правильный формат
         "filters": [],
         "sort": [],
         "limit": 1000,
@@ -119,17 +115,16 @@ def get_ozon_monthly_analytics(date_from, date_to):
         try:
             response = requests.post(OZON_ANALYTICS_URL, headers=headers, json=payload, timeout=15)
             if response.status_code == 429:
-                write_log(f"⚠️ Получен 429 Too Many Requests, повтор через 5 сек (попытка {attempt+1})")
+                write_log(f"⚠️ 429 Too Many Requests, повтор через 5 сек (попытка {attempt+1})")
                 time.sleep(5)
                 continue
             response.raise_for_status()
             data = response.json()
             write_log(f"📥 Ответ Ozon (код {response.status_code}) получен")
-            # Проверяем структуру
             if "result" in data and "data" in data["result"]:
                 return data["result"]["data"]
             else:
-                write_log("⚠️ Неожиданный формат ответа: " + json.dumps(data, ensure_ascii=False)[:300])
+                write_log("⚠️ Неожиданный формат: " + json.dumps(data, ensure_ascii=False)[:300])
                 return None
         except requests.exceptions.RequestException as e:
             write_log(f"❌ Ошибка запроса: {e}")
@@ -142,20 +137,14 @@ def get_ozon_monthly_analytics(date_from, date_to):
     return None
 
 def extract_metrics_from_day_data(day_data, metric_names):
-    """
-    Из данных за один день (словарь с 'dimensions' и 'metrics') извлекает значения
-    в виде словаря {имя_метрики: значение}.
-    """
     if not day_data or "metrics" not in day_data:
         return {name: 0 for name in metric_names}
     values = day_data["metrics"]
-    # Если значений меньше, чем метрик, дополняем нулями
     while len(values) < len(metric_names):
         values.append(0)
     return dict(zip(metric_names, values))
 
 def format_sales_message(period_name, metrics_dict):
-    """Формирует сообщение из словаря с метриками."""
     if not metrics_dict:
         return f"❌ Нет данных за {period_name}."
     return (
@@ -168,11 +157,7 @@ def format_sales_message(period_name, metrics_dict):
         f"  Штук: {metrics_dict.get('canceled_units', 0)}"
     )
 
-# ---------- ОСНОВНАЯ ФУНКЦИЯ ПОЛУЧЕНИЯ ОТЧЁТА ----------
 def get_full_report():
-    """
-    Делает один запрос за месяц и возвращает три словаря: today, yesterday, month.
-    """
     today = datetime.date.today()
     first_day = today.replace(day=1)
     date_from = first_day.strftime("%Y-%m-%d")
@@ -182,7 +167,6 @@ def get_full_report():
     if data_rows is None:
         return None, None, None
 
-    # Преобразуем данные в словарь {дата: {metric: value}}
     metrics_names = ["ordered_units", "ordered_sum", "delivered_units", "delivered_sum", "canceled_units", "canceled_sum"]
     daily_data = {}
     for row in data_rows:
@@ -191,14 +175,12 @@ def get_full_report():
             if date_str:
                 daily_data[date_str] = extract_metrics_from_day_data(row, metrics_names)
 
-    # Получаем сегодня, вчера
     today_str = today.strftime("%Y-%m-%d")
     yesterday_str = (today - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
 
     today_metrics = daily_data.get(today_str, {})
     yesterday_metrics = daily_data.get(yesterday_str, {})
 
-    # Суммируем все за месяц
     month_metrics = {name: 0 for name in metrics_names}
     for day_metrics in daily_data.values():
         for name in metrics_names:
