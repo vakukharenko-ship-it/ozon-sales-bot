@@ -560,9 +560,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.", reply_markup=ReplyKeyboardRemove())
 
-# ---------- ОТЛАДОЧНАЯ КОМАНДА ДЛЯ ПРОСМОТРА ЦЕН ПО ЗАКАЗУ ----------
 async def debug_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает полную структуру отгрузки для указанного номера заказа (только для админа)."""
+    """Показывает полную структуру отгрузки и финансовые данные для указанного номера заказа (только для админа)."""
     chat_id = update.effective_chat.id
     if not is_admin(chat_id):
         await update.message.reply_text("⛔ Только для администратора.")
@@ -574,23 +573,24 @@ async def debug_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     posting_number = args[0]
-    url = "https://api-seller.ozon.ru/v2/posting/fbo/get"
+
+    # 1. Получаем отгрузку
+    url_posting = "https://api-seller.ozon.ru/v2/posting/fbo/get"
     headers = {
         "Client-Id": OZON_CLIENT_ID,
         "Api-Key": OZON_API_KEY,
         "Content-Type": "application/json",
     }
-    payload = {"posting_number": posting_number}
+    payload_posting = {"posting_number": posting_number}
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=15)
+        response = requests.post(url_posting, headers=headers, json=payload_posting, timeout=15)
         response.raise_for_status()
-        data = response.json()
-        # Формируем читаемый вывод
-        result = data.get("result", {})
+        data_posting = response.json()
+        result = data_posting.get("result", {})
         if not result:
             await update.message.reply_text("❌ Отгрузка не найдена.")
             return
-        # Выводим только важные поля: продукты с ценами, статус, даты
+        # Формируем вывод отгрузки
         products = result.get("products", [])
         status = result.get("status")
         created_at = result.get("created_at")
@@ -600,19 +600,37 @@ async def debug_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f"  SKU: {product.get('sku')}\n"
             msg += f"  Название: {product.get('name')}\n"
             msg += f"  Количество: {product.get('quantity')}\n"
-            msg += f"  price (цена покупателя): {product.get('price')}\n"
-            msg += f"  old_price (цена продавца, если есть): {product.get('old_price')}\n"
-            # Добавим другие возможные поля, если они есть
+            msg += f"  price (цена покупателя?): {product.get('price')}\n"
+            msg += f"  old_price (цена продавца?): {product.get('old_price')}\n"
             if 'marketing_price' in product:
                 msg += f"  marketing_price: {product.get('marketing_price')}\n"
             if 'premium_price' in product:
                 msg += f"  premium_price: {product.get('premium_price')}\n"
             msg += "\n"
-        # Также покажем financial_data, если есть
-        financial = result.get("financial_data", {})
-        if financial:
-            msg += "💰 Финансовые данные:\n"
-            msg += json.dumps(financial, indent=2, ensure_ascii=False)
+
+        # 2. Получаем финансовые данные через /v2/finance/realization
+        url_finance = "https://api-seller.ozon.ru/v2/finance/realization"
+        payload_finance = {
+            "filter": {
+                "posting_number": posting_number
+            },
+            "limit": 1,
+            "offset": 0
+        }
+        try:
+            response_finance = requests.post(url_finance, headers=headers, json=payload_finance, timeout=15)
+            response_finance.raise_for_status()
+            data_finance = response_finance.json()
+            finance_items = data_finance.get("result", {}).get("items", [])
+            if finance_items:
+                msg += "💰 Финансовые данные:\n"
+                fin = finance_items[0]
+                msg += json.dumps(fin, indent=2, ensure_ascii=False)
+            else:
+                msg += "💰 Финансовые данные: не найдены.\n"
+        except Exception as e:
+            msg += f"❌ Ошибка получения финансовых данных: {e}\n"
+
         # Обрежем, если слишком длинное
         if len(msg) > 4000:
             msg = msg[:4000] + "\n...(обрезано)"
