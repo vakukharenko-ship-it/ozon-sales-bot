@@ -38,9 +38,6 @@ WAITING_PERIOD_YEAR = 8
 WAITING_PERIOD_MONTH = 9
 WAITING_PERIOD_QUARTER = 10
 WAITING_YEAR_SELECT = 11
-
-# Ставка налога (7%)
-TAX_RATE = 0.07
 # =====================================================
 
 def write_log(message):
@@ -161,6 +158,7 @@ def create_calendar(year, month, callback_prefix):
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data=f"{callback_prefix}cancel")])
     return InlineKeyboardMarkup(keyboard)
 
+# ---------- ЗАГРУЗКА ОТГРУЗОК И АГРЕГАЦИЯ ----------
 def fetch_postings(date_from, date_to):
     headers = {
         "Client-Id": OZON_CLIENT_ID,
@@ -210,19 +208,16 @@ def aggregate_postings(postings, date_from=None, date_to=None):
 
         products = posting.get("products", [])
         total_units = 0
-        total_sum_seller = 0.0
+        total_sum = 0.0
         for product in products:
             qty = int(product.get("quantity", 0))
-            price_seller_str = product.get("old_price")
-            if price_seller_str is not None:
-                try:
-                    price_seller = float(price_seller_str)
-                except:
-                    price_seller = 0.0
-            else:
-                price_seller = float(product.get("price", 0))
+            price_str = product.get("price", "0")
+            try:
+                price = float(price_str)
+            except:
+                price = 0.0
             total_units += qty
-            total_sum_seller += price_seller * qty
+            total_sum += price * qty
 
         status = posting.get("status", "")
         if date_str not in aggregated:
@@ -236,143 +231,18 @@ def aggregate_postings(postings, date_from=None, date_to=None):
             }
 
         aggregated[date_str]["ordered_units"] += total_units
-        aggregated[date_str]["ordered_sum"] += total_sum_seller
+        aggregated[date_str]["ordered_sum"] += total_sum
 
         if status in ("cancelled", "canceled"):
             aggregated[date_str]["canceled_units"] += total_units
-            aggregated[date_str]["canceled_sum"] += total_sum_seller
+            aggregated[date_str]["canceled_sum"] += total_sum
         elif status in ("delivered", "completed"):
             aggregated[date_str]["delivered_units"] += total_units
-            aggregated[date_str]["delivered_sum"] += total_sum_seller
+            aggregated[date_str]["delivered_sum"] += total_sum
 
     return aggregated
 
-# ---------- ФИНАНСОВЫЙ API (ИСПРАВЛЕННЫЙ) ----------
-def fetch_financial_data_v2(date_from, date_to):
-    """
-    Получает финансовые транзакции за период через /v2/finance/realization.
-    Обязательные поля: year и month на корневом уровне.
-    """
-    url = "https://api-seller.ozon.ru/v2/finance/realization"
-    headers = {
-        "Client-Id": OZON_CLIENT_ID,
-        "Api-Key": OZON_API_KEY,
-        "Content-Type": "application/json",
-    }
-    try:
-        from_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d")
-        to_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d") + datetime.timedelta(days=1) - datetime.timedelta(seconds=1)
-        year = from_dt.year
-        month = from_dt.month
-    except:
-        write_log(f"❌ Ошибка парсинга дат: {date_from} {date_to}")
-        return None
-
-    payload = {
-        "year": year,
-        "month": month,
-        "filter": {
-            "date_from": from_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-            "date_to": to_dt.strftime("%Y-%m-%dT%H:%M:%S.999Z"),
-        },
-        "limit": 1000,
-        "offset": 0,
-    }
-    all_transactions = []
-    while True:
-        try:
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
-            if response.status_code == 429:
-                write_log("⚠️ 429 Too Many Requests (финансы), ждём 10 сек")
-                time.sleep(10)
-                continue
-            response.raise_for_status()
-            data = response.json()
-            transactions = data.get("result", {}).get("rows", [])
-            if not transactions:
-                break
-            all_transactions.extend(transactions)
-            if len(transactions) < payload["limit"]:
-                break
-            payload["offset"] += payload["limit"]
-        except Exception as e:
-            write_log(f"❌ Ошибка получения финансов (v2): {e}")
-            break
-    write_log(f"💰 Загружено финансовых транзакций (v2): {len(all_transactions)} за {date_from}–{date_to}")
-    return all_transactions
-
-def get_delivered_sum_from_finance(date_from, date_to):
-    """
-    Получает сумму доставленных заказов из финансовых данных.
-    Фильтрует транзакции по дате (поля date или operation_date).
-    Ищет цену в полях: price_per_instance, seller_price_per_instance, price, total, amount.
-    Возвращает float или None.
-    """
-    transactions = fetch_financial_data_v2(date_from, date_to)
-    if transactions is None:
-        write_log(f"⚠️ Финансовые данные не получены за {date_from}–{date_to}")
-        return None
-    if not transactions:
-        write_log(f"ℹ️ Финансовых транзакций нет за {date_from}–{date_to}")
-        return None
-
-    # Логируем структуру первой транзакции для отладки
-    sample = transactions[0]
-    write_log(f"🔍 Пример финансовой транзакции (первая): {json.dumps(sample, indent=2, ensure_ascii=False)[:1000]}")
-
-    total = 0.0
-    price_fields = ["price_per_instance", "seller_price_per_instance", "price", "total", "amount"]
-
-    # Преобразуем границы дат для сравнения
-    from_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d")
-    to_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d")
-
-    for txn in transactions:
-        # Пытаемся извлечь дату транзакции
-        txn_date = None
-        for date_field in ["date", "operation_date", "created_at"]:
-            val = txn.get(date_field)
-            if val:
-                try:
-                    # Пробуем распарсить в разных форматах
-                    if isinstance(val, str):
-                        # Обрезаем время, если есть
-                        date_part = val[:10]
-                        txn_date = datetime.datetime.strptime(date_part, "%Y-%m-%d").date()
-                    else:
-                        txn_date = val
-                    break
-                except:
-                    pass
-
-        # Если дата транзакции есть и не попадает в диапазон – пропускаем
-        if txn_date:
-            if txn_date < from_dt.date() or txn_date > to_dt.date():
-                continue
-
-        # Ищем цену
-        price_val = None
-        for field in price_fields:
-            val = txn.get(field)
-            if val is not None:
-                try:
-                    price_val = float(val)
-                    break
-                except:
-                    pass
-
-        if price_val is not None:
-            total += price_val
-        else:
-            # Если ни одно поле не найдено, можно попробовать найти числовое значение в любом поле
-            for key, value in txn.items():
-                if isinstance(value, (int, float)):
-                    total += value
-                    break
-
-    write_log(f"💳 Сумма доставленных заказов из финансов (отфильтровано по дате) за {date_from}–{date_to}: {total:.2f} ₽")
-    return total
-# ---------- ОСТАЛЬНЫЕ ФУНКЦИИ ----------
+# ---------- РЕКЛАМНЫЕ РАСХОДЫ ----------
 def get_performance_token():
     if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
         write_log("⚠️ OZON_PERFORMANCE_CLIENT_ID или CLIENT_SECRET не заданы!")
@@ -469,6 +339,48 @@ def fetch_advertising_expense(date_from, date_to):
         write_log(f"❌ Ошибка получения рекламных расходов: {e}")
         return None
 
+# ---------- ФОРМАТИРОВАНИЕ ОДНОГО ПЕРИОДА ----------
+def format_single_metrics(metrics, title):
+    if not metrics:
+        return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
+    has_data = False
+    for key, val in metrics.items():
+        if key in ["drr", "effective_drr", "ad_expense"]:
+            continue
+        if isinstance(val, (int, float)) and val != 0:
+            has_data = True
+            break
+    if not has_data:
+        return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
+
+    ad_expense = metrics.get("ad_expense", 0)
+    drr = metrics.get("drr")
+    eff_drr = metrics.get("effective_drr")
+    drr_text = f"{drr:.2f}%" if drr is not None else "∞"
+    eff_drr_text = f"{eff_drr:.2f}%" if eff_drr is not None else "∞"
+
+    return (
+        f"📊 *{title}*\n\n"
+        f"🛒 *Заказано*\n  На сумму: {metrics.get('ordered_sum', 0):,.2f} ₽\n"
+        f"  Штук: {metrics.get('ordered_units', 0)}\n\n"
+        f"📦 *Доставлено*\n  На сумму: {metrics.get('delivered_sum', 0):,.2f} ₽\n"
+        f"  Штук: {metrics.get('delivered_units', 0)}\n\n"
+        f"❌ *Отмены*\n  На сумму: {metrics.get('canceled_sum', 0):,.2f} ₽\n"
+        f"  Штук: {metrics.get('canceled_units', 0)}\n\n"
+        f"📢 *Реклама*\n"
+        f"  Расходы: {ad_expense:,.2f} ₽\n"
+        f"  ДРР (общий): {drr_text}\n"
+        f"  ДРР (по доставленным): {eff_drr_text}"
+    )
+
+def format_combined_metrics(today_metrics, yesterday_metrics, month_metrics):
+    """Объединяет отчёты за сегодня, вчера и месяц в одно сообщение."""
+    today_part = format_single_metrics(today_metrics, "Сегодня")
+    yesterday_part = format_single_metrics(yesterday_metrics, "Вчера")
+    month_part = format_single_metrics(month_metrics, "Текущий месяц")
+    return f"{today_part}\n\n{yesterday_part}\n\n{month_part}"
+
+# ---------- ОСНОВНЫЕ ФУНКЦИИ ДЛЯ ОТЧЁТОВ ----------
 def get_metrics_for_date(date_str):
     today = get_moscow_today()
     start = (today - datetime.timedelta(days=183)).strftime("%Y-%m-%d")
@@ -478,27 +390,16 @@ def get_metrics_for_date(date_str):
     metrics = agg.get(date_str, {})
     ad_expense = fetch_advertising_expense(date_str, date_str)
     metrics["ad_expense"] = ad_expense if ad_expense is not None else 0.0
-
     revenue = metrics.get("ordered_sum", 0)
     if revenue > 0 and ad_expense is not None:
         metrics["drr"] = (ad_expense / revenue) * 100
     else:
         metrics["drr"] = None
-
     delivered_revenue = metrics.get("delivered_sum", 0)
     if delivered_revenue > 0 and ad_expense is not None:
         metrics["effective_drr"] = (ad_expense / delivered_revenue) * 100
     else:
         metrics["effective_drr"] = None
-
-    # Налог от финансовых данных (если доступны)
-    finance_sum = get_delivered_sum_from_finance(date_str, date_str)
-    if finance_sum is not None:
-        metrics["tax"] = finance_sum * TAX_RATE
-    else:
-        # Fallback на цену из отгрузок
-        metrics["tax"] = metrics.get("delivered_sum", 0) * TAX_RATE
-
     return metrics
 
 def get_metrics_for_period(date_from, date_to):
@@ -517,25 +418,16 @@ def get_metrics_for_period(date_from, date_to):
             total[key] += vals.get(key, 0)
     ad_expense = fetch_advertising_expense(date_from, date_to)
     total["ad_expense"] = ad_expense if ad_expense is not None else 0.0
-
     revenue = total.get("ordered_sum", 0)
     if revenue > 0 and ad_expense is not None:
         total["drr"] = (ad_expense / revenue) * 100
     else:
         total["drr"] = None
-
     delivered_revenue = total.get("delivered_sum", 0)
     if delivered_revenue > 0 and ad_expense is not None:
         total["effective_drr"] = (ad_expense / delivered_revenue) * 100
     else:
         total["effective_drr"] = None
-
-    finance_sum = get_delivered_sum_from_finance(date_from, date_to)
-    if finance_sum is not None:
-        total["tax"] = finance_sum * TAX_RATE
-    else:
-        total["tax"] = total.get("delivered_sum", 0) * TAX_RATE
-
     return total
 
 def get_current_metrics():
@@ -551,7 +443,6 @@ def get_current_metrics():
 
     today_data = agg.get(today_str, {})
     yesterday_data = agg.get(yesterday_str, {})
-
     month_data = {
         "ordered_units": 0,
         "ordered_sum": 0.0,
@@ -564,7 +455,7 @@ def get_current_metrics():
         for key in month_data:
             month_data[key] += vals.get(key, 0)
 
-    def add_drr_and_tax(metrics, ad_expense, d_from, d_to):
+    def add_ad(metrics, ad_expense):
         metrics["ad_expense"] = ad_expense if ad_expense is not None else 0.0
         revenue = metrics.get("ordered_sum", 0)
         if revenue > 0 and ad_expense is not None:
@@ -576,59 +467,18 @@ def get_current_metrics():
             metrics["effective_drr"] = (ad_expense / delivered_revenue) * 100
         else:
             metrics["effective_drr"] = None
-        finance_sum = get_delivered_sum_from_finance(d_from, d_to)
-        if finance_sum is not None:
-            metrics["tax"] = finance_sum * TAX_RATE
-        else:
-            metrics["tax"] = metrics.get("delivered_sum", 0) * TAX_RATE
         return metrics
 
     ad_expense_today = fetch_advertising_expense(today_str, today_str)
-    today_data = add_drr_and_tax(today_data, ad_expense_today, today_str, today_str)
+    today_data = add_ad(today_data, ad_expense_today)
 
     ad_expense_yesterday = fetch_advertising_expense(yesterday_str, yesterday_str)
-    yesterday_data = add_drr_and_tax(yesterday_data, ad_expense_yesterday, yesterday_str, yesterday_str)
+    yesterday_data = add_ad(yesterday_data, ad_expense_yesterday)
 
     ad_expense_month = fetch_advertising_expense(date_from, date_to)
-    month_data = add_drr_and_tax(month_data, ad_expense_month, date_from, date_to)
+    month_data = add_ad(month_data, ad_expense_month)
 
     return today_data, yesterday_data, month_data
-
-def format_metrics(metrics, title):
-    if not metrics:
-        return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
-    has_data = False
-    for key, val in metrics.items():
-        if key in ["drr", "effective_drr", "ad_expense", "tax"]:
-            continue
-        if isinstance(val, (int, float)) and val != 0:
-            has_data = True
-            break
-    if not has_data:
-        return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
-
-    ad_expense = metrics.get("ad_expense", 0)
-    drr = metrics.get("drr")
-    eff_drr = metrics.get("effective_drr")
-    tax = metrics.get("tax", 0)
-    drr_text = f"{drr:.2f}%" if drr is not None else "∞"
-    eff_drr_text = f"{eff_drr:.2f}%" if eff_drr is not None else "∞"
-
-    return (
-        f"📊 *{title}*\n\n"
-        f"🛒 *Заказано*\n  На сумму: {metrics.get('ordered_sum', 0):,.2f} ₽\n"
-        f"  Штук: {metrics.get('ordered_units', 0)}\n\n"
-        f"📦 *Доставлено*\n  На сумму: {metrics.get('delivered_sum', 0):,.2f} ₽\n"
-        f"  Штук: {metrics.get('delivered_units', 0)}\n\n"
-        f"❌ *Отмены*\n  На сумму: {metrics.get('canceled_sum', 0):,.2f} ₽\n"
-        f"  Штук: {metrics.get('canceled_units', 0)}\n\n"
-        f"📢 *Реклама*\n"
-        f"  Расходы: {ad_expense:,.2f} ₽\n"
-        f"  ДРР (общий): {drr_text}\n"
-        f"  ДРР (по доставленным): {eff_drr_text}\n\n"
-        f"🧾 *Налоги*\n"
-        f"  Налог (7% от оплаченной суммы): {tax:,.2f} ₽"
-    )
 
 # ---------- КЛАВИАТУРЫ ----------
 def main_admin_keyboard():
@@ -675,226 +525,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.", reply_markup=ReplyKeyboardRemove())
 
-# ---------- ОТЛАДОЧНЫЕ КОМАНДЫ ----------
-async def debug_finance_variants(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Тестирует разные варианты запросов к финансовому API и показывает полную структуру транзакции."""
-    chat_id = update.effective_chat.id
-    if not is_admin(chat_id):
-        await update.message.reply_text("⛔ Только для администратора.")
-        return
-
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("Укажите даты: /debug_finance_variants 2026-07-01 2026-07-31")
-        return
-
-    date_from = args[0]
-    date_to = args[1]
-    try:
-        datetime.datetime.strptime(date_from, "%Y-%m-%d")
-        datetime.datetime.strptime(date_to, "%Y-%m-%d")
-    except:
-        await update.message.reply_text("Неверный формат даты. Используйте ГГГГ-ММ-ДД")
-        return
-
-    headers = {
-        "Client-Id": OZON_CLIENT_ID,
-        "Api-Key": OZON_API_KEY,
-        "Content-Type": "application/json",
-    }
-
-    from_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d")
-    year = from_dt.year
-    month = from_dt.month
-
-    msg = f"🧪 Тестирование запросов к /v2/finance/realization\nПериод: {date_from} – {date_to}\n\n"
-
-    # Вариант 1: year + month + date_from/date_to (полная структура)
-    payload1 = {
-        "year": year,
-        "month": month,
-        "filter": {
-            "date_from": date_from + "T00:00:00.000Z",
-            "date_to": date_to + "T23:59:59.999Z",
-        },
-        "limit": 1,
-        "offset": 0
-    }
-    try:
-        r1 = requests.post("https://api-seller.ozon.ru/v2/finance/realization", headers=headers, json=payload1, timeout=10)
-        msg += f"📌 Вариант 1 (year+month+даты, limit=1): код {r1.status_code}\n"
-        if r1.status_code == 200:
-            data1 = r1.json()
-            rows = data1.get("result", {}).get("rows", [])
-            if rows:
-                msg += "✅ Полная структура первой транзакции:\n"
-                full_json = json.dumps(rows[0], indent=2, ensure_ascii=False)
-                if len(full_json) > 3500:
-                    full_json = full_json[:3500] + "\n...(обрезано, но ключи видны)"
-                msg += full_json
-            else:
-                msg += "   Транзакций не найдено.\n"
-        else:
-            msg += f"   Ошибка: {r1.text[:200]}\n"
-    except Exception as e:
-        msg += f"   Исключение: {e}\n"
-
-    # Дополнительно покажем общее количество за месяц (без лимита)
-    payload_count = {
-        "year": year,
-        "month": month,
-        "filter": {
-            "date_from": date_from + "T00:00:00.000Z",
-            "date_to": date_to + "T23:59:59.999Z",
-        },
-        "limit": 1,
-        "offset": 0
-    }
-    try:
-        r_count = requests.post("https://api-seller.ozon.ru/v2/finance/realization", headers=headers, json=payload_count, timeout=10)
-        if r_count.status_code == 200:
-            data_count = r_count.json()
-            total_rows = data_count.get("result", {}).get("total", 0)
-            msg += f"\n📊 Всего транзакций за месяц: {total_rows}\n"
-        else:
-            msg += f"\n⚠️ Не удалось получить общее количество.\n"
-    except:
-        pass
-
-    if len(msg) > 4000:
-        msg = msg[:4000] + "\n...(обрезано)"
-    await update.message.reply_text(msg)
-
-async def debug_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает отгрузку и финансовые данные для заказа."""
-    chat_id = update.effective_chat.id
-    if not is_admin(chat_id):
-        await update.message.reply_text("⛔ Только для администратора.")
-        return
-
-    args = context.args
-    if not args:
-        await update.message.reply_text("Укажите номер отгрузки: /debug_order 08928221-0180-1")
-        return
-
-    posting_number = args[0]
-
-    headers = {
-        "Client-Id": OZON_CLIENT_ID,
-        "Api-Key": OZON_API_KEY,
-        "Content-Type": "application/json",
-    }
-
-    url_posting = "https://api-seller.ozon.ru/v2/posting/fbo/get"
-    payload_posting = {
-        "posting_number": posting_number,
-        "with_financial_data": True
-    }
-    try:
-        response = requests.post(url_posting, headers=headers, json=payload_posting, timeout=15)
-        response.raise_for_status()
-        data_posting = response.json()
-        result = data_posting.get("result", {})
-        if not result:
-            await update.message.reply_text("❌ Отгрузка не найдена.")
-            return
-
-        products = result.get("products", [])
-        status = result.get("status")
-        created_at = result.get("created_at")
-        financial_data = result.get("financial_data")
-        msg = f"📦 Отгрузка {posting_number}\nСтатус: {status}\nСоздана: {created_at}\n"
-        msg += f"💰 financial_data: {json.dumps(financial_data, indent=2, ensure_ascii=False) if financial_data else 'None'}\n\n"
-        for idx, product in enumerate(products, 1):
-            msg += f"Товар #{idx}:\n"
-            msg += f"  SKU: {product.get('sku')}\n"
-            msg += f"  Название: {product.get('name')}\n"
-            msg += f"  Количество: {product.get('quantity')}\n"
-            msg += f"  price: {product.get('price')}\n"
-            msg += f"  old_price: {product.get('old_price')}\n"
-            msg += "\n"
-
-        if created_at:
-            month_year = created_at[:7]
-            year, month = month_year.split('-')
-            date_from = f"{year}-{month}-01"
-            next_month = datetime.date(int(year), int(month), 1) + datetime.timedelta(days=32)
-            last_day = next_month.replace(day=1) - datetime.timedelta(days=1)
-            date_to = last_day.strftime("%Y-%m-%d")
-            msg += f"📅 Финансовый запрос за {date_from} – {date_to}\n"
-
-            transactions = fetch_financial_data_v2(date_from, date_to)
-            if transactions:
-                found = [t for t in transactions if t.get("posting_number") == posting_number]
-                if found:
-                    msg += f"✅ Найдено {len(found)} транзакций для этого заказа:\n"
-                    for i, t in enumerate(found[:3]):
-                        msg += f"  Транзакция #{i+1}: {json.dumps(t, indent=2, ensure_ascii=False)}\n"
-                else:
-                    msg += "⚠️ Транзакции для этого заказа не найдены.\n"
-                    if transactions:
-                        msg += "📋 Пример структуры транзакции (первая):\n"
-                        msg += json.dumps(transactions[0], indent=2, ensure_ascii=False)[:1500] + "\n"
-            else:
-                msg += "❌ Не удалось получить финансовые транзакции.\n"
-
-        if len(msg) > 4000:
-            msg = msg[:4000] + "\n...(обрезано)"
-        await update.message.reply_text(msg)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
-async def debug_finance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает финансовые транзакции за указанный период через два метода (v2 и v3)."""
-    chat_id = update.effective_chat.id
-    if not is_admin(chat_id):
-        await update.message.reply_text("⛔ Только для администратора.")
-        return
-
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("Укажите даты: /debug_finance 2026-07-01 2026-07-31")
-        return
-
-    date_from = args[0]
-    date_to = args[1]
-    try:
-        datetime.datetime.strptime(date_from, "%Y-%m-%d")
-        datetime.datetime.strptime(date_to, "%Y-%m-%d")
-    except:
-        await update.message.reply_text("Неверный формат даты. Используйте ГГГГ-ММ-ДД")
-        return
-
-    msg = f"💰 Финансовые транзакции за {date_from} – {date_to}\n\n"
-
-    msg += "📌 Метод /v2/finance/realization:\n"
-    transactions_v2 = fetch_financial_data_v2(date_from, date_to)
-    if transactions_v2 is None:
-        msg += "❌ Ошибка при получении данных (v2).\n"
-    elif not transactions_v2:
-        msg += "ℹ️ Транзакций не найдено (v2).\n"
-    else:
-        msg += f"✅ Найдено {len(transactions_v2)} транзакций.\n"
-        for i, t in enumerate(transactions_v2[:3]):
-            msg += f"--- Транзакция #{i+1} (v2) ---\n"
-            msg += json.dumps(t, indent=2, ensure_ascii=False)[:800] + "\n\n"
-
-    msg += "📌 Метод /v3/finance/transaction/list:\n"
-    transactions_v3 = fetch_financial_data_v3(date_from, date_to)
-    if transactions_v3 is None:
-        msg += "❌ Ошибка при получении данных (v3).\n"
-    elif not transactions_v3:
-        msg += "ℹ️ Транзакций не найдено (v3).\n"
-    else:
-        msg += f"✅ Найдено {len(transactions_v3)} транзакций.\n"
-        for i, t in enumerate(transactions_v3[:3]):
-            msg += f"--- Транзакция #{i+1} (v3) ---\n"
-            msg += json.dumps(t, indent=2, ensure_ascii=False)[:800] + "\n\n"
-
-    if len(msg) > 4000:
-        msg = msg[:4000] + "\n...(обрезано)"
-    await update.message.reply_text(msg)
-
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat_id = update.effective_chat.id
@@ -925,9 +555,8 @@ async def handle_reports_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     if text == "📅 Текущие показатели":
         today_m, yesterday_m, month_m = get_current_metrics()
-        await update.message.reply_text(format_metrics(today_m, "Сегодня"), parse_mode="Markdown")
-        await update.message.reply_text(format_metrics(yesterday_m, "Вчера"), parse_mode="Markdown")
-        await update.message.reply_text(format_metrics(month_m, "Текущий месяц"), parse_mode="Markdown")
+        combined = format_combined_metrics(today_m, yesterday_m, month_m)
+        await update.message.reply_text(combined, parse_mode="Markdown")
     elif text == "📆 Выбрать дату":
         now = get_moscow_today()
         keyboard = create_calendar(now.year, now.month, "date_")
@@ -1011,7 +640,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         date_str = data[5:]
         if re.match(r"\d{4}-\d{2}-\d{2}", date_str):
             metrics = get_metrics_for_date(date_str)
-            msg = format_metrics(metrics, f"Отчёт за {date_str}")
+            msg = format_single_metrics(metrics, f"Отчёт за {date_str}")
             await query.edit_message_text(msg, parse_mode="Markdown")
             await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
             return ConversationHandler.END
@@ -1073,7 +702,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         first_day = datetime.date(year, 1, 1)
         last_day = datetime.date(year, 12, 31)
         metrics = get_metrics_for_period(first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d"))
-        msg = format_metrics(metrics, f"Год {year}")
+        msg = format_single_metrics(metrics, f"Год {year}")
         await query.edit_message_text(msg, parse_mode="Markdown")
         await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
         return ConversationHandler.END
@@ -1088,7 +717,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             last_day = datetime.date(year, month_num+1, 1) - datetime.timedelta(days=1)
         date_from, date_to = first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d")
         metrics = get_metrics_for_period(date_from, date_to)
-        msg = format_metrics(metrics, f"Месяц {first_day.strftime('%B %Y')}")
+        msg = format_single_metrics(metrics, f"Месяц {first_day.strftime('%B %Y')}")
         await query.edit_message_text(msg, parse_mode="Markdown")
         await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
         return ConversationHandler.END
@@ -1105,7 +734,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             last_day = datetime.date(year, end_month+1, 1) - datetime.timedelta(days=1)
         date_from, date_to = first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d")
         metrics = get_metrics_for_period(date_from, date_to)
-        msg = format_metrics(metrics, f"{q} квартал {year}")
+        msg = format_single_metrics(metrics, f"{q} квартал {year}")
         await query.edit_message_text(msg, parse_mode="Markdown")
         await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
         return ConversationHandler.END
@@ -1182,7 +811,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 await query.message.reply_text("Выберите начальную дату заново:", reply_markup=keyboard)
                 return WAITING_PERIOD_START
             metrics = get_metrics_for_period(start_date, end_date_str)
-            msg = format_metrics(metrics, f"Период {start_date} – {end_date_str}")
+            msg = format_single_metrics(metrics, f"Период {start_date} – {end_date_str}")
             await query.edit_message_text(msg, parse_mode="Markdown")
             await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
             context.user_data.pop('period_start_date', None)
@@ -1307,9 +936,6 @@ def main():
                    .build())
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("debug_order", debug_order))
-    application.add_handler(CommandHandler("debug_finance", debug_finance))
-    application.add_handler(CommandHandler("debug_finance_variants", debug_finance_variants))
 
     application.add_handler(MessageHandler(filters.Text(["📊 Отчёт", "⚙️ Администрирование"]), handle_main_menu))
     application.add_handler(MessageHandler(filters.Text(["📅 Текущие показатели", "📆 Выбрать дату", "📊 Выбрать период", "🔙 Назад"]), handle_reports_menu))
@@ -1361,14 +987,10 @@ def main():
         if not managers:
             return
         today_m, yesterday_m, month_m = get_current_metrics()
-        msg_today = format_metrics(today_m, "Сегодня")
-        msg_yesterday = format_metrics(yesterday_m, "Вчера")
-        msg_month = format_metrics(month_m, "Текущий месяц")
+        combined = format_combined_metrics(today_m, yesterday_m, month_m)
         for m in managers:
             try:
-                await context.bot.send_message(chat_id=m['id'], text=msg_today, parse_mode="Markdown")
-                await context.bot.send_message(chat_id=m['id'], text=msg_yesterday, parse_mode="Markdown")
-                await context.bot.send_message(chat_id=m['id'], text=msg_month, parse_mode="Markdown")
+                await context.bot.send_message(chat_id=m['id'], text=combined, parse_mode="Markdown")
             except Exception as e:
                 write_log(f"Ошибка отправки {m['id']}: {e}")
 
