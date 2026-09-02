@@ -493,9 +493,9 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
 
         return (
             f"🔹 *Вчера*\n"
-            f"  🛒 Заказано: \n  {ordered_sum} ₽ / {ordered_units} шт.\n"
-            f"  📦 Доставлено: \n  {delivered_sum} ₽ / {delivered_units} шт.\n"
-            f"  ❌ Отмены: \n  {canceled_sum} ₽ / {canceled_units} шт.\n"
+            f"  🛒 Заказано: \n  {ordered_sum} ₽ / {ordered_units} шт.\n\n"
+            f"  📦 Доставлено: \n  {delivered_sum} ₽ / {delivered_units} шт.\n\n"
+            f"  ❌ Отмены: \n  {canceled_sum} ₽ / {canceled_units} шт.\n\n"
             f"  📢 Реклама: \n  {ad_expense} ₽\n  ДРР общ: {drr_str}\n  ДРР дост: {eff_drr_str}"
         )
 
