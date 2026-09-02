@@ -547,8 +547,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.", reply_markup=ReplyKeyboardRemove())
 
+# ---------- ОТЛАДОЧНАЯ КОМАНДА (ПОКАЗЫВАЕТ total_price ИЗ КОРНЯ ОТГРУЗКИ) ----------
 async def debug_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает полную структуру отгрузки и финансовые данные для указанного номера заказа (только для админа)."""
+    """Показывает полную структуру отгрузки, включая total_price из корня (только для админа)."""
     chat_id = update.effective_chat.id
     if not is_admin(chat_id):
         await update.message.reply_text("⛔ Только для администратора.")
@@ -582,7 +583,9 @@ async def debug_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         products = result.get("products", [])
         status = result.get("status")
         created_at = result.get("created_at")
-        msg = f"📦 Отгрузка {posting_number}\nСтатус: {status}\nСоздана: {created_at}\n\n"
+        total_price_root = result.get("total_price")  # <-- ЭТО НОВОЕ ПОЛЕ
+        msg = f"📦 Отгрузка {posting_number}\nСтатус: {status}\nСоздана: {created_at}\n"
+        msg += f"💰 total_price (корень отгрузки): {total_price_root}\n\n"
         for idx, product in enumerate(products, 1):
             msg += f"Товар #{idx}:\n"
             msg += f"  SKU: {product.get('sku')}\n"
@@ -596,45 +599,11 @@ async def debug_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg += f"  premium_price: {product.get('premium_price')}\n"
             msg += "\n"
 
-        # 2. Получаем финансовые данные через /v2/finance/realization
-        # Извлекаем год из created_at
-        try:
-            year = int(created_at[:4]) if created_at and len(created_at) >= 4 else datetime.datetime.now().year
-        except:
-            year = datetime.datetime.now().year
-        msg += f"📅 Год для финансового запроса: {year}\n"
-
-        # Формируем даты для фильтра: весь год
-        date_from = f"{year}-01-01"
-        date_to = f"{year}-12-31"
-
-        url_finance = "https://api-seller.ozon.ru/v2/finance/realization"
-        payload_finance = {
-            "filter": {
-                "posting_number": posting_number,
-                "year": year,
-                "date_from": date_from,
-                "date_to": date_to
-            }
-        }
-        msg += f"📤 Запрос финансов: {json.dumps(payload_finance, ensure_ascii=False)}\n"
-
-        try:
-            response_finance = requests.post(url_finance, headers=headers, json=payload_finance, timeout=15)
-            if response_finance.status_code != 200:
-                msg += f"❌ Ошибка получения финансов: код {response_finance.status_code}\n"
-                msg += f"Текст ошибки: {response_finance.text[:200]}\n"
-            else:
-                data_finance = response_finance.json()
-                finance_items = data_finance.get("result", {}).get("items", [])
-                if finance_items:
-                    msg += "💰 Финансовые данные:\n"
-                    fin = finance_items[0]
-                    msg += json.dumps(fin, indent=2, ensure_ascii=False)
-                else:
-                    msg += "💰 Финансовые данные: не найдены.\n"
-        except Exception as e:
-            msg += f"❌ Исключение при запросе финансов: {e}\n"
+        # Также можем показать все корневые поля для полноты
+        msg += "📋 Другие корневые поля:\n"
+        for key, value in result.items():
+            if key not in ["products", "status", "created_at", "total_price"]:
+                msg += f"  {key}: {value}\n"
 
         # Обрежем, если слишком длинное
         if len(msg) > 4000:
