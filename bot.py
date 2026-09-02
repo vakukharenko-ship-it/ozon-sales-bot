@@ -356,7 +356,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     postings_current = fetch_postings(current_month_start_str, current_month_end_str)
     postings_prev = fetch_postings(previous_month_start_str, previous_month_end_str)
 
-    # Вчера (полный день)
     agg_yesterday_full = aggregate_postings(
         postings_current,
         date_from=yesterday_str,
@@ -364,7 +363,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     )
     yesterday_full_metrics = agg_yesterday_full.get(yesterday_str, {}) if yesterday_str in agg_yesterday_full else {}
 
-    # Сегодня с ограничением по времени
     agg_today = aggregate_postings(
         postings_current,
         date_from=today_str,
@@ -374,7 +372,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     )
     today_metrics = agg_today.get(today_str, {}) if today_str in agg_today else {}
 
-    # Вчера с ограничением по времени (для дельт)
     agg_yesterday = aggregate_postings(
         postings_current,
         date_from=yesterday_str,
@@ -384,7 +381,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     )
     yesterday_metrics = agg_yesterday.get(yesterday_str, {}) if yesterday_str in agg_yesterday else {}
 
-    # Текущий месяц
     agg_current_month = aggregate_postings(
         postings_current,
         date_from=current_month_start_str,
@@ -404,7 +400,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
         for key in month_metrics:
             month_metrics[key] += vals.get(key, 0)
 
-    # Предыдущий месяц
     prev_period_end = previous_month_start + datetime.timedelta(days=days_passed - 1)
     prev_period_end_str = prev_period_end.isoformat()
     agg_prev_month = aggregate_postings(
@@ -426,7 +421,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
         for key in prev_month_metrics:
             prev_month_metrics[key] += vals.get(key, 0)
 
-    # Реклама
     ad_today = fetch_advertising_expense(today_str, today_str)
     ad_yesterday = fetch_advertising_expense(yesterday_str, yesterday_str)
     ad_month = fetch_advertising_expense(current_month_start_str, current_month_end_str)
@@ -456,7 +450,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
         except:
             return None
 
-    # Дельта для сегодня
     d_ord_sum = calc_delta(today_metrics.get("ordered_sum", 0), yesterday_metrics.get("ordered_sum", 0))
     d_ord_units = calc_delta(today_metrics.get("ordered_units", 0), yesterday_metrics.get("ordered_units", 0))
     d_del_sum = calc_delta(today_metrics.get("delivered_sum", 0), yesterday_metrics.get("delivered_sum", 0))
@@ -465,7 +458,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     d_can_units = calc_delta(today_metrics.get("canceled_units", 0), yesterday_metrics.get("canceled_units", 0))
     d_ad = calc_delta(ad_today, ad_yesterday)
 
-    # Дельта для месяца
     d_ord_sum_m = calc_delta(month_metrics.get("ordered_sum", 0), prev_month_metrics.get("ordered_sum", 0))
     d_ord_units_m = calc_delta(month_metrics.get("ordered_units", 0), prev_month_metrics.get("ordered_units", 0))
     d_del_sum_m = calc_delta(month_metrics.get("delivered_sum", 0), prev_month_metrics.get("delivered_sum", 0))
@@ -474,7 +466,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     d_can_units_m = calc_delta(month_metrics.get("canceled_units", 0), prev_month_metrics.get("canceled_units", 0))
     d_ad_m = calc_delta(ad_month, ad_prev_month)
 
-    # Блок "Вчера"
     def format_yesterday_block():
         ordered_sum = fmt_num(yesterday_full_metrics.get("ordered_sum", 0))
         ordered_units = fmt_int(yesterday_full_metrics.get("ordered_units", 0))
@@ -499,7 +490,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
             f"  📢 Реклама: \n  {ad_expense} ₽\n  ДРР общ: {drr_str}\n  ДРР дост: {eff_drr_str}"
         )
 
-    # Блок "Сегодня"
     def format_today_block():
         ordered_sum = fmt_num(today_metrics.get("ordered_sum", 0))
         ordered_units = fmt_int(today_metrics.get("ordered_units", 0))
@@ -537,7 +527,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
             f"  ДРР дост: {eff_drr_str} | vs Вчера: {delta_ad}"
         )
 
-    # Блок "Текущий месяц"
     def format_month_block():
         ordered_sum = fmt_num(month_metrics.get("ordered_sum", 0))
         ordered_units = fmt_int(month_metrics.get("ordered_units", 0))
@@ -666,6 +655,39 @@ def get_metrics_for_period(date_from, date_to):
         total["effective_drr"] = None
     return total
 
+# ---------- КЛАВИАТУРЫ ----------
+def main_admin_keyboard():
+    buttons = [
+        [KeyboardButton("📊 Отчёт")],
+        [KeyboardButton("⚙️ Администрирование")],
+        [KeyboardButton("📖 Справка")]
+    ]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True, row_width=1)
+
+def main_user_keyboard():
+    buttons = [
+        [KeyboardButton("📊 Отчёт")],
+        [KeyboardButton("📖 Справка")]
+    ]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True, row_width=1)
+
+def reports_keyboard():
+    buttons = [
+        [KeyboardButton("📅 Текущие показатели")],
+        [KeyboardButton("📆 Выбрать дату")],
+        [KeyboardButton("📊 Выбрать период")],
+        [KeyboardButton("🔙 Назад")]
+    ]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+def admin_keyboard():
+    buttons = [
+        [KeyboardButton("➕ Добавить менеджера"), KeyboardButton("➖ Удалить менеджера")],
+        [KeyboardButton("📋 Список менеджеров")],
+        [KeyboardButton("🔙 Назад")]
+    ]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
 # ---------- ОБРАБОТЧИКИ КОМАНД ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -685,31 +707,91 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat_id = update.effective_chat.id
+
     if text == "📊 Отчёт":
         if not has_access(chat_id):
             await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.")
             return
         await update.message.reply_text("Выберите тип отчёта:", reply_markup=reports_keyboard())
-    elif text == "⚙️ Администрирование":
+        return
+
+    if text == "⚙️ Администрирование":
         if not is_admin(chat_id):
             await update.message.reply_text("⛔ Только для администратора.")
             return
         await update.message.reply_text("Управление менеджерами:", reply_markup=admin_keyboard())
-    else:
-        await update.message.reply_text("Используйте кнопки меню.")
+        return
+
+    if text == "📖 Справка":
+        if is_admin(chat_id):
+            help_text = (
+                "📖 *Справка для администратора*\n\n"
+                "🔹 *Основные функции*\n"
+                "• 📊 Отчёт – получить актуальную сводку за сегодня, вчера и текущий месяц.\n"
+                "• 📅 Текущие показатели – быстрый доступ к сводке.\n"
+                "• 📆 Выбрать дату – просмотр данных за конкретный день.\n"
+                "• 📊 Выбрать период – гибкий выбор отчётного периода (месяц, квартал, год, произвольный).\n"
+                "• ⚙️ Администрирование – управление доступом менеджеров.\n\n"
+                "🔹 *Управление менеджерами*\n"
+                "• ➕ Добавить менеджера – введите Telegram ID или @username пользователя, затем номер телефона (или '-' для пропуска).\n"
+                "• ➖ Удалить менеджера – введите Telegram ID пользователя.\n"
+                "• 📋 Список менеджеров – просмотр всех добавленных пользователей (ID, username, имя, телефон).\n\n"
+                "🔹 *Автоматические отчёты*\n"
+                "• В 10:00 МСК – отчёт с блоками «Вчера», «Сегодня» и «Текущий месяц».\n"
+                "• В 22:00 МСК – отчёт с блоками «Сегодня» и «Текущий месяц».\n\n"
+                "🔹 *Метрики*\n"
+                "• 🛒 Заказано – сумма и количество всех заказов.\n"
+                "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
+                "• ❌ Отмены – сумма и количество отменённых заказов.\n"
+                "• 📢 Реклама – расходы на рекламу, ДРР общий и ДРР по доставленным.\n\n"
+                "🔹 *Сравнение динамики*\n"
+                "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
+                "• Для «Текущий месяц» – сравнение с аналогичным периодом предыдущего месяца.\n\n"
+                "🔹 *Часовой пояс*\n"
+                "• Все расчёты ведутся по московскому времени (МСК, UTC+3).\n"
+            )
+        else:
+            help_text = (
+                "📖 *Справка для менеджера*\n\n"
+                "🔹 *Основные функции*\n"
+                "• 📊 Отчёт – получить актуальную сводку за сегодня, вчера и текущий месяц.\n"
+                "• 📅 Текущие показатели – быстрый доступ к сводке.\n"
+                "• 📆 Выбрать дату – просмотр данных за конкретный день.\n"
+                "• 📊 Выбрать период – гибкий выбор отчётного периода (месяц, квартал, год, произвольный).\n\n"
+                "🔹 *Автоматические отчёты*\n"
+                "• В 10:00 МСК – отчёт с блоками «Вчера», «Сегодня» и «Текущий месяц».\n"
+                "• В 22:00 МСК – отчёт с блоками «Сегодня» и «Текущий месяц».\n\n"
+                "🔹 *Метрики*\n"
+                "• 🛒 Заказано – сумма и количество всех заказов.\n"
+                "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
+                "• ❌ Отмены – сумма и количество отменённых заказов.\n"
+                "• 📢 Реклама – расходы на рекламу, ДРР общий и ДРР по доставленным.\n\n"
+                "🔹 *Сравнение динамики*\n"
+                "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
+                "• Для «Текущий месяц» – сравнение с аналогичным периодом предыдущего месяца.\n\n"
+                "🔹 *Часовой пояс*\n"
+                "• Все расчёты ведутся по московскому времени (МСК, UTC+3).\n"
+            )
+        await update.message.reply_text(help_text, parse_mode="Markdown")
+        return
+
+    await update.message.reply_text("Используйте кнопки меню.")
 
 async def handle_reports_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat_id = update.effective_chat.id
+
     if text == "🔙 Назад":
         if is_admin(chat_id):
             await update.message.reply_text("Главное меню", reply_markup=main_admin_keyboard())
         else:
             await update.message.reply_text("Главное меню", reply_markup=main_user_keyboard())
         return
+
     if not has_access(chat_id):
         await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.")
         return
+
     if text == "📅 Текущие показатели":
         report = format_combined_metrics_with_deltas(include_yesterday=False)
         await update.message.reply_text(report, parse_mode="Markdown")
@@ -737,6 +819,7 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Только для администратора.")
         return
     text = update.message.text
+
     if text == "📋 Список менеджеров":
         managers = load_managers()
         if not managers:
@@ -854,35 +937,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = main_admin_keyboard() if is_admin(chat_id) else main_user_keyboard()
     await update.message.reply_text("Действие отменено.", reply_markup=keyboard)
     return ConversationHandler.END
-
-# ---------- КЛАВИАТУРЫ ----------
-def main_admin_keyboard():
-    buttons = [
-        [KeyboardButton("📊 Отчёт")],
-        [KeyboardButton("⚙️ Администрирование")]
-    ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-
-def main_user_keyboard():
-    buttons = [[KeyboardButton("📊 Отчёт")]]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-
-def reports_keyboard():
-    buttons = [
-        [KeyboardButton("📅 Текущие показатели")],
-        [KeyboardButton("📆 Выбрать дату")],
-        [KeyboardButton("📊 Выбрать период")],
-        [KeyboardButton("🔙 Назад")]
-    ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-
-def admin_keyboard():
-    buttons = [
-        [KeyboardButton("➕ Добавить менеджера"), KeyboardButton("➖ Удалить менеджера")],
-        [KeyboardButton("📋 Список менеджеров")],
-        [KeyboardButton("🔙 Назад")]
-    ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 # ---------- INLINE CALLBACK ----------
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1121,8 +1175,62 @@ def main():
                    .build())
 
     application.add_handler(CommandHandler("start", start))
+    # Команда /help для текстового вызова справки (можно добавить)
+    async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        if is_admin(chat_id):
+            help_text = (
+                "📖 *Справка для администратора*\n\n"
+                "🔹 *Основные функции*\n"
+                "• 📊 Отчёт – получить актуальную сводку за сегодня, вчера и текущий месяц.\n"
+                "• 📅 Текущие показатели – быстрый доступ к сводке.\n"
+                "• 📆 Выбрать дату – просмотр данных за конкретный день.\n"
+                "• 📊 Выбрать период – гибкий выбор отчётного периода (месяц, квартал, год, произвольный).\n"
+                "• ⚙️ Администрирование – управление доступом менеджеров.\n\n"
+                "🔹 *Управление менеджерами*\n"
+                "• ➕ Добавить менеджера – введите Telegram ID или @username пользователя, затем номер телефона (или '-' для пропуска).\n"
+                "• ➖ Удалить менеджера – введите Telegram ID пользователя.\n"
+                "• 📋 Список менеджеров – просмотр всех добавленных пользователей (ID, username, имя, телефон).\n\n"
+                "🔹 *Автоматические отчёты*\n"
+                "• В 10:00 МСК – отчёт с блоками «Вчера», «Сегодня» и «Текущий месяц».\n"
+                "• В 22:00 МСК – отчёт с блоками «Сегодня» и «Текущий месяц».\n\n"
+                "🔹 *Метрики*\n"
+                "• 🛒 Заказано – сумма и количество всех заказов.\n"
+                "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
+                "• ❌ Отмены – сумма и количество отменённых заказов.\n"
+                "• 📢 Реклама – расходы на рекламу, ДРР общий и ДРР по доставленным.\n\n"
+                "🔹 *Сравнение динамики*\n"
+                "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
+                "• Для «Текущий месяц» – сравнение с аналогичным периодом предыдущего месяца.\n\n"
+                "🔹 *Часовой пояс*\n"
+                "• Все расчёты ведутся по московскому времени (МСК, UTC+3).\n"
+            )
+        else:
+            help_text = (
+                "📖 *Справка для менеджера*\n\n"
+                "🔹 *Основные функции*\n"
+                "• 📊 Отчёт – получить актуальную сводку за сегодня, вчера и текущий месяц.\n"
+                "• 📅 Текущие показатели – быстрый доступ к сводке.\n"
+                "• 📆 Выбрать дату – просмотр данных за конкретный день.\n"
+                "• 📊 Выбрать период – гибкий выбор отчётного периода (месяц, квартал, год, произвольный).\n\n"
+                "🔹 *Автоматические отчёты*\n"
+                "• В 10:00 МСК – отчёт с блоками «Вчера», «Сегодня» и «Текущий месяц».\n"
+                "• В 22:00 МСК – отчёт с блоками «Сегодня» и «Текущий месяц».\n\n"
+                "🔹 *Метрики*\n"
+                "• 🛒 Заказано – сумма и количество всех заказов.\n"
+                "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
+                "• ❌ Отмены – сумма и количество отменённых заказов.\n"
+                "• 📢 Реклама – расходы на рекламу, ДРР общий и ДРР по доставленным.\n\n"
+                "🔹 *Сравнение динамики*\n"
+                "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
+                "• Для «Текущий месяц» – сравнение с аналогичным периодом предыдущего месяца.\n\n"
+                "🔹 *Часовой пояс*\n"
+                "• Все расчёты ведутся по московскому времени (МСК, UTC+3).\n"
+            )
+        await update.message.reply_text(help_text, parse_mode="Markdown")
+    application.add_handler(CommandHandler("help", help_command))
 
-    application.add_handler(MessageHandler(filters.Text(["📊 Отчёт", "⚙️ Администрирование"]), handle_main_menu))
+    application.add_handler(MessageHandler(filters.Text(["📊 Отчёт", "⚙️ Администрирование", "📖 Справка"]), handle_main_menu))
     application.add_handler(MessageHandler(filters.Text(["📅 Текущие показатели", "📆 Выбрать дату", "📊 Выбрать период", "🔙 Назад"]), handle_reports_menu))
     application.add_handler(MessageHandler(filters.Text(["📋 Список менеджеров", "🔙 Назад"]), handle_admin_menu))
 
