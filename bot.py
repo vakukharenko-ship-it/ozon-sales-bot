@@ -339,7 +339,7 @@ def fetch_advertising_expense(date_from, date_to):
         write_log(f"❌ Ошибка получения рекламных расходов: {e}")
         return None
 
-# ---------- ФОРМАТИРОВАНИЕ ОДНОГО ПЕРИОДА ----------
+# ---------- ФОРМАТИРОВАНИЕ ОТДЕЛЬНОГО ПЕРИОДА ----------
 def format_single_metrics(metrics, title):
     if not metrics:
         return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
@@ -373,12 +373,110 @@ def format_single_metrics(metrics, title):
         f"  ДРР (по доставленным): {eff_drr_text}"
     )
 
-def format_combined_metrics(today_metrics, yesterday_metrics, month_metrics):
-    """Объединяет отчёты за сегодня, вчера и месяц в одно сообщение."""
-    today_part = format_single_metrics(today_metrics, "Сегодня")
-    yesterday_part = format_single_metrics(yesterday_metrics, "Вчера")
-    month_part = format_single_metrics(month_metrics, "Текущий месяц")
-    return f"{today_part}\n\n{yesterday_part}\n\n{month_part}"
+# ---------- НОВАЯ ТАБЛИЧНАЯ ФУНКЦИЯ ДЛЯ ТРЁХ ПЕРИОДОВ ----------
+def format_number(num):
+    try:
+        return f"{num:,.2f}".replace(",", " ")
+    except:
+        return "0.00"
+
+def format_percent(value):
+    if value is None:
+        return "∞"
+    try:
+        return f"{value:.2f}%"
+    except:
+        return "∞"
+
+def format_combined_metrics_table(today, yesterday, month):
+    if not today and not yesterday and not month:
+        return "📊 *Текущие показатели*\n\n❌ Нет данных."
+
+    def get_val(metrics, key):
+        return metrics.get(key, 0) if metrics else 0
+
+    def get_drr(metrics, key):
+        val = metrics.get(key) if metrics else None
+        if val is None:
+            return "∞"
+        return f"{val:.2f}%"
+
+    rows = []
+    # Заказано (сумма)
+    rows.append((
+        "🛒 Заказано (сумма)",
+        format_number(get_val(today, "ordered_sum")),
+        format_number(get_val(yesterday, "ordered_sum")),
+        format_number(get_val(month, "ordered_sum"))
+    ))
+    # Заказано (шт)
+    rows.append((
+        "🛒 Заказано (шт)",
+        str(get_val(today, "ordered_units")),
+        str(get_val(yesterday, "ordered_units")),
+        str(get_val(month, "ordered_units"))
+    ))
+    # Доставлено (сумма)
+    rows.append((
+        "📦 Доставлено (сумма)",
+        format_number(get_val(today, "delivered_sum")),
+        format_number(get_val(yesterday, "delivered_sum")),
+        format_number(get_val(month, "delivered_sum"))
+    ))
+    # Доставлено (шт)
+    rows.append((
+        "📦 Доставлено (шт)",
+        str(get_val(today, "delivered_units")),
+        str(get_val(yesterday, "delivered_units")),
+        str(get_val(month, "delivered_units"))
+    ))
+    # Отмены (сумма)
+    rows.append((
+        "❌ Отмены (сумма)",
+        format_number(get_val(today, "canceled_sum")),
+        format_number(get_val(yesterday, "canceled_sum")),
+        format_number(get_val(month, "canceled_sum"))
+    ))
+    # Отмены (шт)
+    rows.append((
+        "❌ Отмены (шт)",
+        str(get_val(today, "canceled_units")),
+        str(get_val(yesterday, "canceled_units")),
+        str(get_val(month, "canceled_units"))
+    ))
+    # Реклама (расходы)
+    rows.append((
+        "📢 Реклама (расходы)",
+        format_number(get_val(today, "ad_expense")),
+        format_number(get_val(yesterday, "ad_expense")),
+        format_number(get_val(month, "ad_expense"))
+    ))
+    # ДРР (общий)
+    rows.append((
+        "ДРР (общий)",
+        format_percent(get_val(today, "drr") if today else None),
+        format_percent(get_val(yesterday, "drr") if yesterday else None),
+        format_percent(get_val(month, "drr") if month else None)
+    ))
+    # ДРР (по доставленным)
+    rows.append((
+        "ДРР (доставл.)",
+        format_percent(get_val(today, "effective_drr") if today else None),
+        format_percent(get_val(yesterday, "effective_drr") if yesterday else None),
+        format_percent(get_val(month, "effective_drr") if month else None)
+    ))
+
+    max_len = max(len(row[0]) for row in rows)
+    header = f"📊 *Текущие показатели*\n\n"
+    header += f"{'Метрика':<{max_len+2}} | {'Сегодня':<15} | {'Вчера':<15} | {'Месяц':<15}\n"
+    header += "-" * (max_len + 2 + 3 + 15*3 + 6) + "\n"
+
+    table_lines = [header]
+    for row in rows:
+        line = f"{row[0]:<{max_len+2}} | {row[1]:<15} | {row[2]:<15} | {row[3]:<15}"
+        table_lines.append(line)
+
+    return "\n".join(table_lines)
 
 # ---------- ОСНОВНЫЕ ФУНКЦИИ ДЛЯ ОТЧЁТОВ ----------
 def get_metrics_for_date(date_str):
@@ -555,8 +653,8 @@ async def handle_reports_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     if text == "📅 Текущие показатели":
         today_m, yesterday_m, month_m = get_current_metrics()
-        combined = format_combined_metrics(today_m, yesterday_m, month_m)
-        await update.message.reply_text(combined, parse_mode="Markdown")
+        combined_table = format_combined_metrics_table(today_m, yesterday_m, month_m)
+        await update.message.reply_text(combined_table, parse_mode="Markdown")
     elif text == "📆 Выбрать дату":
         now = get_moscow_today()
         keyboard = create_calendar(now.year, now.month, "date_")
@@ -987,10 +1085,10 @@ def main():
         if not managers:
             return
         today_m, yesterday_m, month_m = get_current_metrics()
-        combined = format_combined_metrics(today_m, yesterday_m, month_m)
+        combined_table = format_combined_metrics_table(today_m, yesterday_m, month_m)
         for m in managers:
             try:
-                await context.bot.send_message(chat_id=m['id'], text=combined, parse_mode="Markdown")
+                await context.bot.send_message(chat_id=m['id'], text=combined_table, parse_mode="Markdown")
             except Exception as e:
                 write_log(f"Ошибка отправки {m['id']}: {e}")
 
