@@ -662,14 +662,14 @@ def main_admin_keyboard():
         [KeyboardButton("⚙️ Администрирование")],
         [KeyboardButton("📖 Справка")]
     ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True, row_width=1)
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)   # row_width удалён
 
 def main_user_keyboard():
     buttons = [
         [KeyboardButton("📊 Отчёт")],
         [KeyboardButton("📖 Справка")]
     ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True, row_width=1)
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 def reports_keyboard():
     buttons = [
@@ -1019,7 +1019,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         year = int(data.split("_")[-1])
         context.user_data['period_year'] = year
         months = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-                  "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
+                  "Июль", "Август", "Сентябрь", "Окторябрь", "Ноябрь", "Декабрь"]
         buttons = [[InlineKeyboardButton(name, callback_data=f"period_month_{i}_{year}")] for i, name in enumerate(months, 1)]
         buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")])
         await query.edit_message_text(f"Выберите месяц {year}:", reply_markup=InlineKeyboardMarkup(buttons))
