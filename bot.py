@@ -443,6 +443,8 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
             return "∞"
         if val > 0:
             return f"+{val:.1f}%"
+        elif val < 0:
+            return f"{val:.1f}%"
         else:
             return f"{val:.1f}%"
 
@@ -454,31 +456,40 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
         except:
             return None
 
-    # Вычисляем дельты для сегодня (vs вчера)
-    delta_ordered_sum = calc_delta(today_metrics.get("ordered_sum", 0), yesterday_metrics.get("ordered_sum", 0))
-    delta_ordered_units = calc_delta(today_metrics.get("ordered_units", 0), yesterday_metrics.get("ordered_units", 0))
-    delta_delivered_sum = calc_delta(today_metrics.get("delivered_sum", 0), yesterday_metrics.get("delivered_sum", 0))
-    delta_delivered_units = calc_delta(today_metrics.get("delivered_units", 0), yesterday_metrics.get("delivered_units", 0))
-    delta_canceled_sum = calc_delta(today_metrics.get("canceled_sum", 0), yesterday_metrics.get("canceled_sum", 0))
-    delta_canceled_units = calc_delta(today_metrics.get("canceled_units", 0), yesterday_metrics.get("canceled_units", 0))
-    delta_ad = calc_delta(ad_today, ad_yesterday)
+    # Дельта для сегодня
+    d_ord_sum = calc_delta(today_metrics.get("ordered_sum", 0), yesterday_metrics.get("ordered_sum", 0))
+    d_ord_units = calc_delta(today_metrics.get("ordered_units", 0), yesterday_metrics.get("ordered_units", 0))
+    d_del_sum = calc_delta(today_metrics.get("delivered_sum", 0), yesterday_metrics.get("delivered_sum", 0))
+    d_del_units = calc_delta(today_metrics.get("delivered_units", 0), yesterday_metrics.get("delivered_units", 0))
+    d_can_sum = calc_delta(today_metrics.get("canceled_sum", 0), yesterday_metrics.get("canceled_sum", 0))
+    d_can_units = calc_delta(today_metrics.get("canceled_units", 0), yesterday_metrics.get("canceled_units", 0))
+    d_ad = calc_delta(ad_today, ad_yesterday)
 
-    # Дельта для ДРР (используем дельту расходов, как в примере)
-    delta_drr = delta_ad
-    delta_eff_drr = delta_ad
+    # Дельта для месяца
+    d_ord_sum_m = calc_delta(month_metrics.get("ordered_sum", 0), prev_month_metrics.get("ordered_sum", 0))
+    d_ord_units_m = calc_delta(month_metrics.get("ordered_units", 0), prev_month_metrics.get("ordered_units", 0))
+    d_del_sum_m = calc_delta(month_metrics.get("delivered_sum", 0), prev_month_metrics.get("delivered_sum", 0))
+    d_del_units_m = calc_delta(month_metrics.get("delivered_units", 0), prev_month_metrics.get("delivered_units", 0))
+    d_can_sum_m = calc_delta(month_metrics.get("canceled_sum", 0), prev_month_metrics.get("canceled_sum", 0))
+    d_can_units_m = calc_delta(month_metrics.get("canceled_units", 0), prev_month_metrics.get("canceled_units", 0))
+    d_ad_m = calc_delta(ad_month, ad_prev_month)
 
-    # Для месяца
-    delta_ordered_sum_m = calc_delta(month_metrics.get("ordered_sum", 0), prev_month_metrics.get("ordered_sum", 0))
-    delta_ordered_units_m = calc_delta(month_metrics.get("ordered_units", 0), prev_month_metrics.get("ordered_units", 0))
-    delta_delivered_sum_m = calc_delta(month_metrics.get("delivered_sum", 0), prev_month_metrics.get("delivered_sum", 0))
-    delta_delivered_units_m = calc_delta(month_metrics.get("delivered_units", 0), prev_month_metrics.get("delivered_units", 0))
-    delta_canceled_sum_m = calc_delta(month_metrics.get("canceled_sum", 0), prev_month_metrics.get("canceled_sum", 0))
-    delta_canceled_units_m = calc_delta(month_metrics.get("canceled_units", 0), prev_month_metrics.get("canceled_units", 0))
-    delta_ad_m = calc_delta(ad_month, ad_prev_month)
-    delta_drr_m = delta_ad_m
-    delta_eff_drr_m = delta_ad_m
+    # Форматирование дельты с эмодзи и жирным шрифтом
+    def format_delta(delta, label):
+        if delta is None:
+            return f"{label}: ∞"
+        if delta > 0:
+            emoji = "📈"
+        elif delta < 0:
+            emoji = "📉"
+        else:
+            emoji = "➖"
+        return f"{label}: *{emoji}{fmt_pct(delta)}*"
 
-    # Форматирование блоков
+    def format_delta_ad(delta):
+        return format_delta(delta, "vs Вчера")  # для рекламы отдельно
+
+    # Блок "Вчера"
     def format_yesterday_block():
         ordered_sum = fmt_num(yesterday_full_metrics.get("ordered_sum", 0))
         ordered_units = fmt_int(yesterday_full_metrics.get("ordered_units", 0))
@@ -503,6 +514,7 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
             f"  📢 Реклама: \n\t{ad_expense} ₽\n\tДРР общ: {drr_str}\n\tДРР дост: {eff_drr_str}"
         )
 
+    # Блок "Сегодня"
     def format_today_block():
         ordered_sum = fmt_num(today_metrics.get("ordered_sum", 0))
         ordered_units = fmt_int(today_metrics.get("ordered_units", 0))
@@ -519,30 +531,24 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
         drr_str = f"{drr:.2f}%" if drr is not None else "∞"
         eff_drr_str = f"{eff_drr:.2f}%" if eff_drr is not None else "∞"
 
-        # Формируем строки с дельтами
-        delta_ordered_sum_str = fmt_pct(delta_ordered_sum)
-        delta_ordered_units_str = fmt_pct(delta_ordered_units)
-        delta_delivered_sum_str = fmt_pct(delta_delivered_sum)
-        delta_delivered_units_str = fmt_pct(delta_delivered_units)
-        delta_canceled_sum_str = fmt_pct(delta_canceled_sum)
-        delta_canceled_units_str = fmt_pct(delta_canceled_units)
-        delta_ad_str = fmt_pct(delta_ad)
-        delta_drr_str = fmt_pct(delta_drr)
-        delta_eff_drr_str = fmt_pct(delta_eff_drr)
+        # Формируем дельты
+        delta_ord_sum = format_delta(d_ord_sum, "vs Вчера")
+        delta_ord_units = format_delta(d_ord_units, "vs Вчера")
+        delta_del_sum = format_delta(d_del_sum, "vs Вчера")
+        delta_del_units = format_delta(d_del_units, "vs Вчера")
+        delta_can_sum = format_delta(d_can_sum, "vs Вчера")
+        delta_can_units = format_delta(d_can_units, "vs Вчера")
+        delta_ad = format_delta(d_ad, "vs Вчера")
 
         return (
             f"🔹 *Сегодня (на {now.strftime('%H:%M')} МСК)*\n"
-            f"  🛒 Заказано: \n\t{ordered_sum} ₽ / {ordered_units} шт.\n"
-            f"\tvs Вчера: \n\t{delta_ordered_sum_str} ₽ / {delta_ordered_units_str} шт.\n"
-            f"  📦 Доставлено: \n\t{delivered_sum} ₽ / {delivered_units} шт.\n"
-            f"\tvs Вчера: \n\t{delta_delivered_sum_str} ₽ / {delta_delivered_units_str} шт.\n"
-            f"  ❌ Отмены: \n\t{canceled_sum} ₽ / {canceled_units} шт.\n"
-            f"\tvs Вчера: \n\t{delta_canceled_sum_str} ₽ / {delta_canceled_units_str} шт.\n"
-            f"  📢 Реклама: \n\t{ad_expense} ₽ | vs Вчера: {delta_ad_str}\n"
-            f"\tДРР общ: {drr_str} | vs Вчера: {delta_drr_str}\n"
-            f"\tДРР дост: {eff_drr_str} | vs Вчера: {delta_eff_drr_str}"
+            f"  🛒 Заказано: \n\t{ordered_sum} ₽ / {ordered_units} шт.\n\t\t{delta_ord_sum} ₽ / {delta_ord_units} шт.\n"
+            f"  📦 Доставлено: \n\t{delivered_sum} ₽ / {delivered_units} шт.\n\t\t{delta_del_sum} ₽ / {delta_del_units} шт.\n"
+            f"  ❌ Отмены: \n\t{canceled_sum} ₽ / {canceled_units} шт.\n\t\t{delta_can_sum} ₽ / {delta_can_units} шт.\n"
+            f"  📢 Реклама: \n\t{ad_expense} ₽ | {delta_ad}\n\tДРР общ: {drr_str} | {delta_ad}\n\tДРР дост: {eff_drr_str} | {delta_ad}"
         )
 
+    # Блок "Текущий месяц"
     def format_month_block():
         ordered_sum = fmt_num(month_metrics.get("ordered_sum", 0))
         ordered_units = fmt_int(month_metrics.get("ordered_units", 0))
@@ -559,28 +565,21 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
         drr_str = f"{drr:.2f}%" if drr is not None else "∞"
         eff_drr_str = f"{eff_drr:.2f}%" if eff_drr is not None else "∞"
 
-        # Формируем строки с дельтами
-        delta_ordered_sum_m_str = fmt_pct(delta_ordered_sum_m)
-        delta_ordered_units_m_str = fmt_pct(delta_ordered_units_m)
-        delta_delivered_sum_m_str = fmt_pct(delta_delivered_sum_m)
-        delta_delivered_units_m_str = fmt_pct(delta_delivered_units_m)
-        delta_canceled_sum_m_str = fmt_pct(delta_canceled_sum_m)
-        delta_canceled_units_m_str = fmt_pct(delta_canceled_units_m)
-        delta_ad_m_str = fmt_pct(delta_ad_m)
-        delta_drr_m_str = fmt_pct(delta_drr_m)
-        delta_eff_drr_m_str = fmt_pct(delta_eff_drr_m)
+        # Дельта для месяца
+        delta_ord_sum_m = format_delta(d_ord_sum_m, "vs предыдущий месяц")
+        delta_ord_units_m = format_delta(d_ord_units_m, "vs предыдущий месяц")
+        delta_del_sum_m = format_delta(d_del_sum_m, "vs предыдущий месяц")
+        delta_del_units_m = format_delta(d_del_units_m, "vs предыдущий месяц")
+        delta_can_sum_m = format_delta(d_can_sum_m, "vs предыдущий месяц")
+        delta_can_units_m = format_delta(d_can_units_m, "vs предыдущий месяц")
+        delta_ad_m = format_delta(d_ad_m, "vs предыдущий месяц")
 
         return (
             f"🔹 *Текущий месяц (за аналогичный период)*\n"
-            f"  🛒 Заказано: \n\t{ordered_sum} ₽ / {ordered_units} шт.\n"
-            f"\tvs предыдущий месяц: \n\t{delta_ordered_sum_m_str} ₽ / {delta_ordered_units_m_str} шт.\n"
-            f"  📦 Доставлено: \n\t{delivered_sum} ₽ / {delivered_units} шт.\n"
-            f"\tvs предыдущий месяц: \n\t{delta_delivered_sum_m_str} ₽ / {delta_delivered_units_m_str} шт.\n"
-            f"  ❌ Отмены: \n\t{canceled_sum} ₽ / {canceled_units} шт.\n"
-            f"\tvs предыдущий месяц: \n\t{delta_canceled_sum_m_str} ₽ / {delta_canceled_units_m_str} шт.\n"
-            f"  📢 Реклама: \n\t{ad_expense} ₽ | vs предыдущий месяц: {delta_ad_m_str}\n"
-            f"\tДРР общ: {drr_str} | vs предыдущий месяц: {delta_drr_m_str}\n"
-            f"\tДРР дост: {eff_drr_str} | vs предыдущий месяц: {delta_eff_drr_m_str}"
+            f"  🛒 Заказано: \n\t{ordered_sum} ₽ / {ordered_units} шт.\n\t\t{delta_ord_sum_m} ₽ / {delta_ord_units_m} шт.\n"
+            f"  📦 Доставлено: \n\t{delivered_sum} ₽ / {delivered_units} шт.\n\t\t{delta_del_sum_m} ₽ / {delta_del_units_m} шт.\n"
+            f"  ❌ Отмены: \n\t{canceled_sum} ₽ / {canceled_units} шт.\n\t\t{delta_can_sum_m} ₽ / {delta_can_units_m} шт.\n"
+            f"  📢 Реклама: \n\t{ad_expense} ₽ | {delta_ad_m}\n\tДРР общ: {drr_str} | {delta_ad_m}\n\tДРР дост: {eff_drr_str} | {delta_ad_m}"
         )
 
     parts = []
