@@ -652,7 +652,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- ОТЛАДОЧНЫЕ КОМАНДЫ ----------
 async def debug_finance_variants(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Тестирует разные варианты запросов к финансовому API (только для админа)."""
+    """Тестирует разные варианты запросов к финансовому API и показывает полную структуру транзакции."""
     chat_id = update.effective_chat.id
     if not is_admin(chat_id):
         await update.message.reply_text("⛔ Только для администратора.")
@@ -684,7 +684,7 @@ async def debug_finance_variants(update: Update, context: ContextTypes.DEFAULT_T
 
     msg = f"🧪 Тестирование запросов к /v2/finance/realization\nПериод: {date_from} – {date_to}\n\n"
 
-    # Вариант 1: year + month + date_from/date_to
+    # Вариант 1: year + month + date_from/date_to (полная структура)
     payload1 = {
         "year": year,
         "month": month,
@@ -692,90 +692,51 @@ async def debug_finance_variants(update: Update, context: ContextTypes.DEFAULT_T
             "date_from": date_from + "T00:00:00.000Z",
             "date_to": date_to + "T23:59:59.999Z",
         },
-        "limit": 10
+        "limit": 1,  # берём только одну транзакцию для детального просмотра
+        "offset": 0
     }
     try:
         r1 = requests.post("https://api-seller.ozon.ru/v2/finance/realization", headers=headers, json=payload1, timeout=10)
-        msg += f"📌 Вариант 1 (year+month+даты): код {r1.status_code}\n"
+        msg += f"📌 Вариант 1 (year+month+даты, limit=1): код {r1.status_code}\n"
         if r1.status_code == 200:
             data1 = r1.json()
             rows = data1.get("result", {}).get("rows", [])
-            msg += f"   Найдено записей: {len(rows)}\n"
             if rows:
-                msg += f"   Пример: {json.dumps(rows[0], indent=2, ensure_ascii=False)[:300]}\n"
+                msg += "✅ Полная структура первой транзакции:\n"
+                # Выводим полностью первый объект
+                full_json = json.dumps(rows[0], indent=2, ensure_ascii=False)
+                # Если слишком длинное, обрежем, но покажем все ключи
+                if len(full_json) > 3500:
+                    full_json = full_json[:3500] + "\n...(обрезано, но ключи видны)"
+                msg += full_json
+            else:
+                msg += "   Транзакций не найдено.\n"
         else:
             msg += f"   Ошибка: {r1.text[:200]}\n"
     except Exception as e:
         msg += f"   Исключение: {e}\n"
 
-    # Вариант 2: только year + month (без дат)
-    payload2 = {
-        "year": year,
-        "month": month,
-        "limit": 10
-    }
-    try:
-        r2 = requests.post("https://api-seller.ozon.ru/v2/finance/realization", headers=headers, json=payload2, timeout=10)
-        msg += f"\n📌 Вариант 2 (year+month без дат): код {r2.status_code}\n"
-        if r2.status_code == 200:
-            data2 = r2.json()
-            rows = data2.get("result", {}).get("rows", [])
-            msg += f"   Найдено записей: {len(rows)}\n"
-            if rows:
-                msg += f"   Пример: {json.dumps(rows[0], indent=2, ensure_ascii=False)[:300]}\n"
-        else:
-            msg += f"   Ошибка: {r2.text[:200]}\n"
-    except Exception as e:
-        msg += f"   Исключение: {e}\n"
-
-    # Вариант 3: year+month+posting_number
-    posting_number = "0237561952-0099-1"
-    payload3 = {
-        "year": year,
-        "month": month,
-        "filter": {
-            "posting_number": posting_number
-        },
-        "limit": 10
-    }
-    try:
-        r3 = requests.post("https://api-seller.ozon.ru/v2/finance/realization", headers=headers, json=payload3, timeout=10)
-        msg += f"\n📌 Вариант 3 (year+month+posting_number): код {r3.status_code}\n"
-        if r3.status_code == 200:
-            data3 = r3.json()
-            rows = data3.get("result", {}).get("rows", [])
-            msg += f"   Найдено записей: {len(rows)}\n"
-            if rows:
-                msg += f"   Пример: {json.dumps(rows[0], indent=2, ensure_ascii=False)[:300]}\n"
-        else:
-            msg += f"   Ошибка: {r3.text[:200]}\n"
-    except Exception as e:
-        msg += f"   Исключение: {e}\n"
-
-    # Вариант 4: все вместе
-    payload4 = {
+    # Дополнительно покажем общее количество за месяц (без лимита)
+    payload_count = {
         "year": year,
         "month": month,
         "filter": {
             "date_from": date_from + "T00:00:00.000Z",
             "date_to": date_to + "T23:59:59.999Z",
-            "posting_number": posting_number
         },
-        "limit": 10
+        "limit": 1,
+        "offset": 0
     }
     try:
-        r4 = requests.post("https://api-seller.ozon.ru/v2/finance/realization", headers=headers, json=payload4, timeout=10)
-        msg += f"\n📌 Вариант 4 (все вместе): код {r4.status_code}\n"
-        if r4.status_code == 200:
-            data4 = r4.json()
-            rows = data4.get("result", {}).get("rows", [])
-            msg += f"   Найдено записей: {len(rows)}\n"
-            if rows:
-                msg += f"   Пример: {json.dumps(rows[0], indent=2, ensure_ascii=False)[:300]}\n"
+        r_count = requests.post("https://api-seller.ozon.ru/v2/finance/realization", headers=headers, json=payload_count, timeout=10)
+        if r_count.status_code == 200:
+            data_count = r_count.json()
+            total_rows = data_count.get("result", {}).get("total", 0)
+            msg += f"\n📊 Всего транзакций за месяц: {total_rows}\n"
         else:
-            msg += f"   Ошибка: {r4.text[:200]}\n"
-    except Exception as e:
-        msg += f"   Исключение: {e}\n"
+            msg += f"\n⚠️ Не удалось получить общее количество.\n"
+    except:
+        pass
 
     if len(msg) > 4000:
         msg = msg[:4000] + "\n...(обрезано)"
