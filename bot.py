@@ -303,20 +303,43 @@ def fetch_financial_data_v2(date_from, date_to):
 
 def get_delivered_sum_from_finance(date_from, date_to):
     """
-    Получает сумму доставленных заказов из финансовых данных по полю price_per_instance.
+    Получает сумму доставленных заказов из финансовых данных.
+    Ищет поля: price_per_instance, seller_price_per_instance, price, total, amount.
     Возвращает float или None.
     """
     transactions = fetch_financial_data_v2(date_from, date_to)
     if transactions is None:
+        write_log(f"⚠️ Финансовые данные не получены за {date_from}–{date_to}")
         return None
+    if not transactions:
+        write_log(f"ℹ️ Финансовых транзакций нет за {date_from}–{date_to}")
+        return None
+
+    # Логируем структуру первой транзакции для отладки
+    sample = transactions[0]
+    write_log(f"🔍 Пример финансовой транзакции (первая): {json.dumps(sample, indent=2, ensure_ascii=False)[:1000]}")
+
     total = 0.0
+    price_fields = ["price_per_instance", "seller_price_per_instance", "price", "total", "amount"]
     for txn in transactions:
-        price = txn.get("price_per_instance")
-        if price is not None:
-            try:
-                total += float(price)
-            except:
-                pass
+        found = False
+        for field in price_fields:
+            val = txn.get(field)
+            if val is not None:
+                try:
+                    total += float(val)
+                    found = True
+                    break
+                except:
+                    pass
+        if not found:
+            # Если ни одно поле не найдено, можно попробовать искать во вложенных объектах
+            for key, value in txn.items():
+                if isinstance(value, (int, float)):
+                    total += value
+                    break
+
+    write_log(f"💳 Сумма доставленных заказов из финансов (по полю price_per_instance и др.) за {date_from}–{date_to}: {total:.2f} ₽")
     return total
 
 # ---------- ОСТАЛЬНЫЕ ФУНКЦИИ ----------
@@ -511,7 +534,7 @@ def get_current_metrics():
         for key in month_data:
             month_data[key] += vals.get(key, 0)
 
-    def add_drr_and_tax(metrics, ad_expense, date_from, date_to):
+    def add_drr_and_tax(metrics, ad_expense, d_from, d_to):
         metrics["ad_expense"] = ad_expense if ad_expense is not None else 0.0
         revenue = metrics.get("ordered_sum", 0)
         if revenue > 0 and ad_expense is not None:
@@ -523,7 +546,7 @@ def get_current_metrics():
             metrics["effective_drr"] = (ad_expense / delivered_revenue) * 100
         else:
             metrics["effective_drr"] = None
-        finance_sum = get_delivered_sum_from_finance(date_from, date_to)
+        finance_sum = get_delivered_sum_from_finance(d_from, d_to)
         if finance_sum is not None:
             metrics["tax"] = finance_sum * TAX_RATE
         else:
