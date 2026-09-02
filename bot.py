@@ -373,10 +373,10 @@ def format_single_metrics(metrics, title):
         f"  ДРР (по доставленным): {eff_drr_text}"
     )
 
-# ---------- НОВЫЙ КОМПАКТНЫЙ БЛОЧНЫЙ ФОРМАТ ДЛЯ ТРЁХ ПЕРИОДОВ ----------
-def format_combined_metrics_block(today, yesterday, month):
+# ---------- НОВАЯ ФУНКЦИЯ ДЛЯ КОМПАКТНОГО ОТЧЁТА С ПРОЦЕНТНЫМИ ИЗМЕНЕНИЯМИ ----------
+def format_combined_metrics_with_deltas(today, yesterday, month):
     """
-    Формирует компактный блочный отчёт с тремя периодами.
+    Формирует компактный блочный отчёт с процентными изменениями.
     """
     if not today and not yesterday and not month:
         return "📊 *Текущие показатели*\n\n❌ Нет данных."
@@ -388,9 +388,63 @@ def format_combined_metrics_block(today, yesterday, month):
         return str(val) if val else "0"
 
     def fmt_pct(val):
-        return f"{val:.2f}%" if val is not None else "∞"
+        if val is None:
+            return "∞"
+        if val > 0:
+            return f"+{val:.1f}%"
+        else:
+            return f"{val:.1f}%"
 
-    def block(title, data):
+    def calc_delta(current, previous):
+        if previous == 0 or current == 0:
+            return "∞"
+        try:
+            return ((current - previous) / abs(previous)) * 100
+        except:
+            return "∞"
+
+    # Получаем сегодняшнюю дату и количество дней в месяце
+    today_date = get_moscow_today()
+    first_day = today_date.replace(day=1)
+    days_passed = (today_date - first_day).days + 1  # количество дней от начала месяца до сегодня включительно
+
+    # Вычисляем среднемесячные значения
+    def safe_div(num, denom):
+        if denom == 0:
+            return 0
+        return num / denom
+
+    month_avg = {
+        "ordered_sum": safe_div(month.get("ordered_sum", 0), days_passed),
+        "ordered_units": safe_div(month.get("ordered_units", 0), days_passed),
+        "delivered_sum": safe_div(month.get("delivered_sum", 0), days_passed),
+        "delivered_units": safe_div(month.get("delivered_units", 0), days_passed),
+        "canceled_sum": safe_div(month.get("canceled_sum", 0), days_passed),
+        "canceled_units": safe_div(month.get("canceled_units", 0), days_passed),
+        "ad_expense": safe_div(month.get("ad_expense", 0), days_passed),
+    }
+
+    # Значения за сегодня и вчера
+    today_vals = {
+        "ordered_sum": today.get("ordered_sum", 0),
+        "ordered_units": today.get("ordered_units", 0),
+        "delivered_sum": today.get("delivered_sum", 0),
+        "delivered_units": today.get("delivered_units", 0),
+        "canceled_sum": today.get("canceled_sum", 0),
+        "canceled_units": today.get("canceled_units", 0),
+        "ad_expense": today.get("ad_expense", 0),
+    }
+    yesterday_vals = {
+        "ordered_sum": yesterday.get("ordered_sum", 0),
+        "ordered_units": yesterday.get("ordered_units", 0),
+        "delivered_sum": yesterday.get("delivered_sum", 0),
+        "delivered_units": yesterday.get("delivered_units", 0),
+        "canceled_sum": yesterday.get("canceled_sum", 0),
+        "canceled_units": yesterday.get("canceled_units", 0),
+        "ad_expense": yesterday.get("ad_expense", 0),
+    }
+
+    def block_with_deltas(title, data):
         if not data:
             return f"🔹 {title}: Нет данных"
         ordered_sum = fmt_num(data.get("ordered_sum", 0))
@@ -400,23 +454,32 @@ def format_combined_metrics_block(today, yesterday, month):
         canceled_sum = fmt_num(data.get("canceled_sum", 0))
         canceled_units = fmt_int(data.get("canceled_units", 0))
         ad_expense = fmt_num(data.get("ad_expense", 0))
-        drr = fmt_pct(data.get("drr"))
-        eff_drr = fmt_pct(data.get("effective_drr"))
-        return (
-            f"🔹 *{title}*\n"
-            f"  🛒 Заказано: {ordered_sum} ₽ / {ordered_units} шт\n"
-            f"  📦 Доставлено: {delivered_sum} ₽ / {delivered_units} шт\n"
-            f"  ❌ Отмены: {canceled_sum} ₽ / {canceled_units} шт\n"
-            f"  📢 Реклама: {ad_expense} ₽ / ДРР общ: {drr} / ДРР дост: {eff_drr}"
-        )
+        drr = fmt_pct(data.get("drr") if data.get("drr") is not None else None)
+        eff_drr = fmt_pct(data.get("effective_drr") if data.get("effective_drr") is not None else None)
+
+        # Вычисляем дельты для сегодня (относительно вчера и среднего)
+        def delta_str(current, previous, avg):
+            if previous == 0 and avg == 0:
+                return "vs Вчера: ∞ | vs Месяц: ∞"
+            prev_delta = calc_delta(current, previous)
+            avg_delta = calc_delta(current, avg)
+            return f"vs Вчера: {fmt_pct(prev_delta)} | vs Месяц: {fmt_pct(avg_delta)}"
+
+        # Для каждой метрики формируем строку с дельтами
+        line1 = f"🛒 Заказано: {ordered_sum} ₽ / {ordered_units} шт. | {delta_str(today_vals['ordered_sum'], yesterday_vals['ordered_sum'], month_avg['ordered_sum'])}"
+        line2 = f"📦 Доставлено: {delivered_sum} ₽ / {delivered_units} шт. | {delta_str(today_vals['delivered_sum'], yesterday_vals['delivered_sum'], month_avg['delivered_sum'])}"
+        line3 = f"❌ Отмены: {canceled_sum} ₽ / {canceled_units} шт. | {delta_str(today_vals['canceled_sum'], yesterday_vals['canceled_sum'], month_avg['canceled_sum'])}"
+        line4 = f"📢 Реклама: {ad_expense} ₽ / ДРР общ: {drr} / ДРР дост: {eff_drr} | {delta_str(today_vals['ad_expense'], yesterday_vals['ad_expense'], month_avg['ad_expense'])}"
+        return f"🔹 *{title}*\n  {line1}\n  {line2}\n  {line3}\n  {line4}"
 
     parts = []
     if today:
-        parts.append(block("Сегодня", today))
+        parts.append(block_with_deltas("Сегодня", today))
     if yesterday:
-        parts.append(block("Вчера", yesterday))
+        # Для вчера и месяца дельты не нужны, показываем только данные
+        parts.append(block_with_deltas("Вчера", yesterday))
     if month:
-        parts.append(block("Текущий месяц", month))
+        parts.append(block_with_deltas("Текущий месяц", month))
 
     return "📊 *Текущие показатели*\n\n" + "\n\n".join(parts)
 
@@ -595,7 +658,7 @@ async def handle_reports_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     if text == "📅 Текущие показатели":
         today_m, yesterday_m, month_m = get_current_metrics()
-        combined = format_combined_metrics_block(today_m, yesterday_m, month_m)
+        combined = format_combined_metrics_with_deltas(today_m, yesterday_m, month_m)
         await update.message.reply_text(combined, parse_mode="Markdown")
     elif text == "📆 Выбрать дату":
         now = get_moscow_today()
@@ -1027,7 +1090,7 @@ def main():
         if not managers:
             return
         today_m, yesterday_m, month_m = get_current_metrics()
-        combined = format_combined_metrics_block(today_m, yesterday_m, month_m)
+        combined = format_combined_metrics_with_deltas(today_m, yesterday_m, month_m)
         for m in managers:
             try:
                 await context.bot.send_message(chat_id=m['id'], text=combined, parse_mode="Markdown")
