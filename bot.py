@@ -256,11 +256,11 @@ def aggregate_postings(postings, date_from=None, date_to=None):
 
     return aggregated
 
-# ---------- ФИНАНСОВЫЙ API (НОВЫЙ - ИСПРАВЛЕННЫЙ) ----------
+# ---------- ФИНАНСОВЫЙ API (ИСПРАВЛЕННЫЙ) ----------
 def fetch_financial_data_v2(date_from, date_to):
     """
     Получает финансовые транзакции за период через /v2/finance/realization.
-    Правильный формат запроса.
+    Год передаётся на корневом уровне, даты внутри filter.
     """
     url = "https://api-seller.ozon.ru/v2/finance/realization"
     headers = {
@@ -271,11 +271,13 @@ def fetch_financial_data_v2(date_from, date_to):
     try:
         from_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d")
         to_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d") + datetime.timedelta(days=1) - datetime.timedelta(seconds=1)
+        year = from_dt.year
     except:
         write_log(f"❌ Ошибка парсинга дат: {date_from} {date_to}")
         return None
 
     payload = {
+        "year": year,  # обязательное поле на корневом уровне
         "filter": {
             "date_from": from_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
             "date_to": to_dt.strftime("%Y-%m-%dT%H:%M:%S.999Z"),
@@ -646,7 +648,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.", reply_markup=ReplyKeyboardRemove())
 
-# ---------- НОВАЯ ОТЛАДОЧНАЯ КОМАНДА ДЛЯ ТЕСТИРОВАНИЯ РАЗНЫХ ВАРИАНТОВ ФИНАНСОВОГО API ----------
+# ---------- ОТЛАДОЧНЫЕ КОМАНДЫ ----------
 async def debug_finance_variants(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Тестирует разные варианты запросов к финансовому API (только для админа)."""
     chat_id = update.effective_chat.id
@@ -673,11 +675,13 @@ async def debug_finance_variants(update: Update, context: ContextTypes.DEFAULT_T
         "Api-Key": OZON_API_KEY,
         "Content-Type": "application/json",
     }
+    year = date_from[:4]
 
     msg = f"🧪 Тестирование запросов к /v2/finance/realization\nПериод: {date_from} – {date_to}\n\n"
 
-    # Вариант 1: только date_from и date_to
+    # Вариант 1: year + date_from/date_to
     payload1 = {
+        "year": int(year),
         "filter": {
             "date_from": date_from + "T00:00:00.000Z",
             "date_to": date_to + "T23:59:59.999Z",
@@ -686,7 +690,7 @@ async def debug_finance_variants(update: Update, context: ContextTypes.DEFAULT_T
     }
     try:
         r1 = requests.post("https://api-seller.ozon.ru/v2/finance/realization", headers=headers, json=payload1, timeout=10)
-        msg += f"📌 Вариант 1 (date_from/date_to): код {r1.status_code}\n"
+        msg += f"📌 Вариант 1 (year + date_from/date_to): код {r1.status_code}\n"
         if r1.status_code == 200:
             data1 = r1.json()
             rows = data1.get("result", {}).get("rows", [])
@@ -699,11 +703,8 @@ async def debug_finance_variants(update: Update, context: ContextTypes.DEFAULT_T
         msg += f"   Исключение: {e}\n"
 
     # Вариант 2: только year (без date_from/date_to)
-    year = date_from[:4]
     payload2 = {
-        "filter": {
-            "year": int(year)
-        },
+        "year": int(year),
         "limit": 10
     }
     try:
@@ -720,11 +721,11 @@ async def debug_finance_variants(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as e:
         msg += f"   Исключение: {e}\n"
 
-    # Вариант 3: год + posting_number (с известным заказом)
+    # Вариант 3: year + posting_number
     posting_number = "0237561952-0099-1"
     payload3 = {
+        "year": int(year),
         "filter": {
-            "year": int(year),
             "posting_number": posting_number
         },
         "limit": 10
@@ -743,11 +744,19 @@ async def debug_finance_variants(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as e:
         msg += f"   Исключение: {e}\n"
 
-    # Вариант 4: без фильтров, только limit
-    payload4 = {"limit": 10}
+    # Вариант 4: год + даты + posting_number
+    payload4 = {
+        "year": int(year),
+        "filter": {
+            "date_from": date_from + "T00:00:00.000Z",
+            "date_to": date_to + "T23:59:59.999Z",
+            "posting_number": posting_number
+        },
+        "limit": 10
+    }
     try:
         r4 = requests.post("https://api-seller.ozon.ru/v2/finance/realization", headers=headers, json=payload4, timeout=10)
-        msg += f"\n📌 Вариант 4 (без фильтров): код {r4.status_code}\n"
+        msg += f"\n📌 Вариант 4 (год+даты+posting_number): код {r4.status_code}\n"
         if r4.status_code == 200:
             data4 = r4.json()
             rows = data4.get("result", {}).get("rows", [])
@@ -763,7 +772,6 @@ async def debug_finance_variants(update: Update, context: ContextTypes.DEFAULT_T
         msg = msg[:4000] + "\n...(обрезано)"
     await update.message.reply_text(msg)
 
-# ---------- ОСТАЛЬНЫЕ ОБРАБОТЧИКИ ----------
 async def debug_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает отгрузку и финансовые данные для заказа."""
     chat_id = update.effective_chat.id
