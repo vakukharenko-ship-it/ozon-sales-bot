@@ -334,7 +334,7 @@ def fetch_advertising_expense(date_from, date_to):
 def get_current_time_msk():
     return datetime.datetime.now(MOSCOW_TZ)
 
-def format_combined_metrics_with_deltas():
+def format_combined_metrics_with_deltas(include_yesterday=False):
     now = get_current_time_msk()
     today_date = now.date()
     current_time = now.time()
@@ -352,12 +352,19 @@ def format_combined_metrics_with_deltas():
     previous_month_end_str = previous_month_end.isoformat()
 
     days_passed = (today_date - current_month_start).days + 1
-    previous_month_today = previous_month_start + datetime.timedelta(days=days_passed - 1)
-    previous_month_today_str = previous_month_today.isoformat()
 
     postings_current = fetch_postings(current_month_start_str, current_month_end_str)
     postings_prev = fetch_postings(previous_month_start_str, previous_month_end_str)
 
+    # Вчера (полный день)
+    agg_yesterday_full = aggregate_postings(
+        postings_current,
+        date_from=yesterday_str,
+        date_to=yesterday_str
+    )
+    yesterday_full_metrics = agg_yesterday_full.get(yesterday_str, {}) if yesterday_str in agg_yesterday_full else {}
+
+    # Сегодня с ограничением по времени
     agg_today = aggregate_postings(
         postings_current,
         date_from=today_str,
@@ -367,6 +374,7 @@ def format_combined_metrics_with_deltas():
     )
     today_metrics = agg_today.get(today_str, {}) if today_str in agg_today else {}
 
+    # Вчера с ограничением по времени (для дельт)
     agg_yesterday = aggregate_postings(
         postings_current,
         date_from=yesterday_str,
@@ -376,6 +384,7 @@ def format_combined_metrics_with_deltas():
     )
     yesterday_metrics = agg_yesterday.get(yesterday_str, {}) if yesterday_str in agg_yesterday else {}
 
+    # Текущий месяц
     agg_current_month = aggregate_postings(
         postings_current,
         date_from=current_month_start_str,
@@ -395,6 +404,7 @@ def format_combined_metrics_with_deltas():
         for key in month_metrics:
             month_metrics[key] += vals.get(key, 0)
 
+    # Предыдущий месяц
     prev_period_end = previous_month_start + datetime.timedelta(days=days_passed - 1)
     prev_period_end_str = prev_period_end.isoformat()
     agg_prev_month = aggregate_postings(
@@ -416,6 +426,7 @@ def format_combined_metrics_with_deltas():
         for key in prev_month_metrics:
             prev_month_metrics[key] += vals.get(key, 0)
 
+    # Реклама
     ad_today = fetch_advertising_expense(today_str, today_str)
     ad_yesterday = fetch_advertising_expense(yesterday_str, yesterday_str)
     ad_month = fetch_advertising_expense(current_month_start_str, current_month_end_str)
@@ -446,6 +457,31 @@ def format_combined_metrics_with_deltas():
     def delta_str(current, previous, label):
         delta = calc_delta(current, previous)
         return f"{label}: {fmt_pct(delta)}"
+
+    def format_yesterday_block():
+        ordered_sum = fmt_num(yesterday_full_metrics.get("ordered_sum", 0))
+        ordered_units = fmt_int(yesterday_full_metrics.get("ordered_units", 0))
+        delivered_sum = fmt_num(yesterday_full_metrics.get("delivered_sum", 0))
+        delivered_units = fmt_int(yesterday_full_metrics.get("delivered_units", 0))
+        canceled_sum = fmt_num(yesterday_full_metrics.get("canceled_sum", 0))
+        canceled_units = fmt_int(yesterday_full_metrics.get("canceled_units", 0))
+        ad_expense = fmt_num(ad_yesterday)
+
+        revenue = yesterday_full_metrics.get("ordered_sum", 0)
+        drr = (ad_yesterday / revenue * 100) if revenue > 0 else None
+        delivered_revenue = yesterday_full_metrics.get("delivered_sum", 0)
+        eff_drr = (ad_yesterday / delivered_revenue * 100) if delivered_revenue > 0 else None
+        drr_str = f"{drr:.2f}%" if drr is not None else "∞"
+        eff_drr_str = f"{eff_drr:.2f}%" if eff_drr is not None else "∞"
+
+        return (
+            f"🔹 *Вчера*\n"
+            f"  🛒 Заказано: {ordered_sum} ₽ / {ordered_units} шт.\n"
+            f"  📦 Доставлено: {delivered_sum} ₽ / {delivered_units} шт.\n"
+            f"  ❌ Отмены: {canceled_sum} ₽ / {canceled_units} шт.\n"
+            f"  📢 Реклама: {ad_expense} ₽\n"
+            f"  ДРР общ: {drr_str} | ДРР дост: {eff_drr_str}"
+        )
 
     def format_today_block():
         ordered_sum = fmt_num(today_metrics.get("ordered_sum", 0))
@@ -513,10 +549,13 @@ def format_combined_metrics_with_deltas():
             f"  ДРР общ: {drr_str} | ДРР дост: {eff_drr_str}"
         )
 
-    today_block = format_today_block()
-    month_block = format_month_block()
+    parts = []
+    if include_yesterday:
+        parts.append(format_yesterday_block())
+    parts.append(format_today_block())
+    parts.append(format_month_block())
 
-    return f"📊 *Текущие показатели*\n\n{today_block}\n\n{month_block}"
+    return "📊 *Текущие показатели*\n\n" + "\n\n".join(parts)
 
 def format_single_metrics(metrics, title):
     if not metrics:
@@ -645,7 +684,8 @@ async def handle_reports_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.")
         return
     if text == "📅 Текущие показатели":
-        report = format_combined_metrics_with_deltas()
+        # Ручной вызов – без блока "Вчера"
+        report = format_combined_metrics_with_deltas(include_yesterday=False)
         await update.message.reply_text(report, parse_mode="Markdown")
     elif text == "📆 Выбрать дату":
         now = get_moscow_today()
@@ -1101,9 +1141,10 @@ def main():
     application.add_handler(conv_remove)
     application.add_handler(CallbackQueryHandler(handle_callback_query))
 
-    # ---------- НОВОЕ РАСПИСАНИЕ (10:00 и 22:00 МСК) ----------
+    # ---------- РАСПИСАНИЕ ----------
     job_queue = application.job_queue
     if job_queue:
+        # Утренняя сводка (10:00) – с блоком "Вчера"
         job_queue.run_daily(
             scheduled_report,
             time=datetime.time(10, 0, 0),
@@ -1111,6 +1152,7 @@ def main():
             name="morning_report",
             timezone=MOSCOW_TZ
         )
+        # Вечерняя сводка (22:00) – без блока "Вчера"
         job_queue.run_daily(
             scheduled_report,
             time=datetime.time(22, 0, 0),
@@ -1128,11 +1170,12 @@ def main():
 async def scheduled_report(context):
     moscow_tz = MOSCOW_TZ
     now = datetime.datetime.now(moscow_tz)
-    # Отправка происходит по расписанию, дополнительная проверка времени не обязательна, но оставим для безопасности
+    # Для утренней сводки включаем блок "Вчера"
+    include_yesterday = (now.hour == 10)
+    report = format_combined_metrics_with_deltas(include_yesterday=include_yesterday)
     managers = load_managers()
     if not managers:
         return
-    report = format_combined_metrics_with_deltas()
     for m in managers:
         try:
             await context.bot.send_message(chat_id=m['id'], text=report, parse_mode="Markdown")
