@@ -209,7 +209,6 @@ def aggregate_postings(postings, date_from=None, date_to=None, time_limit=None, 
             continue
         try:
             dt = datetime.datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-            # переводим в московское время для сравнения времени
             dt_msk = dt.astimezone(MOSCOW_TZ)
         except:
             continue
@@ -219,7 +218,6 @@ def aggregate_postings(postings, date_from=None, date_to=None, time_limit=None, 
         if date_to and date_str > date_to:
             continue
 
-        # Применяем ограничение по времени для указанного дня
         if time_limit is not None and apply_limit_on_day is not None and date_str == apply_limit_on_day:
             if dt_msk.time() > time_limit:
                 continue
@@ -260,86 +258,7 @@ def aggregate_postings(postings, date_from=None, date_to=None, time_limit=None, 
 
     return aggregated
 
-def get_metrics_for_period_with_time_limit(date_from, date_to, time_limit, apply_limit_on_day):
-    """
-    Загружает отгрузки за период date_from–date_to и агрегирует,
-    применяя временное ограничение для указанного дня.
-    Возвращает словарь с суммарными метриками за весь период.
-    """
-    postings = fetch_postings(date_from, date_to)
-    agg = aggregate_postings(postings, date_from, date_to, time_limit, apply_limit_on_day)
-    total = {
-        "ordered_units": 0,
-        "ordered_sum": 0.0,
-        "delivered_units": 0,
-        "delivered_sum": 0.0,
-        "canceled_units": 0,
-        "canceled_sum": 0.0,
-    }
-    for vals in agg.values():
-        for key in total:
-            total[key] += vals.get(key, 0)
-    return total
-
-def get_advertising_expense_for_period(date_from, date_to, time_limit=None, apply_limit_on_day=None):
-    """
-    Получает рекламные расходы за период. Если задан time_limit, применяет фильтр по времени для дня apply_limit_on_day.
-    """
-    # Для рекламы фильтрация по времени сложнее, так как у нас есть данные с разбивкой по дням.
-    # Мы можем получить расходы за каждый день и просуммировать с учётом ограничений.
-    token = get_performance_token()
-    if not token:
-        return 0.0
-
-    url = "https://api-performance.ozon.ru/api/client/statistics/expense/json"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-    # Запрашиваем данные за весь период
-    start_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d") - datetime.timedelta(days=1)
-    end_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d") + datetime.timedelta(days=1)
-    params = {
-        "dateFrom": start_dt.strftime("%Y-%m-%d"),
-        "dateTo": end_dt.strftime("%Y-%m-%d"),
-    }
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=15)
-        if response.status_code == 429:
-            time.sleep(10)
-            response = requests.get(url, headers=headers, params=params, timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        total_expense = 0.0
-        if isinstance(data, dict) and "rows" in data:
-            rows = data["rows"]
-            if isinstance(rows, list):
-                for item in rows:
-                    item_date = item.get("date")
-                    if not item_date:
-                        continue
-                    item_date_str = item_date[:10]
-                    if item_date_str < date_from or item_date_str > date_to:
-                        continue
-                    # Если задано временное ограничение и это день применения
-                    if time_limit is not None and apply_limit_on_day is not None and item_date_str == apply_limit_on_day:
-                        # В рекламных данных нет времени, только дата, поэтому мы не можем отфильтровать по времени
-                        # Для простоты будем считать, что рекламные расходы за день распределяются равномерно по времени?
-                        # Но точного решения нет, поэтому пока будем учитывать полный день.
-                        pass
-                    money_spent_str = item.get("moneySpent")
-                    if money_spent_str is not None:
-                        try:
-                            money_spent = float(money_spent_str.replace(",", "."))
-                            total_expense += money_spent
-                        except:
-                            pass
-        return total_expense
-    except Exception as e:
-        write_log(f"❌ Ошибка получения рекламных расходов: {e}")
-        return 0.0
-
-# ---------- РЕКЛАМНЫЕ РАСХОДЫ (С ИСПОЛЬЗОВАНИЕМ ТОКЕНА) ----------
+# ---------- РЕКЛАМНЫЕ РАСХОДЫ ----------
 def get_performance_token():
     if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
         write_log("⚠️ OZON_PERFORMANCE_CLIENT_ID или CLIENT_SECRET не заданы!")
@@ -420,7 +339,7 @@ def fetch_advertising_expense(date_from, date_to):
         write_log(f"❌ Ошибка получения рекламных расходов: {e}")
         return 0.0
 
-# ---------- ОСНОВНЫЕ ФУНКЦИИ ДЛЯ ОТЧЁТОВ (С УЧЁТОМ ВРЕМЕНИ) ----------
+# ---------- ОСНОВНАЯ ФУНКЦИЯ ОТЧЁТА (С УЧЁТОМ ВРЕМЕНИ) ----------
 def get_current_time_msk():
     return datetime.datetime.now(MOSCOW_TZ)
 
@@ -437,33 +356,24 @@ def format_combined_metrics_with_deltas():
     yesterday_date = today_date - datetime.timedelta(days=1)
     yesterday_str = yesterday_date.isoformat()
 
-    # Определяем границы текущего месяца
     current_month_start = today_date.replace(day=1)
     current_month_start_str = current_month_start.isoformat()
     current_month_end_str = today_str
 
-    # Определяем границы предыдущего месяца
     previous_month_start = (current_month_start - datetime.timedelta(days=1)).replace(day=1)
     previous_month_start_str = previous_month_start.isoformat()
     previous_month_end = current_month_start - datetime.timedelta(days=1)
     previous_month_end_str = previous_month_end.isoformat()
 
-    # Количество дней, прошедших в текущем месяце (включая сегодня)
     days_passed = (today_date - current_month_start).days + 1
-
-    # Дата в предыдущем месяце, соответствующая сегодняшнему дню (для ограничения времени)
     previous_month_today = previous_month_start + datetime.timedelta(days=days_passed - 1)
     previous_month_today_str = previous_month_today.isoformat()
 
-    # 1. Загружаем отгрузки за текущий месяц
+    # Загружаем отгрузки за текущий и предыдущий месяц
     postings_current = fetch_postings(current_month_start_str, current_month_end_str)
-
-    # 2. Загружаем отгрузки за предыдущий месяц (полностью)
     postings_prev = fetch_postings(previous_month_start_str, previous_month_end_str)
 
-    # 3. Агрегируем с учётом времени для каждого периода
-
-    # Сегодня (весь день до текущего времени)
+    # Агрегируем сегодня с ограничением по времени
     agg_today = aggregate_postings(
         postings_current,
         date_from=today_str,
@@ -473,7 +383,7 @@ def format_combined_metrics_with_deltas():
     )
     today_metrics = agg_today.get(today_str, {}) if today_str in agg_today else {}
 
-    # Вчера (весь день вчера до текущего времени)
+    # Вчера с ограничением по времени
     agg_yesterday = aggregate_postings(
         postings_current,
         date_from=yesterday_str,
@@ -483,16 +393,14 @@ def format_combined_metrics_with_deltas():
     )
     yesterday_metrics = agg_yesterday.get(yesterday_str, {}) if yesterday_str in agg_yesterday else {}
 
-    # Текущий месяц (с начала месяца до сегодня, но для сегодня ограничиваем время)
-    # Сначала агрегируем весь месяц, потом отфильтруем нужные даты
+    # Текущий месяц (с ограничением для сегодня)
     agg_current_month = aggregate_postings(
         postings_current,
         date_from=current_month_start_str,
         date_to=current_month_end_str,
         time_limit=current_time,
-        apply_limit_on_day=today_str  # только для сегодня ограничиваем время
+        apply_limit_on_day=today_str
     )
-    # Суммируем все дни в agg_current_month
     month_metrics = {
         "ordered_units": 0,
         "ordered_sum": 0.0,
@@ -506,10 +414,8 @@ def format_combined_metrics_with_deltas():
             month_metrics[key] += vals.get(key, 0)
 
     # Предыдущий месяц (первые days_passed дней, для последнего дня ограничиваем время)
-    # Определим дату конца периода в предыдущем месяце
     prev_period_end = previous_month_start + datetime.timedelta(days=days_passed - 1)
     prev_period_end_str = prev_period_end.isoformat()
-    # Агрегируем отгрузки за предыдущий месяц, но ограничиваем время для последнего дня
     agg_prev_month = aggregate_postings(
         postings_prev,
         date_from=previous_month_start_str,
@@ -529,14 +435,13 @@ def format_combined_metrics_with_deltas():
         for key in prev_month_metrics:
             prev_month_metrics[key] += vals.get(key, 0)
 
-    # Получаем рекламные расходы для каждого периода (с учётом времени, если возможно)
-    # Для простоты используем старую функцию, но она не учитывает время. Мы можем улучшить позже.
-    ad_today = fetch_advertising_expense(today_str, today_str)  # за сегодня весь день (но нам нужно до текущего времени, пока оставим так)
+    # Рекламные расходы (пока без временного ограничения)
+    ad_today = fetch_advertising_expense(today_str, today_str)
     ad_yesterday = fetch_advertising_expense(yesterday_str, yesterday_str)
     ad_month = fetch_advertising_expense(current_month_start_str, current_month_end_str)
     ad_prev_month = fetch_advertising_expense(previous_month_start_str, previous_month_end_str)
 
-    # Функции форматирования и расчёта дельт
+    # Вспомогательные функции форматирования
     def fmt_num(val):
         return f"{val:,.2f}".replace(",", " ") if val else "0.00"
 
@@ -563,7 +468,7 @@ def format_combined_metrics_with_deltas():
         delta = calc_delta(current, previous)
         return f"{label}: {fmt_pct(delta)}"
 
-    # Формируем блок "Сегодня"
+    # Блок "Сегодня"
     def format_today_block():
         ordered_sum = fmt_num(today_metrics.get("ordered_sum", 0))
         ordered_units = fmt_int(today_metrics.get("ordered_units", 0))
@@ -573,7 +478,6 @@ def format_combined_metrics_with_deltas():
         canceled_units = fmt_int(today_metrics.get("canceled_units", 0))
         ad_expense = fmt_num(ad_today)
 
-        # Дельта по сравнению со вчера
         d_ordered_sum = delta_str(today_metrics.get("ordered_sum", 0), yesterday_metrics.get("ordered_sum", 0), "vs Вчера")
         d_ordered_units = delta_str(today_metrics.get("ordered_units", 0), yesterday_metrics.get("ordered_units", 0), "vs Вчера")
         d_delivered_sum = delta_str(today_metrics.get("delivered_sum", 0), yesterday_metrics.get("delivered_sum", 0), "vs Вчера")
@@ -582,16 +486,12 @@ def format_combined_metrics_with_deltas():
         d_canceled_units = delta_str(today_metrics.get("canceled_units", 0), yesterday_metrics.get("canceled_units", 0), "vs Вчера")
         d_ad_expense = delta_str(ad_today, ad_yesterday, "vs Вчера")
 
-        # ДРР
         revenue = today_metrics.get("ordered_sum", 0)
         drr = (ad_today / revenue * 100) if revenue > 0 else None
         delivered_revenue = today_metrics.get("delivered_sum", 0)
         eff_drr = (ad_today / delivered_revenue * 100) if delivered_revenue > 0 else None
         drr_str = f"{drr:.2f}%" if drr is not None else "∞"
         eff_drr_str = f"{eff_drr:.2f}%" if eff_drr is not None else "∞"
-
-        # Дельта для ДРР (по сравнению со вчерашним ДРР) – для простоты показываем изменение расходов
-        # Можно вычислить ДРР вчера и сравнить, но сейчас оставим только изменение расходов
 
         return (
             f"🔹 *Сегодня (на {now.strftime('%H:%M')} МСК)*\n"
@@ -612,7 +512,6 @@ def format_combined_metrics_with_deltas():
         canceled_units = fmt_int(month_metrics.get("canceled_units", 0))
         ad_expense = fmt_num(ad_month)
 
-        # Дельта по сравнению с предыдущим месяцем (аналогичный период)
         d_ordered_sum = delta_str(month_metrics.get("ordered_sum", 0), prev_month_metrics.get("ordered_sum", 0), "vs предыдущий месяц")
         d_ordered_units = delta_str(month_metrics.get("ordered_units", 0), prev_month_metrics.get("ordered_units", 0), "vs предыдущий месяц")
         d_delivered_sum = delta_str(month_metrics.get("delivered_sum", 0), prev_month_metrics.get("delivered_sum", 0), "vs предыдущий месяц")
@@ -641,6 +540,89 @@ def format_combined_metrics_with_deltas():
     month_block = format_month_block()
 
     return f"📊 *Текущие показатели*\n\n{today_block}\n\n{month_block}"
+
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ВЫБОРА ДАТЫ/ПЕРИОДА ----------
+def format_single_metrics(metrics, title):
+    if not metrics:
+        return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
+    has_data = False
+    for key, val in metrics.items():
+        if key in ["drr", "effective_drr", "ad_expense"]:
+            continue
+        if isinstance(val, (int, float)) and val != 0:
+            has_data = True
+            break
+    if not has_data:
+        return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
+
+    ad_expense = metrics.get("ad_expense", 0)
+    drr = metrics.get("drr")
+    eff_drr = metrics.get("effective_drr")
+    drr_text = f"{drr:.2f}%" if drr is not None else "∞"
+    eff_drr_text = f"{eff_drr:.2f}%" if eff_drr is not None else "∞"
+
+    return (
+        f"📊 *{title}*\n\n"
+        f"🛒 *Заказано*\n  На сумму: {metrics.get('ordered_sum', 0):,.2f} ₽\n"
+        f"  Штук: {metrics.get('ordered_units', 0)}\n\n"
+        f"📦 *Доставлено*\n  На сумму: {metrics.get('delivered_sum', 0):,.2f} ₽\n"
+        f"  Штук: {metrics.get('delivered_units', 0)}\n\n"
+        f"❌ *Отмены*\n  На сумму: {metrics.get('canceled_sum', 0):,.2f} ₽\n"
+        f"  Штук: {metrics.get('canceled_units', 0)}\n\n"
+        f"📢 *Реклама*\n"
+        f"  Расходы: {ad_expense:,.2f} ₽\n"
+        f"  ДРР (общий): {drr_text}\n"
+        f"  ДРР (по доставленным): {eff_drr_text}"
+    )
+
+def get_metrics_for_date(date_str):
+    today = get_moscow_today()
+    start = (today - datetime.timedelta(days=183)).strftime("%Y-%m-%d")
+    end = today.strftime("%Y-%m-%d")
+    postings = fetch_postings(start, end)
+    agg = aggregate_postings(postings, date_from=date_str, date_to=date_str)
+    metrics = agg.get(date_str, {})
+    ad_expense = fetch_advertising_expense(date_str, date_str)
+    metrics["ad_expense"] = ad_expense if ad_expense is not None else 0.0
+    revenue = metrics.get("ordered_sum", 0)
+    if revenue > 0 and ad_expense is not None:
+        metrics["drr"] = (ad_expense / revenue) * 100
+    else:
+        metrics["drr"] = None
+    delivered_revenue = metrics.get("delivered_sum", 0)
+    if delivered_revenue > 0 and ad_expense is not None:
+        metrics["effective_drr"] = (ad_expense / delivered_revenue) * 100
+    else:
+        metrics["effective_drr"] = None
+    return metrics
+
+def get_metrics_for_period(date_from, date_to):
+    postings = fetch_postings(date_from, date_to)
+    agg = aggregate_postings(postings, date_from=date_from, date_to=date_to)
+    total = {
+        "ordered_units": 0,
+        "ordered_sum": 0.0,
+        "delivered_units": 0,
+        "delivered_sum": 0.0,
+        "canceled_units": 0,
+        "canceled_sum": 0.0,
+    }
+    for vals in agg.values():
+        for key in total:
+            total[key] += vals.get(key, 0)
+    ad_expense = fetch_advertising_expense(date_from, date_to)
+    total["ad_expense"] = ad_expense if ad_expense is not None else 0.0
+    revenue = total.get("ordered_sum", 0)
+    if revenue > 0 and ad_expense is not None:
+        total["drr"] = (ad_expense / revenue) * 100
+    else:
+        total["drr"] = None
+    delivered_revenue = total.get("delivered_sum", 0)
+    if delivered_revenue > 0 and ad_expense is not None:
+        total["effective_drr"] = (ad_expense / delivered_revenue) * 100
+    else:
+        total["effective_drr"] = None
+    return total
 
 # ---------- ОБРАБОТЧИКИ КОМАНД ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -734,6 +716,133 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Неизвестная команда.")
 
+# ---------- ДИАЛОГИ АДМИНИСТРИРОВАНИЯ ----------
+async def add_manager_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Введите ID (число) или username (без @):")
+    return WAITING_ADD_MANAGER
+
+async def add_manager_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await update.message.reply_text("⛔ Только для администратора.")
+        return ConversationHandler.END
+    text = update.message.text.strip()
+    if not text:
+        await update.message.reply_text("❌ Введите ID или username.")
+        return WAITING_ADD_MANAGER
+    if text.isdigit():
+        user_id = int(text)
+        try:
+            user = await context.bot.get_chat(user_id)
+            username = user.username or ""
+            first_name = user.first_name or ""
+            last_name = user.last_name or ""
+        except Exception:
+            await update.message.reply_text(f"❌ Не удалось найти пользователя с ID {user_id}. Убедитесь, что он уже написал боту.")
+            return WAITING_ADD_MANAGER
+    else:
+        username = text.lstrip('@')
+        try:
+            user = await context.bot.get_chat(username)
+            user_id = user.id
+            first_name = user.first_name or ""
+            last_name = user.last_name or ""
+        except Exception:
+            await update.message.reply_text(f"❌ Не удалось найти пользователя @{username}. Убедитесь, что он уже написал боту.")
+            return WAITING_ADD_MANAGER
+    if user_id == ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ Администратор уже имеет доступ.")
+        return WAITING_ADD_MANAGER
+    context.user_data['new_manager'] = {
+        'id': user_id,
+        'username': username,
+        'first_name': first_name,
+        'last_name': last_name
+    }
+    await update.message.reply_text("Введите номер телефона менеджера (или '-' чтобы пропустить):")
+    return WAITING_MANAGER_PHONE
+
+async def add_manager_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await update.message.reply_text("⛔ Только для администратора.")
+        return ConversationHandler.END
+    phone = update.message.text.strip()
+    if phone == "-":
+        phone = ""
+    data = context.user_data.get('new_manager')
+    if not data:
+        await update.message.reply_text("❌ Ошибка: данные менеджера потеряны. Начните заново.")
+        return ConversationHandler.END
+    user_id = data['id']; username = data['username']; first_name = data['first_name']; last_name = data['last_name']
+    if add_manager(user_id, username, first_name, last_name, phone):
+        await update.message.reply_text(f"✅ Менеджер с ID {user_id} (username: @{username}) добавлен.")
+    else:
+        await update.message.reply_text(f"⚠️ Менеджер с ID {user_id} уже существует.")
+    context.user_data.pop('new_manager', None)
+    await update.message.reply_text("Управление менеджерами:", reply_markup=admin_keyboard())
+    return ConversationHandler.END
+
+async def remove_manager_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Введите ID менеджера (цифры):")
+    return WAITING_REMOVE_MANAGER
+
+async def remove_manager_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await update.message.reply_text("⛔ Только для администратора.")
+        return ConversationHandler.END
+    try:
+        user_id = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ Введите число.")
+        return WAITING_REMOVE_MANAGER
+    if user_id == ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ Администратора нельзя удалить.")
+        return WAITING_REMOVE_MANAGER
+    if remove_manager(user_id):
+        await update.message.reply_text(f"✅ Менеджер с ID {user_id} удалён.")
+    else:
+        await update.message.reply_text(f"❌ Менеджер с ID {user_id} не найден.")
+    await update.message.reply_text("Управление менеджерами:", reply_markup=admin_keyboard())
+    return ConversationHandler.END
+
+# ---------- ОТМЕНА ДИАЛОГА (ИСПРАВЛЕНИЕ) ----------
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    keyboard = main_admin_keyboard() if is_admin(chat_id) else main_user_keyboard()
+    await update.message.reply_text("Действие отменено.", reply_markup=keyboard)
+    return ConversationHandler.END
+
+# ---------- КЛАВИАТУРЫ ----------
+def main_admin_keyboard():
+    buttons = [
+        [KeyboardButton("📊 Отчёт")],
+        [KeyboardButton("⚙️ Администрирование")]
+    ]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+def main_user_keyboard():
+    buttons = [[KeyboardButton("📊 Отчёт")]]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+def reports_keyboard():
+    buttons = [
+        [KeyboardButton("📅 Текущие показатели")],
+        [KeyboardButton("📆 Выбрать дату")],
+        [KeyboardButton("📊 Выбрать период")],
+        [KeyboardButton("🔙 Назад")]
+    ]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+def admin_keyboard():
+    buttons = [
+        [KeyboardButton("➕ Добавить менеджера"), KeyboardButton("➖ Удалить менеджера")],
+        [KeyboardButton("📋 Список менеджеров")],
+        [KeyboardButton("🔙 Назад")]
+    ]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
 # ---------- INLINE CALLBACK ----------
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -811,6 +920,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
         return ConversationHandler.END
 
+    # Обработка выбора года для месяца/квартала
     if data.startswith("period_year_month_"):
         year = int(data.split("_")[-1])
         context.user_data['period_year'] = year
@@ -955,120 +1065,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text("❌ Неизвестная команда.")
     return ConversationHandler.END
 
-# ---------- ОСТАЛЬНЫЕ ФУНКЦИИ (ВСПОМОГАТЕЛЬНЫЕ) ----------
-def format_single_metrics(metrics, title):
-    if not metrics:
-        return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
-    has_data = False
-    for key, val in metrics.items():
-        if key in ["drr", "effective_drr", "ad_expense"]:
-            continue
-        if isinstance(val, (int, float)) and val != 0:
-            has_data = True
-            break
-    if not has_data:
-        return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
-
-    ad_expense = metrics.get("ad_expense", 0)
-    drr = metrics.get("drr")
-    eff_drr = metrics.get("effective_drr")
-    drr_text = f"{drr:.2f}%" if drr is not None else "∞"
-    eff_drr_text = f"{eff_drr:.2f}%" if eff_drr is not None else "∞"
-
-    return (
-        f"📊 *{title}*\n\n"
-        f"🛒 *Заказано*\n  На сумму: {metrics.get('ordered_sum', 0):,.2f} ₽\n"
-        f"  Штук: {metrics.get('ordered_units', 0)}\n\n"
-        f"📦 *Доставлено*\n  На сумму: {metrics.get('delivered_sum', 0):,.2f} ₽\n"
-        f"  Штук: {metrics.get('delivered_units', 0)}\n\n"
-        f"❌ *Отмены*\n  На сумму: {metrics.get('canceled_sum', 0):,.2f} ₽\n"
-        f"  Штук: {metrics.get('canceled_units', 0)}\n\n"
-        f"📢 *Реклама*\n"
-        f"  Расходы: {ad_expense:,.2f} ₽\n"
-        f"  ДРР (общий): {drr_text}\n"
-        f"  ДРР (по доставленным): {eff_drr_text}"
-    )
-
-def get_metrics_for_date(date_str):
-    # Используется для выбора даты (без временного ограничения)
-    today = get_moscow_today()
-    start = (today - datetime.timedelta(days=183)).strftime("%Y-%m-%d")
-    end = today.strftime("%Y-%m-%d")
-    postings = fetch_postings(start, end)
-    agg = aggregate_postings(postings, date_from=date_str, date_to=date_str)
-    metrics = agg.get(date_str, {})
-    ad_expense = fetch_advertising_expense(date_str, date_str)
-    metrics["ad_expense"] = ad_expense if ad_expense is not None else 0.0
-    revenue = metrics.get("ordered_sum", 0)
-    if revenue > 0 and ad_expense is not None:
-        metrics["drr"] = (ad_expense / revenue) * 100
-    else:
-        metrics["drr"] = None
-    delivered_revenue = metrics.get("delivered_sum", 0)
-    if delivered_revenue > 0 and ad_expense is not None:
-        metrics["effective_drr"] = (ad_expense / delivered_revenue) * 100
-    else:
-        metrics["effective_drr"] = None
-    return metrics
-
-def get_metrics_for_period(date_from, date_to):
-    # Для выбора периода (без временного ограничения)
-    postings = fetch_postings(date_from, date_to)
-    agg = aggregate_postings(postings, date_from=date_from, date_to=date_to)
-    total = {
-        "ordered_units": 0,
-        "ordered_sum": 0.0,
-        "delivered_units": 0,
-        "delivered_sum": 0.0,
-        "canceled_units": 0,
-        "canceled_sum": 0.0,
-    }
-    for vals in agg.values():
-        for key in total:
-            total[key] += vals.get(key, 0)
-    ad_expense = fetch_advertising_expense(date_from, date_to)
-    total["ad_expense"] = ad_expense if ad_expense is not None else 0.0
-    revenue = total.get("ordered_sum", 0)
-    if revenue > 0 and ad_expense is not None:
-        total["drr"] = (ad_expense / revenue) * 100
-    else:
-        total["drr"] = None
-    delivered_revenue = total.get("delivered_sum", 0)
-    if delivered_revenue > 0 and ad_expense is not None:
-        total["effective_drr"] = (ad_expense / delivered_revenue) * 100
-    else:
-        total["effective_drr"] = None
-    return total
-
-# ---------- КЛАВИАТУРЫ ----------
-def main_admin_keyboard():
-    buttons = [
-        [KeyboardButton("📊 Отчёт")],
-        [KeyboardButton("⚙️ Администрирование")]
-    ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-
-def main_user_keyboard():
-    buttons = [[KeyboardButton("📊 Отчёт")]]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-
-def reports_keyboard():
-    buttons = [
-        [KeyboardButton("📅 Текущие показатели")],
-        [KeyboardButton("📆 Выбрать дату")],
-        [KeyboardButton("📊 Выбрать период")],
-        [KeyboardButton("🔙 Назад")]
-    ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-
-def admin_keyboard():
-    buttons = [
-        [KeyboardButton("➕ Добавить менеджера"), KeyboardButton("➖ Удалить менеджера")],
-        [KeyboardButton("📋 Список менеджеров")],
-        [KeyboardButton("🔙 Назад")]
-    ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-
 # ---------- ЗАПУСК ----------
 def main():
     if not all([OZON_CLIENT_ID, OZON_API_KEY, TELEGRAM_BOT_TOKEN]):
@@ -1090,11 +1086,14 @@ def main():
     application.add_handler(MessageHandler(filters.Text(["📅 Текущие показатели", "📆 Выбрать дату", "📊 Выбрать период", "🔙 Назад"]), handle_reports_menu))
     application.add_handler(MessageHandler(filters.Text(["📋 Список менеджеров", "🔙 Назад"]), handle_admin_menu))
 
+    # ConversationHandler для выбора даты
     conv_date = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📆 Выбрать дату"), handle_reports_menu)],
         states={WAITING_DATE_SINGLE: [CallbackQueryHandler(handle_callback_query)]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
+
+    # ConversationHandler для выбора периода
     conv_period = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📊 Выбрать период"), handle_reports_menu)],
         states={
@@ -1108,6 +1107,8 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
+
+    # ConversationHandler для добавления менеджера
     conv_add = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➕ Добавить менеджера"), add_manager_start)],
         states={
@@ -1116,11 +1117,14 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
+
+    # ConversationHandler для удаления менеджера
     conv_remove = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➖ Удалить менеджера"), remove_manager_start)],
         states={WAITING_REMOVE_MANAGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_manager_input)]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
+
     application.add_handler(conv_date)
     application.add_handler(conv_period)
     application.add_handler(conv_add)
