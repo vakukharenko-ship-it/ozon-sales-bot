@@ -211,25 +211,18 @@ def aggregate_postings(postings, date_from=None, date_to=None):
         products = posting.get("products", [])
         total_units = 0
         total_sum_seller = 0.0
-        total_sum_buyer = 0.0
         for product in products:
             qty = int(product.get("quantity", 0))
-            price_buyer_str = product.get("price", "0")
-            try:
-                price_buyer = float(price_buyer_str)
-            except:
-                price_buyer = 0.0
             price_seller_str = product.get("old_price")
             if price_seller_str is not None:
                 try:
                     price_seller = float(price_seller_str)
                 except:
-                    price_seller = price_buyer
+                    price_seller = 0.0
             else:
-                price_seller = price_buyer
+                price_seller = float(product.get("price", 0))
             total_units += qty
             total_sum_seller += price_seller * qty
-            total_sum_buyer += price_buyer * qty
 
         status = posting.get("status", "")
         if date_str not in aggregated:
@@ -240,7 +233,6 @@ def aggregate_postings(postings, date_from=None, date_to=None):
                 "delivered_sum": 0.0,
                 "canceled_units": 0,
                 "canceled_sum": 0.0,
-                "taxable_delivered_sum": 0.0,
             }
 
         aggregated[date_str]["ordered_units"] += total_units
@@ -252,7 +244,6 @@ def aggregate_postings(postings, date_from=None, date_to=None):
         elif status in ("delivered", "completed"):
             aggregated[date_str]["delivered_units"] += total_units
             aggregated[date_str]["delivered_sum"] += total_sum_seller
-            aggregated[date_str]["taxable_delivered_sum"] += total_sum_buyer
 
     return aggregated
 
@@ -310,53 +301,23 @@ def fetch_financial_data_v2(date_from, date_to):
     write_log(f"💰 Загружено финансовых транзакций (v2): {len(all_transactions)} за {date_from}–{date_to}")
     return all_transactions
 
-def fetch_financial_data_v3(date_from, date_to):
+def get_delivered_sum_from_finance(date_from, date_to):
     """
-    Получает финансовые транзакции через /v3/finance/transaction/list.
+    Получает сумму доставленных заказов из финансовых данных по полю price_per_instance.
+    Возвращает float или None.
     """
-    url = "https://api-seller.ozon.ru/v3/finance/transaction/list"
-    headers = {
-        "Client-Id": OZON_CLIENT_ID,
-        "Api-Key": OZON_API_KEY,
-        "Content-Type": "application/json",
-    }
-    try:
-        from_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d")
-        to_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d") + datetime.timedelta(days=1) - datetime.timedelta(seconds=1)
-    except:
-        write_log(f"❌ Ошибка парсинга дат: {date_from} {date_to}")
+    transactions = fetch_financial_data_v2(date_from, date_to)
+    if transactions is None:
         return None
-
-    payload = {
-        "filter": {
-            "date_from": from_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-            "date_to": to_dt.strftime("%Y-%m-%dT%H:%M:%S.999Z"),
-        },
-        "limit": 1000,
-        "offset": 0,
-    }
-    all_transactions = []
-    while True:
-        try:
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
-            if response.status_code == 429:
-                write_log("⚠️ 429 Too Many Requests (финансы v3), ждём 10 сек")
-                time.sleep(10)
-                continue
-            response.raise_for_status()
-            data = response.json()
-            transactions = data.get("result", {}).get("items", [])
-            if not transactions:
-                break
-            all_transactions.extend(transactions)
-            if len(transactions) < payload["limit"]:
-                break
-            payload["offset"] += payload["limit"]
-        except Exception as e:
-            write_log(f"❌ Ошибка получения финансов (v3): {e}")
-            break
-    write_log(f"💰 Загружено финансовых транзакций (v3): {len(all_transactions)} за {date_from}–{date_to}")
-    return all_transactions
+    total = 0.0
+    for txn in transactions:
+        price = txn.get("price_per_instance")
+        if price is not None:
+            try:
+                total += float(price)
+            except:
+                pass
+    return total
 
 # ---------- ОСТАЛЬНЫЕ ФУНКЦИИ ----------
 def get_performance_token():
@@ -477,8 +438,13 @@ def get_metrics_for_date(date_str):
     else:
         metrics["effective_drr"] = None
 
-    taxable_delivered = metrics.get("taxable_delivered_sum", 0)
-    metrics["tax"] = taxable_delivered * TAX_RATE
+    # Налог от финансовых данных (если доступны)
+    finance_sum = get_delivered_sum_from_finance(date_str, date_str)
+    if finance_sum is not None:
+        metrics["tax"] = finance_sum * TAX_RATE
+    else:
+        # Fallback на цену из отгрузок
+        metrics["tax"] = metrics.get("delivered_sum", 0) * TAX_RATE
 
     return metrics
 
@@ -492,7 +458,6 @@ def get_metrics_for_period(date_from, date_to):
         "delivered_sum": 0.0,
         "canceled_units": 0,
         "canceled_sum": 0.0,
-        "taxable_delivered_sum": 0.0,
     }
     for vals in agg.values():
         for key in total:
@@ -512,7 +477,11 @@ def get_metrics_for_period(date_from, date_to):
     else:
         total["effective_drr"] = None
 
-    total["tax"] = total.get("taxable_delivered_sum", 0) * TAX_RATE
+    finance_sum = get_delivered_sum_from_finance(date_from, date_to)
+    if finance_sum is not None:
+        total["tax"] = finance_sum * TAX_RATE
+    else:
+        total["tax"] = total.get("delivered_sum", 0) * TAX_RATE
 
     return total
 
@@ -537,13 +506,12 @@ def get_current_metrics():
         "delivered_sum": 0.0,
         "canceled_units": 0,
         "canceled_sum": 0.0,
-        "taxable_delivered_sum": 0.0,
     }
     for vals in agg.values():
         for key in month_data:
             month_data[key] += vals.get(key, 0)
 
-    def add_drr_and_tax(metrics, ad_expense):
+    def add_drr_and_tax(metrics, ad_expense, date_from, date_to):
         metrics["ad_expense"] = ad_expense if ad_expense is not None else 0.0
         revenue = metrics.get("ordered_sum", 0)
         if revenue > 0 and ad_expense is not None:
@@ -555,17 +523,21 @@ def get_current_metrics():
             metrics["effective_drr"] = (ad_expense / delivered_revenue) * 100
         else:
             metrics["effective_drr"] = None
-        metrics["tax"] = metrics.get("taxable_delivered_sum", 0) * TAX_RATE
+        finance_sum = get_delivered_sum_from_finance(date_from, date_to)
+        if finance_sum is not None:
+            metrics["tax"] = finance_sum * TAX_RATE
+        else:
+            metrics["tax"] = metrics.get("delivered_sum", 0) * TAX_RATE
         return metrics
 
     ad_expense_today = fetch_advertising_expense(today_str, today_str)
-    today_data = add_drr_and_tax(today_data, ad_expense_today)
+    today_data = add_drr_and_tax(today_data, ad_expense_today, today_str, today_str)
 
     ad_expense_yesterday = fetch_advertising_expense(yesterday_str, yesterday_str)
-    yesterday_data = add_drr_and_tax(yesterday_data, ad_expense_yesterday)
+    yesterday_data = add_drr_and_tax(yesterday_data, ad_expense_yesterday, yesterday_str, yesterday_str)
 
     ad_expense_month = fetch_advertising_expense(date_from, date_to)
-    month_data = add_drr_and_tax(month_data, ad_expense_month)
+    month_data = add_drr_and_tax(month_data, ad_expense_month, date_from, date_to)
 
     return today_data, yesterday_data, month_data
 
@@ -574,7 +546,7 @@ def format_metrics(metrics, title):
         return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
     has_data = False
     for key, val in metrics.items():
-        if key in ["drr", "effective_drr", "ad_expense", "tax", "taxable_delivered_sum"]:
+        if key in ["drr", "effective_drr", "ad_expense", "tax"]:
             continue
         if isinstance(val, (int, float)) and val != 0:
             has_data = True
@@ -692,7 +664,7 @@ async def debug_finance_variants(update: Update, context: ContextTypes.DEFAULT_T
             "date_from": date_from + "T00:00:00.000Z",
             "date_to": date_to + "T23:59:59.999Z",
         },
-        "limit": 1,  # берём только одну транзакцию для детального просмотра
+        "limit": 1,
         "offset": 0
     }
     try:
@@ -703,9 +675,7 @@ async def debug_finance_variants(update: Update, context: ContextTypes.DEFAULT_T
             rows = data1.get("result", {}).get("rows", [])
             if rows:
                 msg += "✅ Полная структура первой транзакции:\n"
-                # Выводим полностью первый объект
                 full_json = json.dumps(rows[0], indent=2, ensure_ascii=False)
-                # Если слишком длинное, обрежем, но покажем все ключи
                 if len(full_json) > 3500:
                     full_json = full_json[:3500] + "\n...(обрезано, но ключи видны)"
                 msg += full_json
