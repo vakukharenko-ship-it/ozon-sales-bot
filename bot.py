@@ -275,7 +275,6 @@ def fetch_financial_data_v2(date_from, date_to):
         write_log(f"❌ Ошибка парсинга дат: {date_from} {date_to}")
         return None
 
-    # Правильный формат с year внутри filter
     payload = {
         "filter": {
             "date_from": from_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
@@ -355,7 +354,7 @@ def fetch_financial_data_v3(date_from, date_to):
     write_log(f"💰 Загружено финансовых транзакций (v3): {len(all_transactions)} за {date_from}–{date_to}")
     return all_transactions
 
-# ---------- ОСТАЛЬНЫЕ ФУНКЦИИ (без изменений) ----------
+# ---------- ОСТАЛЬНЫЕ ФУНКЦИИ ----------
 def get_performance_token():
     if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
         write_log("⚠️ OZON_PERFORMANCE_CLIENT_ID или CLIENT_SECRET не заданы!")
@@ -647,9 +646,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.", reply_markup=ReplyKeyboardRemove())
 
-# ---------- НОВАЯ ОТЛАДОЧНАЯ КОМАНДА ДЛЯ ФИНАНСОВ (С ДВУМЯ МЕТОДАМИ) ----------
-async def debug_finance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает финансовые транзакции за указанный период через два метода (v2 и v3)."""
+# ---------- НОВАЯ ОТЛАДОЧНАЯ КОМАНДА ДЛЯ ТЕСТИРОВАНИЯ РАЗНЫХ ВАРИАНТОВ ФИНАНСОВОГО API ----------
+async def debug_finance_variants(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Тестирует разные варианты запросов к финансовому API (только для админа)."""
     chat_id = update.effective_chat.id
     if not is_admin(chat_id):
         await update.message.reply_text("⛔ Только для администратора.")
@@ -657,7 +656,7 @@ async def debug_finance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text("Укажите даты: /debug_finance 2026-07-01 2026-07-31")
+        await update.message.reply_text("Укажите даты: /debug_finance_variants 2026-07-01 2026-07-31")
         return
 
     date_from = args[0]
@@ -669,39 +668,102 @@ async def debug_finance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Неверный формат даты. Используйте ГГГГ-ММ-ДД")
         return
 
-    msg = f"💰 Финансовые транзакции за {date_from} – {date_to}\n\n"
+    headers = {
+        "Client-Id": OZON_CLIENT_ID,
+        "Api-Key": OZON_API_KEY,
+        "Content-Type": "application/json",
+    }
 
-    # Метод v2
-    msg += "📌 Метод /v2/finance/realization:\n"
-    transactions_v2 = fetch_financial_data_v2(date_from, date_to)
-    if transactions_v2 is None:
-        msg += "❌ Ошибка при получении данных (v2).\n"
-    elif not transactions_v2:
-        msg += "ℹ️ Транзакций не найдено (v2).\n"
-    else:
-        msg += f"✅ Найдено {len(transactions_v2)} транзакций.\n"
-        for i, t in enumerate(transactions_v2[:3]):
-            msg += f"--- Транзакция #{i+1} (v2) ---\n"
-            msg += json.dumps(t, indent=2, ensure_ascii=False)[:800] + "\n\n"
+    msg = f"🧪 Тестирование запросов к /v2/finance/realization\nПериод: {date_from} – {date_to}\n\n"
 
-    # Метод v3
-    msg += "📌 Метод /v3/finance/transaction/list:\n"
-    transactions_v3 = fetch_financial_data_v3(date_from, date_to)
-    if transactions_v3 is None:
-        msg += "❌ Ошибка при получении данных (v3).\n"
-    elif not transactions_v3:
-        msg += "ℹ️ Транзакций не найдено (v3).\n"
-    else:
-        msg += f"✅ Найдено {len(transactions_v3)} транзакций.\n"
-        for i, t in enumerate(transactions_v3[:3]):
-            msg += f"--- Транзакция #{i+1} (v3) ---\n"
-            msg += json.dumps(t, indent=2, ensure_ascii=False)[:800] + "\n\n"
+    # Вариант 1: только date_from и date_to
+    payload1 = {
+        "filter": {
+            "date_from": date_from + "T00:00:00.000Z",
+            "date_to": date_to + "T23:59:59.999Z",
+        },
+        "limit": 10
+    }
+    try:
+        r1 = requests.post("https://api-seller.ozon.ru/v2/finance/realization", headers=headers, json=payload1, timeout=10)
+        msg += f"📌 Вариант 1 (date_from/date_to): код {r1.status_code}\n"
+        if r1.status_code == 200:
+            data1 = r1.json()
+            rows = data1.get("result", {}).get("rows", [])
+            msg += f"   Найдено записей: {len(rows)}\n"
+            if rows:
+                msg += f"   Пример: {json.dumps(rows[0], indent=2, ensure_ascii=False)[:300]}\n"
+        else:
+            msg += f"   Ошибка: {r1.text[:200]}\n"
+    except Exception as e:
+        msg += f"   Исключение: {e}\n"
+
+    # Вариант 2: только year (без date_from/date_to)
+    year = date_from[:4]
+    payload2 = {
+        "filter": {
+            "year": int(year)
+        },
+        "limit": 10
+    }
+    try:
+        r2 = requests.post("https://api-seller.ozon.ru/v2/finance/realization", headers=headers, json=payload2, timeout=10)
+        msg += f"\n📌 Вариант 2 (только year={year}): код {r2.status_code}\n"
+        if r2.status_code == 200:
+            data2 = r2.json()
+            rows = data2.get("result", {}).get("rows", [])
+            msg += f"   Найдено записей: {len(rows)}\n"
+            if rows:
+                msg += f"   Пример: {json.dumps(rows[0], indent=2, ensure_ascii=False)[:300]}\n"
+        else:
+            msg += f"   Ошибка: {r2.text[:200]}\n"
+    except Exception as e:
+        msg += f"   Исключение: {e}\n"
+
+    # Вариант 3: год + posting_number (с известным заказом)
+    posting_number = "0237561952-0099-1"
+    payload3 = {
+        "filter": {
+            "year": int(year),
+            "posting_number": posting_number
+        },
+        "limit": 10
+    }
+    try:
+        r3 = requests.post("https://api-seller.ozon.ru/v2/finance/realization", headers=headers, json=payload3, timeout=10)
+        msg += f"\n📌 Вариант 3 (year={year} + posting_number={posting_number}): код {r3.status_code}\n"
+        if r3.status_code == 200:
+            data3 = r3.json()
+            rows = data3.get("result", {}).get("rows", [])
+            msg += f"   Найдено записей: {len(rows)}\n"
+            if rows:
+                msg += f"   Пример: {json.dumps(rows[0], indent=2, ensure_ascii=False)[:300]}\n"
+        else:
+            msg += f"   Ошибка: {r3.text[:200]}\n"
+    except Exception as e:
+        msg += f"   Исключение: {e}\n"
+
+    # Вариант 4: без фильтров, только limit
+    payload4 = {"limit": 10}
+    try:
+        r4 = requests.post("https://api-seller.ozon.ru/v2/finance/realization", headers=headers, json=payload4, timeout=10)
+        msg += f"\n📌 Вариант 4 (без фильтров): код {r4.status_code}\n"
+        if r4.status_code == 200:
+            data4 = r4.json()
+            rows = data4.get("result", {}).get("rows", [])
+            msg += f"   Найдено записей: {len(rows)}\n"
+            if rows:
+                msg += f"   Пример: {json.dumps(rows[0], indent=2, ensure_ascii=False)[:300]}\n"
+        else:
+            msg += f"   Ошибка: {r4.text[:200]}\n"
+    except Exception as e:
+        msg += f"   Исключение: {e}\n"
 
     if len(msg) > 4000:
         msg = msg[:4000] + "\n...(обрезано)"
     await update.message.reply_text(msg)
 
-# ---------- ОБНОВЛЁННАЯ КОМАНДА debug_order (с финансовыми данными) ----------
+# ---------- ОСТАЛЬНЫЕ ОБРАБОТЧИКИ ----------
 async def debug_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает отгрузку и финансовые данные для заказа."""
     chat_id = update.effective_chat.id
@@ -722,7 +784,6 @@ async def debug_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Content-Type": "application/json",
     }
 
-    # 1. Получаем отгрузку
     url_posting = "https://api-seller.ozon.ru/v2/posting/fbo/get"
     payload_posting = {
         "posting_number": posting_number,
@@ -752,7 +813,6 @@ async def debug_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f"  old_price: {product.get('old_price')}\n"
             msg += "\n"
 
-        # 2. Финансовые данные за месяц
         if created_at:
             month_year = created_at[:7]
             year, month = month_year.split('-')
@@ -782,6 +842,57 @@ async def debug_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg)
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
+
+async def debug_finance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает финансовые транзакции за указанный период через два метода (v2 и v3)."""
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await update.message.reply_text("⛔ Только для администратора.")
+        return
+
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("Укажите даты: /debug_finance 2026-07-01 2026-07-31")
+        return
+
+    date_from = args[0]
+    date_to = args[1]
+    try:
+        datetime.datetime.strptime(date_from, "%Y-%m-%d")
+        datetime.datetime.strptime(date_to, "%Y-%m-%d")
+    except:
+        await update.message.reply_text("Неверный формат даты. Используйте ГГГГ-ММ-ДД")
+        return
+
+    msg = f"💰 Финансовые транзакции за {date_from} – {date_to}\n\n"
+
+    msg += "📌 Метод /v2/finance/realization:\n"
+    transactions_v2 = fetch_financial_data_v2(date_from, date_to)
+    if transactions_v2 is None:
+        msg += "❌ Ошибка при получении данных (v2).\n"
+    elif not transactions_v2:
+        msg += "ℹ️ Транзакций не найдено (v2).\n"
+    else:
+        msg += f"✅ Найдено {len(transactions_v2)} транзакций.\n"
+        for i, t in enumerate(transactions_v2[:3]):
+            msg += f"--- Транзакция #{i+1} (v2) ---\n"
+            msg += json.dumps(t, indent=2, ensure_ascii=False)[:800] + "\n\n"
+
+    msg += "📌 Метод /v3/finance/transaction/list:\n"
+    transactions_v3 = fetch_financial_data_v3(date_from, date_to)
+    if transactions_v3 is None:
+        msg += "❌ Ошибка при получении данных (v3).\n"
+    elif not transactions_v3:
+        msg += "ℹ️ Транзакций не найдено (v3).\n"
+    else:
+        msg += f"✅ Найдено {len(transactions_v3)} транзакций.\n"
+        for i, t in enumerate(transactions_v3[:3]):
+            msg += f"--- Транзакция #{i+1} (v3) ---\n"
+            msg += json.dumps(t, indent=2, ensure_ascii=False)[:800] + "\n\n"
+
+    if len(msg) > 4000:
+        msg = msg[:4000] + "\n...(обрезано)"
+    await update.message.reply_text(msg)
 
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -1197,6 +1308,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("debug_order", debug_order))
     application.add_handler(CommandHandler("debug_finance", debug_finance))
+    application.add_handler(CommandHandler("debug_finance_variants", debug_finance_variants))
 
     application.add_handler(MessageHandler(filters.Text(["📊 Отчёт", "⚙️ Администрирование"]), handle_main_menu))
     application.add_handler(MessageHandler(filters.Text(["📅 Текущие показатели", "📆 Выбрать дату", "📊 Выбрать период", "🔙 Назад"]), handle_reports_menu))
