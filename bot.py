@@ -684,7 +684,6 @@ async def handle_reports_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.")
         return
     if text == "📅 Текущие показатели":
-        # Ручной вызов – без блока "Вчера"
         report = format_combined_metrics_with_deltas(include_yesterday=False)
         await update.message.reply_text(report, parse_mode="Markdown")
     elif text == "📆 Выбрать дату":
@@ -1105,7 +1104,6 @@ def main():
         states={WAITING_DATE_SINGLE: [CallbackQueryHandler(handle_callback_query)]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-
     conv_period = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📊 Выбрать период"), handle_reports_menu)],
         states={
@@ -1119,7 +1117,6 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-
     conv_add = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➕ Добавить менеджера"), add_manager_start)],
         states={
@@ -1128,39 +1125,22 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-
     conv_remove = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➖ Удалить менеджера"), remove_manager_start)],
         states={WAITING_REMOVE_MANAGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_manager_input)]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-
     application.add_handler(conv_date)
     application.add_handler(conv_period)
     application.add_handler(conv_add)
     application.add_handler(conv_remove)
     application.add_handler(CallbackQueryHandler(handle_callback_query))
 
-    # ---------- РАСПИСАНИЕ ----------
+    # ---------- ПЛАНИРОВЩИК (каждый час) ----------
     job_queue = application.job_queue
     if job_queue:
-        # Утренняя сводка (10:00) – с блоком "Вчера"
-        job_queue.run_daily(
-            scheduled_report,
-            time=datetime.time(10, 0, 0),
-            days=tuple(range(7)),
-            name="morning_report",
-            timezone=MOSCOW_TZ
-        )
-        # Вечерняя сводка (22:00) – без блока "Вчера"
-        job_queue.run_daily(
-            scheduled_report,
-            time=datetime.time(22, 0, 0),
-            days=tuple(range(7)),
-            name="evening_report",
-            timezone=MOSCOW_TZ
-        )
-        write_log("✅ Планировщик запущен (ежедневно в 10:00 и 22:00 МСК).")
+        job_queue.run_repeating(scheduled_report, interval=3600, first=0)
+        write_log("✅ Планировщик запущен (отправка в 10:00 и 22:00 МСК).")
     else:
         write_log("⚠️ JobQueue недоступен.")
 
@@ -1170,8 +1150,10 @@ def main():
 async def scheduled_report(context):
     moscow_tz = MOSCOW_TZ
     now = datetime.datetime.now(moscow_tz)
-    # Для утренней сводки включаем блок "Вчера"
-    include_yesterday = (now.hour == 10)
+    hour = now.hour
+    if hour not in (10, 22):
+        return
+    include_yesterday = (hour == 10)
     report = format_combined_metrics_with_deltas(include_yesterday=include_yesterday)
     managers = load_managers()
     if not managers:
