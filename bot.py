@@ -256,6 +256,71 @@ def aggregate_postings(postings, date_from=None, date_to=None):
 
     return aggregated
 
+# ---------- ФИНАНСОВЫЙ API (НОВЫЙ) ----------
+def fetch_financial_data(date_from, date_to):
+    """
+    Получает финансовые транзакции за период через /v2/finance/realization.
+    Возвращает список транзакций или None в случае ошибки.
+    """
+    url = "https://api-seller.ozon.ru/v2/finance/realization"
+    headers = {
+        "Client-Id": OZON_CLIENT_ID,
+        "Api-Key": OZON_API_KEY,
+        "Content-Type": "application/json",
+    }
+    # Преобразуем даты в формат ISO с временем
+    try:
+        from_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d")
+        to_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d") + datetime.timedelta(days=1) - datetime.timedelta(seconds=1)
+    except:
+        write_log(f"❌ Ошибка парсинга дат для финансов: {date_from} {date_to}")
+        return None
+
+    payload = {
+        "date_from": from_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        "date_to": to_dt.strftime("%Y-%m-%dT%H:%M:%S.999Z"),
+        "limit": 1000,
+        "offset": 0,
+    }
+    all_transactions = []
+    while True:
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            if response.status_code == 429:
+                write_log("⚠️ 429 Too Many Requests (финансы), ждём 10 сек")
+                time.sleep(10)
+                continue
+            response.raise_for_status()
+            data = response.json()
+            transactions = data.get("result", {}).get("rows", [])
+            if not transactions:
+                break
+            all_transactions.extend(transactions)
+            if len(transactions) < payload["limit"]:
+                break
+            payload["offset"] += payload["limit"]
+        except Exception as e:
+            write_log(f"❌ Ошибка получения финансов: {e}")
+            break
+    write_log(f"💰 Загружено финансовых транзакций: {len(all_transactions)} за {date_from}–{date_to}")
+    return all_transactions
+
+# ---------- ФУНКЦИЯ ДЛЯ ПОЛУЧЕНИЯ СУММЫ ИЗ ФИНАНСОВ (ПОКА НЕ ИСПОЛЬЗУЕТСЯ) ----------
+def get_taxable_amount_from_finance(posting_number, date_from, date_to):
+    """
+    Ищет в финансовых данных транзакцию с указанным posting_number и возвращает сумму.
+    Пока заглушка, возвращает None.
+    """
+    transactions = fetch_financial_data(date_from, date_to)
+    if not transactions:
+        return None
+    for txn in transactions:
+        if txn.get("posting_number") == posting_number:
+            # Здесь нужно найти поле с суммой. Пока возвращаем весь объект для отладки.
+            return txn
+    return None
+
+# ---------- ОСТАЛЬНЫЕ ФУНКЦИИ (без изменений) ----------
 def get_performance_token():
     if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
         write_log("⚠️ OZON_PERFORMANCE_CLIENT_ID или CLIENT_SECRET не заданы!")
@@ -547,9 +612,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.", reply_markup=ReplyKeyboardRemove())
 
-# ---------- ОТЛАДОЧНАЯ КОМАНДА (ПОКАЗЫВАЕТ total_price ИЗ КОРНЯ ОТГРУЗКИ) ----------
+# ---------- ОТЛАДОЧНАЯ КОМАНДА (ОТГРУЗКА + ФИНАНСЫ) ----------
 async def debug_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает полную структуру отгрузки, включая total_price из корня (только для админа)."""
+    """Показывает отгрузку и финансовые транзакции за месяц, содержащие этот заказ."""
     chat_id = update.effective_chat.id
     if not is_admin(chat_id):
         await update.message.reply_text("⛔ Только для администратора.")
@@ -583,7 +648,7 @@ async def debug_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         products = result.get("products", [])
         status = result.get("status")
         created_at = result.get("created_at")
-        total_price_root = result.get("total_price")  # <-- ЭТО НОВОЕ ПОЛЕ
+        total_price_root = result.get("total_price")
         msg = f"📦 Отгрузка {posting_number}\nСтатус: {status}\nСоздана: {created_at}\n"
         msg += f"💰 total_price (корень отгрузки): {total_price_root}\n\n"
         for idx, product in enumerate(products, 1):
@@ -599,18 +664,91 @@ async def debug_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg += f"  premium_price: {product.get('premium_price')}\n"
             msg += "\n"
 
-        # Также можем показать все корневые поля для полноты
-        msg += "📋 Другие корневые поля:\n"
-        for key, value in result.items():
-            if key not in ["products", "status", "created_at", "total_price"]:
-                msg += f"  {key}: {value}\n"
+        # 2. Получаем финансовые данные за месяц, в котором создана отгрузка
+        try:
+            month_year = created_at[:7] if created_at else None  # YYYY-MM
+            if month_year:
+                year, month = month_year.split('-')
+                date_from = f"{year}-{month}-01"
+                # последний день месяца
+                next_month = datetime.date(int(year), int(month), 1) + datetime.timedelta(days=32)
+                last_day = next_month.replace(day=1) - datetime.timedelta(days=1)
+                date_to = last_day.strftime("%Y-%m-%d")
+                msg += f"📅 Финансовый запрос за {date_from} – {date_to}\n"
+                transactions = fetch_financial_data(date_from, date_to)
+                if transactions:
+                    # Найдём транзакции с этим posting_number
+                    found = [t for t in transactions if t.get("posting_number") == posting_number]
+                    if found:
+                        msg += f"💰 Найдено {len(found)} финансовых транзакций для этого заказа:\n"
+                        for i, t in enumerate(found[:5]):  # покажем первые 5
+                            msg += f"  Транзакция #{i+1}: {json.dumps(t, indent=2, ensure_ascii=False)}\n"
+                    else:
+                        msg += "⚠️ Финансовые транзакции для этого заказа не найдены.\n"
+                        # Покажем структуру первых двух транзакций за месяц для понимания
+                        if len(transactions) > 0:
+                            msg += "📋 Пример транзакции за месяц (структура):\n"
+                            msg += json.dumps(transactions[0], indent=2, ensure_ascii=False)[:1500] + "\n"
+                else:
+                    msg += "❌ Не удалось получить финансовые данные за месяц.\n"
+        except Exception as e:
+            msg += f"❌ Ошибка при получении финансов: {e}\n"
 
-        # Обрежем, если слишком длинное
         if len(msg) > 4000:
             msg = msg[:4000] + "\n...(обрезано)"
         await update.message.reply_text(msg)
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
+
+# ---------- НОВАЯ ОТЛАДОЧНАЯ КОМАНДА ДЛЯ ПРОСМОТРА ФИНАНСОВ ----------
+async def debug_finance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает финансовые транзакции за указанный период (только для админа)."""
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await update.message.reply_text("⛔ Только для администратора.")
+        return
+
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("Укажите даты: /debug_finance 2026-07-01 2026-07-31")
+        return
+
+    date_from = args[0]
+    date_to = args[1]
+    try:
+        datetime.datetime.strptime(date_from, "%Y-%m-%d")
+        datetime.datetime.strptime(date_to, "%Y-%m-%d")
+    except:
+        await update.message.reply_text("Неверный формат даты. Используйте ГГГГ-ММ-ДД")
+        return
+
+    transactions = fetch_financial_data(date_from, date_to)
+    if transactions is None:
+        await update.message.reply_text("❌ Ошибка при получении финансовых данных.")
+        return
+    if not transactions:
+        await update.message.reply_text("ℹ️ Финансовых транзакций за период не найдено.")
+        return
+
+    msg = f"💰 Финансовые транзакции за {date_from} – {date_to}\nВсего: {len(transactions)}\n\n"
+    for i, t in enumerate(transactions[:10]):  # покажем первые 10
+        msg += f"--- Транзакция #{i+1} ---\n"
+        # Выведем ключевые поля
+        posting = t.get("posting_number")
+        amount = t.get("amount") or t.get("total") or t.get("sum") or "?"
+        date = t.get("date") or t.get("operation_date")
+        msg += f"  posting_number: {posting}\n"
+        msg += f"  сумма: {amount}\n"
+        msg += f"  дата: {date}\n"
+        # добавим ещё пару полей для понимания
+        for key in ["type", "operation_type", "status"]:
+            if key in t:
+                msg += f"  {key}: {t[key]}\n"
+        msg += "\n"
+
+    if len(transactions) > 10:
+        msg += f"... и ещё {len(transactions)-10} транзакций.\n"
+    await update.message.reply_text(msg)
 
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -1025,6 +1163,7 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("debug_order", debug_order))
+    application.add_handler(CommandHandler("debug_finance", debug_finance))
 
     application.add_handler(MessageHandler(filters.Text(["📊 Отчёт", "⚙️ Администрирование"]), handle_main_menu))
     application.add_handler(MessageHandler(filters.Text(["📅 Текущие показатели", "📆 Выбрать дату", "📊 Выбрать период", "🔙 Назад"]), handle_reports_menu))
