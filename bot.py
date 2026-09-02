@@ -14,6 +14,12 @@ from telegram.ext import (
 from telegram.warnings import PTBUserWarning
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
+# НОВОЕ: импорты для графиков
+import matplotlib.pyplot as plt
+import io
+from matplotlib.dates import MonthLocator, DateFormatter
+import matplotlib.dates as mdates
+
 # ==================== КОНФИГУРАЦИЯ ====================
 OZON_CLIENT_ID = os.getenv("OZON_CLIENT_ID")
 OZON_API_KEY = os.getenv("OZON_API_KEY")
@@ -38,6 +44,10 @@ WAITING_PERIOD_YEAR = 8
 WAITING_PERIOD_MONTH = 9
 WAITING_PERIOD_QUARTER = 10
 WAITING_YEAR_SELECT = 11
+# НОВОЕ: состояния для динамики продаж
+WAITING_DYNAMICS_SELECT = 12
+WAITING_DYNAMICS_RANGE_START = 13
+WAITING_DYNAMICS_RANGE_END = 14
 # =====================================================
 
 MOSCOW_TZ = datetime.timezone(datetime.timedelta(hours=3))
@@ -572,7 +582,67 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
 
     return "📊 *Текущие показатели*\n\n\n" + "\n\n".join(parts)
 
-# ---------- ОСТАЛЬНЫЕ ФУНКЦИИ ----------
+# ---------- НОВОЕ: ФУНКЦИИ ДЛЯ ГРАФИКА ----------
+def get_monthly_delivered_sum(year):
+    """Возвращает список (12 элементов) сумм доставленных заказов по месяцам для указанного года."""
+    start_date = datetime.date(year, 1, 1).isoformat()
+    end_date = datetime.date(year, 12, 31).isoformat()
+    postings = fetch_postings(start_date, end_date)
+    # Агрегируем по дням, потом свернём по месяцам
+    daily_agg = aggregate_postings(postings, date_from=start_date, date_to=end_date)
+    monthly = [0.0] * 12
+    for date_str, vals in daily_agg.items():
+        try:
+            dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+            month_idx = dt.month - 1
+            monthly[month_idx] += vals.get("delivered_sum", 0.0)
+        except:
+            continue
+    return monthly
+
+def generate_sales_chart(years_list):
+    """
+    Принимает список годов, строит график доставленных сумм по месяцам.
+    Возвращает BytesIO с изображением PNG.
+    """
+    if not years_list:
+        return None
+    # Собираем данные
+    data = {}
+    for year in years_list:
+        data[year] = get_monthly_delivered_sum(year)
+
+    # Создаём график
+    fig, ax = plt.subplots(figsize=(10, 6))
+    months = [datetime.date(2000, m, 1) for m in range(1, 13)]  # фиктивный год
+    month_names = ["Янв", "Фев", "Мар", "Апр", "Май", "Июн",
+                   "Июл", "Авг", "Сен", "Окт", "Ноя", "Дек"]
+
+    for year, values in data.items():
+        ax.plot(months, values, marker='o', label=str(year), linewidth=2)
+
+    ax.set_title("Динамика доставленных заказов (сумма, руб.)", fontsize=14)
+    ax.set_xlabel("Месяц")
+    ax.set_ylabel("Сумма доставленных заказов, ₽")
+    ax.xaxis.set_major_locator(mdates.MonthLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+    ax.grid(True, linestyle='--', alpha=0.7)
+    ax.legend()
+
+    # Форматирование чисел по оси Y
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{int(x):,}'.replace(',', ' ')))
+
+    plt.tight_layout()
+
+    # Сохраняем в BytesIO
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=100)
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+# ---------------------------------------------
+
 def format_single_metrics(metrics, title):
     if not metrics:
         return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
@@ -662,7 +732,7 @@ def main_admin_keyboard():
         [KeyboardButton("⚙️ Администрирование")],
         [KeyboardButton("📖 Справка")]
     ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)   # row_width удалён
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 def main_user_keyboard():
     buttons = [
@@ -676,6 +746,7 @@ def reports_keyboard():
         [KeyboardButton("📅 Текущие показатели")],
         [KeyboardButton("📆 Выбрать дату")],
         [KeyboardButton("📊 Выбрать период")],
+        [KeyboardButton("📈 Динамика продаж")],    # НОВОЕ
         [KeyboardButton("🔙 Назад")]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
@@ -731,6 +802,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "• 📅 Текущие показатели – быстрый доступ к сводке.\n"
                 "• 📆 Выбрать дату – просмотр данных за конкретный день.\n"
                 "• 📊 Выбрать период – гибкий выбор отчётного периода (месяц, квартал, год, произвольный).\n"
+                "• 📈 Динамика продаж – график доставленных заказов по месяцам за выбранный год (или несколько лет).\n"   # НОВОЕ
                 "• ⚙️ Администрирование – управление доступом менеджеров.\n\n"
                 "🔹 *Управление менеджерами*\n"
                 "• ➕ Добавить менеджера – введите Telegram ID или @username пользователя, затем номер телефона (или '-' для пропуска).\n"
@@ -757,7 +829,8 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "• 📊 Отчёт – получить актуальную сводку за сегодня, вчера и текущий месяц.\n"
                 "• 📅 Текущие показатели – быстрый доступ к сводке.\n"
                 "• 📆 Выбрать дату – просмотр данных за конкретный день.\n"
-                "• 📊 Выбрать период – гибкий выбор отчётного периода (месяц, квартал, год, произвольный).\n\n"
+                "• 📊 Выбрать период – гибкий выбор отчётного периода (месяц, квартал, год, произвольный).\n"
+                "• 📈 Динамика продаж – график доставленных заказов по месяцам за выбранный год (или несколько лет).\n\n"
                 "🔹 *Автоматические отчёты*\n"
                 "• В 10:00 МСК – отчёт с блоками «Вчера», «Сегодня» и «Текущий месяц».\n"
                 "• В 22:00 МСК – отчёт с блоками «Сегодня» и «Текущий месяц».\n\n"
@@ -810,6 +883,24 @@ async def handle_reports_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
         ])
         await update.message.reply_text("Выберите тип периода:", reply_markup=keyboard)
         return WAITING_PERIOD_TYPE
+    # НОВОЕ: обработка динамики продаж
+    elif text == "📈 Динамика продаж":
+        current_year = get_moscow_today().year
+        years = list(range(current_year - 9, current_year + 1))
+        buttons = [
+            [InlineKeyboardButton("📅 Текущий год", callback_data="dynamics_current")],
+            [InlineKeyboardButton("📆 Выбрать год", callback_data="dynamics_select")],
+            [InlineKeyboardButton("📊 Диапазон лет", callback_data="dynamics_range")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="dynamics_cancel")]
+        ]
+        await update.message.reply_text(
+            "Выберите вариант для построения графика:\n"
+            "• Текущий год – сразу покажет динамику за текущий год.\n"
+            "• Выбрать год – покажет список годов (последние 10).\n"
+            "• Диапазон лет – введите начальный и конечный год.",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return WAITING_DYNAMICS_SELECT
     else:
         await update.message.reply_text("Неизвестная команда.")
 
@@ -949,6 +1040,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("❌ Нет доступа! Обратитесь к администратору.")
         return ConversationHandler.END
 
+    # ---------- Обработка выбора даты ----------
     if data.startswith("date_"):
         if data == "date_cancel":
             await query.edit_message_text("Выбор даты отменён.")
@@ -984,6 +1076,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("❌ Ошибка формата даты.")
             return WAITING_DATE_SINGLE
 
+    # ---------- Обработка выбора периода ----------
     if data == "period_month":
         current_year = get_moscow_today().year
         years = list(range(current_year - 9, current_year + 1))
@@ -1019,7 +1112,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         year = int(data.split("_")[-1])
         context.user_data['period_year'] = year
         months = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-                  "Июль", "Август", "Сентябрь", "Окторябрь", "Ноябрь", "Декабрь"]
+                  "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]   # исправлено "Окторябрь"
         buttons = [[InlineKeyboardButton(name, callback_data=f"period_month_{i}_{year}")] for i, name in enumerate(months, 1)]
         buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")])
         await query.edit_message_text(f"Выберите месяц {year}:", reply_markup=InlineKeyboardMarkup(buttons))
@@ -1156,7 +1249,93 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("❌ Ошибка формата даты.")
             return WAITING_PERIOD_END
 
+    # ---------- НОВОЕ: Обработка динамики продаж ----------
+    if data == "dynamics_current":
+        await query.edit_message_text("⏳ Загружаю данные для текущего года...")
+        current_year = get_moscow_today().year
+        chart_buf = generate_sales_chart([current_year])
+        if chart_buf:
+            await query.message.reply_photo(photo=chart_buf, caption=f"Динамика доставленных заказов за {current_year} год")
+        else:
+            await query.message.reply_text("❌ Не удалось построить график.")
+        await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
+        return ConversationHandler.END
+
+    if data == "dynamics_select":
+        current_year = get_moscow_today().year
+        years = list(range(current_year - 9, current_year + 1))
+        buttons = [[InlineKeyboardButton(str(y), callback_data=f"dynamics_year_{y}")] for y in years]
+        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="dynamics_cancel")])
+        await query.edit_message_text("Выберите год для отображения графика:", reply_markup=InlineKeyboardMarkup(buttons))
+        return WAITING_DYNAMICS_SELECT  # остаёмся в том же состоянии
+
+    if data == "dynamics_range":
+        await query.edit_message_text("Введите начальный год (например, 2020):")
+        return WAITING_DYNAMICS_RANGE_START
+
+    if data == "dynamics_cancel":
+        await query.edit_message_text("Построение графика отменено.")
+        await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
+        return ConversationHandler.END
+
+    if data.startswith("dynamics_year_"):
+        year = int(data.split("_")[-1])
+        await query.edit_message_text(f"⏳ Загружаю данные за {year} год...")
+        chart_buf = generate_sales_chart([year])
+        if chart_buf:
+            await query.message.reply_photo(photo=chart_buf, caption=f"Динамика доставленных заказов за {year} год")
+        else:
+            await query.message.reply_text("❌ Не удалось построить график.")
+        await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
+        return ConversationHandler.END
+
+    # Обработка ввода диапазона (сообщениями)
+    # Этот код будет в отдельных обработчиках для состояний WAITING_DYNAMICS_RANGE_START и END
+
     await query.edit_message_text("❌ Неизвестная команда.")
+    return ConversationHandler.END
+
+# ---------- ОБРАБОТЧИКИ ДИАЛОГА ДЛЯ ДИНАМИКИ (диапазон) ----------
+async def dynamics_range_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text.isdigit():
+        await update.message.reply_text("❌ Пожалуйста, введите число (год).")
+        return WAITING_DYNAMICS_RANGE_START
+    year = int(text)
+    if year < 2000 or year > get_moscow_today().year + 1:
+        await update.message.reply_text("❌ Некорректный год. Введите год от 2000 до текущего.")
+        return WAITING_DYNAMICS_RANGE_START
+    context.user_data['dynamics_range_start'] = year
+    await update.message.reply_text("Введите конечный год (включительно):")
+    return WAITING_DYNAMICS_RANGE_END
+
+async def dynamics_range_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text.isdigit():
+        await update.message.reply_text("❌ Пожалуйста, введите число (год).")
+        return WAITING_DYNAMICS_RANGE_END
+    year_end = int(text)
+    year_start = context.user_data.get('dynamics_range_start')
+    if year_start is None:
+        await update.message.reply_text("❌ Ошибка: начальный год не найден. Начните заново.")
+        return ConversationHandler.END
+    if year_end < year_start:
+        await update.message.reply_text("❌ Конечный год должен быть не меньше начального.")
+        return WAITING_DYNAMICS_RANGE_END
+    years = list(range(year_start, year_end + 1))
+    # Ограничим количество лет (например, не более 10)
+    if len(years) > 10:
+        await update.message.reply_text("⚠️ Слишком много лет (максимум 10). Пожалуйста, выберите меньший диапазон.")
+        return ConversationHandler.END
+    await update.message.reply_text(f"⏳ Загружаю данные за годы {year_start}-{year_end}...")
+    chart_buf = generate_sales_chart(years)
+    if chart_buf:
+        caption = f"Динамика доставленных заказов за {year_start}-{year_end} гг."
+        await update.message.reply_photo(photo=chart_buf, caption=caption)
+    else:
+        await update.message.reply_text("❌ Не удалось построить график.")
+    await update.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
+    context.user_data.pop('dynamics_range_start', None)
     return ConversationHandler.END
 
 # ---------- ЗАПУСК ----------
@@ -1186,6 +1365,7 @@ def main():
                 "• 📅 Текущие показатели – быстрый доступ к сводке.\n"
                 "• 📆 Выбрать дату – просмотр данных за конкретный день.\n"
                 "• 📊 Выбрать период – гибкий выбор отчётного периода (месяц, квартал, год, произвольный).\n"
+                "• 📈 Динамика продаж – график доставленных заказов по месяцам за выбранный год (или несколько лет).\n"
                 "• ⚙️ Администрирование – управление доступом менеджеров.\n\n"
                 "🔹 *Управление менеджерами*\n"
                 "• ➕ Добавить менеджера – введите Telegram ID или @username пользователя, затем номер телефона (или '-' для пропуска).\n"
@@ -1212,7 +1392,8 @@ def main():
                 "• 📊 Отчёт – получить актуальную сводку за сегодня, вчера и текущий месяц.\n"
                 "• 📅 Текущие показатели – быстрый доступ к сводке.\n"
                 "• 📆 Выбрать дату – просмотр данных за конкретный день.\n"
-                "• 📊 Выбрать период – гибкий выбор отчётного периода (месяц, квартал, год, произвольный).\n\n"
+                "• 📊 Выбрать период – гибкий выбор отчётного периода (месяц, квартал, год, произвольный).\n"
+                "• 📈 Динамика продаж – график доставленных заказов по месяцам за выбранный год (или несколько лет).\n\n"
                 "🔹 *Автоматические отчёты*\n"
                 "• В 10:00 МСК – отчёт с блоками «Вчера», «Сегодня» и «Текущий месяц».\n"
                 "• В 22:00 МСК – отчёт с блоками «Сегодня» и «Текущий месяц».\n\n"
@@ -1231,7 +1412,7 @@ def main():
     application.add_handler(CommandHandler("help", help_command))
 
     application.add_handler(MessageHandler(filters.Text(["📊 Отчёт", "⚙️ Администрирование", "📖 Справка"]), handle_main_menu))
-    application.add_handler(MessageHandler(filters.Text(["📅 Текущие показатели", "📆 Выбрать дату", "📊 Выбрать период", "🔙 Назад"]), handle_reports_menu))
+    application.add_handler(MessageHandler(filters.Text(["📅 Текущие показатели", "📆 Выбрать дату", "📊 Выбрать период", "📈 Динамика продаж", "🔙 Назад"]), handle_reports_menu))
     application.add_handler(MessageHandler(filters.Text(["📋 Список менеджеров", "🔙 Назад"]), handle_admin_menu))
 
     conv_date = ConversationHandler(
@@ -1252,6 +1433,16 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
+    # НОВОЕ: диалог для динамики продаж (диапазон лет)
+    conv_dynamics = ConversationHandler(
+        entry_points=[MessageHandler(filters.Text("📈 Динамика продаж"), handle_reports_menu)],
+        states={
+            WAITING_DYNAMICS_SELECT: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_DYNAMICS_RANGE_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, dynamics_range_start)],
+            WAITING_DYNAMICS_RANGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, dynamics_range_end)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
     conv_add = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➕ Добавить менеджера"), add_manager_start)],
         states={
@@ -1267,6 +1458,7 @@ def main():
     )
     application.add_handler(conv_date)
     application.add_handler(conv_period)
+    application.add_handler(conv_dynamics)   # НОВОЕ
     application.add_handler(conv_add)
     application.add_handler(conv_remove)
     application.add_handler(CallbackQueryHandler(handle_callback_query))
