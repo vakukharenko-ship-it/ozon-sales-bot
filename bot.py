@@ -374,6 +374,27 @@ def format_single_metrics(metrics, title):
     )
 
 # ---------- НОВАЯ ФУНКЦИЯ ДЛЯ КОМПАКТНОГО ОТЧЁТА С ПРОЦЕНТНЫМИ ИЗМЕНЕНИЯМИ ----------
+def calc_delta(current, previous):
+    if previous == 0:
+        return None
+    try:
+        return ((current - previous) / abs(previous)) * 100
+    except:
+        return None
+
+def fmt_pct(val):
+    if val is None:
+        return "∞"
+    if val > 0:
+        return f"+{val:.1f}%"
+    else:
+        return f"{val:.1f}%"
+
+def delta_str(current, previous, avg):
+    prev_delta = calc_delta(current, previous)
+    avg_delta = calc_delta(current, avg)
+    return f"vs Вчера: {fmt_pct(prev_delta)} | vs Месяц: {fmt_pct(avg_delta)}"
+
 def format_combined_metrics_with_deltas(today, yesterday, month):
     """
     Формирует компактный блочный отчёт с процентными изменениями.
@@ -387,26 +408,10 @@ def format_combined_metrics_with_deltas(today, yesterday, month):
     def fmt_int(val):
         return str(val) if val else "0"
 
-    def fmt_pct(val):
-        if val is None:
-            return "∞"
-        if val > 0:
-            return f"+{val:.1f}%"
-        else:
-            return f"{val:.1f}%"
-
-    def calc_delta(current, previous):
-        if previous == 0 or current == 0:
-            return "∞"
-        try:
-            return ((current - previous) / abs(previous)) * 100
-        except:
-            return "∞"
-
     # Получаем сегодняшнюю дату и количество дней в месяце
     today_date = get_moscow_today()
     first_day = today_date.replace(day=1)
-    days_passed = (today_date - first_day).days + 1  # количество дней от начала месяца до сегодня включительно
+    days_passed = (today_date - first_day).days + 1
 
     # Вычисляем среднемесячные значения
     def safe_div(num, denom):
@@ -454,29 +459,21 @@ def format_combined_metrics_with_deltas(today, yesterday, month):
         canceled_sum = fmt_num(data.get("canceled_sum", 0))
         canceled_units = fmt_int(data.get("canceled_units", 0))
         ad_expense = fmt_num(data.get("ad_expense", 0))
-        drr = fmt_pct(data.get("drr") if data.get("drr") is not None else None)
-        eff_drr = fmt_pct(data.get("effective_drr") if data.get("effective_drr") is not None else None)
+        drr = data.get("drr")
+        eff_drr = data.get("effective_drr")
+        drr_str = f"{drr:.2f}%" if drr is not None else "∞"
+        eff_drr_str = f"{eff_drr:.2f}%" if eff_drr is not None else "∞"
 
-        # Вычисляем дельты для сегодня (относительно вчера и среднего)
-        def delta_str(current, previous, avg):
-            if previous == 0 and avg == 0:
-                return "vs Вчера: ∞ | vs Месяц: ∞"
-            prev_delta = calc_delta(current, previous)
-            avg_delta = calc_delta(current, avg)
-            return f"vs Вчера: {fmt_pct(prev_delta)} | vs Месяц: {fmt_pct(avg_delta)}"
-
-        # Для каждой метрики формируем строку с дельтами
         line1 = f"🛒 Заказано: {ordered_sum} ₽ / {ordered_units} шт. | {delta_str(today_vals['ordered_sum'], yesterday_vals['ordered_sum'], month_avg['ordered_sum'])}"
         line2 = f"📦 Доставлено: {delivered_sum} ₽ / {delivered_units} шт. | {delta_str(today_vals['delivered_sum'], yesterday_vals['delivered_sum'], month_avg['delivered_sum'])}"
         line3 = f"❌ Отмены: {canceled_sum} ₽ / {canceled_units} шт. | {delta_str(today_vals['canceled_sum'], yesterday_vals['canceled_sum'], month_avg['canceled_sum'])}"
-        line4 = f"📢 Реклама: {ad_expense} ₽ / ДРР общ: {drr} / ДРР дост: {eff_drr} | {delta_str(today_vals['ad_expense'], yesterday_vals['ad_expense'], month_avg['ad_expense'])}"
+        line4 = f"📢 Реклама: {ad_expense} ₽ / ДРР общ: {drr_str} / ДРР дост: {eff_drr_str} | {delta_str(today_vals['ad_expense'], yesterday_vals['ad_expense'], month_avg['ad_expense'])}"
         return f"🔹 *{title}*\n  {line1}\n  {line2}\n  {line3}\n  {line4}"
 
     parts = []
     if today:
         parts.append(block_with_deltas("Сегодня", today))
     if yesterday:
-        # Для вчера и месяца дельты не нужны, показываем только данные
         parts.append(block_with_deltas("Вчера", yesterday))
     if month:
         parts.append(block_with_deltas("Текущий месяц", month))
