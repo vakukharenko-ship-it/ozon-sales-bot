@@ -304,7 +304,8 @@ def fetch_financial_data_v2(date_from, date_to):
 def get_delivered_sum_from_finance(date_from, date_to):
     """
     Получает сумму доставленных заказов из финансовых данных.
-    Ищет поля: price_per_instance, seller_price_per_instance, price, total, amount.
+    Фильтрует транзакции по дате (поля date или operation_date).
+    Ищет цену в полях: price_per_instance, seller_price_per_instance, price, total, amount.
     Возвращает float или None.
     """
     transactions = fetch_financial_data_v2(date_from, date_to)
@@ -321,27 +322,56 @@ def get_delivered_sum_from_finance(date_from, date_to):
 
     total = 0.0
     price_fields = ["price_per_instance", "seller_price_per_instance", "price", "total", "amount"]
+
+    # Преобразуем границы дат для сравнения
+    from_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d")
+    to_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d")
+
     for txn in transactions:
-        found = False
+        # Пытаемся извлечь дату транзакции
+        txn_date = None
+        for date_field in ["date", "operation_date", "created_at"]:
+            val = txn.get(date_field)
+            if val:
+                try:
+                    # Пробуем распарсить в разных форматах
+                    if isinstance(val, str):
+                        # Обрезаем время, если есть
+                        date_part = val[:10]
+                        txn_date = datetime.datetime.strptime(date_part, "%Y-%m-%d").date()
+                    else:
+                        txn_date = val
+                    break
+                except:
+                    pass
+
+        # Если дата транзакции есть и не попадает в диапазон – пропускаем
+        if txn_date:
+            if txn_date < from_dt.date() or txn_date > to_dt.date():
+                continue
+
+        # Ищем цену
+        price_val = None
         for field in price_fields:
             val = txn.get(field)
             if val is not None:
                 try:
-                    total += float(val)
-                    found = True
+                    price_val = float(val)
                     break
                 except:
                     pass
-        if not found:
-            # Если ни одно поле не найдено, можно попробовать искать во вложенных объектах
+
+        if price_val is not None:
+            total += price_val
+        else:
+            # Если ни одно поле не найдено, можно попробовать найти числовое значение в любом поле
             for key, value in txn.items():
                 if isinstance(value, (int, float)):
                     total += value
                     break
 
-    write_log(f"💳 Сумма доставленных заказов из финансов (по полю price_per_instance и др.) за {date_from}–{date_to}: {total:.2f} ₽")
+    write_log(f"💳 Сумма доставленных заказов из финансов (отфильтровано по дате) за {date_from}–{date_to}: {total:.2f} ₽")
     return total
-
 # ---------- ОСТАЛЬНЫЕ ФУНКЦИИ ----------
 def get_performance_token():
     if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
