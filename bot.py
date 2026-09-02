@@ -159,7 +159,6 @@ def create_calendar(year, month, callback_prefix):
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data=f"{callback_prefix}cancel")])
     return InlineKeyboardMarkup(keyboard)
 
-# ---------- ЗАГРУЗКА ОТГРУЗОК И АГРЕГАЦИЯ ----------
 def fetch_postings(date_from, date_to):
     headers = {
         "Client-Id": OZON_CLIENT_ID,
@@ -196,12 +195,6 @@ def fetch_postings(date_from, date_to):
     return all_postings
 
 def aggregate_postings(postings, date_from=None, date_to=None, time_limit=None, apply_limit_on_day=None):
-    """
-    Агрегирует отгрузки по дням с учётом временного ограничения.
-    Если time_limit задан, то для дня equal to apply_limit_on_day (строка YYYY-MM-DD)
-    учитываются только отгрузки с created_at <= time_limit (время в этот день).
-    Для остальных дней ограничения нет.
-    """
     aggregated = {}
     for posting in postings:
         created_at = posting.get("created_at", "")
@@ -258,7 +251,6 @@ def aggregate_postings(postings, date_from=None, date_to=None, time_limit=None, 
 
     return aggregated
 
-# ---------- РЕКЛАМНЫЕ РАСХОДЫ ----------
 def get_performance_token():
     if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
         write_log("⚠️ OZON_PERFORMANCE_CLIENT_ID или CLIENT_SECRET не заданы!")
@@ -339,16 +331,10 @@ def fetch_advertising_expense(date_from, date_to):
         write_log(f"❌ Ошибка получения рекламных расходов: {e}")
         return 0.0
 
-# ---------- ОСНОВНАЯ ФУНКЦИЯ ОТЧЁТА (С УЧЁТОМ ВРЕМЕНИ) ----------
 def get_current_time_msk():
     return datetime.datetime.now(MOSCOW_TZ)
 
 def format_combined_metrics_with_deltas():
-    """
-    Формирует отчёт с двумя блоками:
-    - Сегодня (сравнение с вчера за аналогичное время)
-    - Текущий месяц (сравнение с предыдущим месяцем за аналогичный период)
-    """
     now = get_current_time_msk()
     today_date = now.date()
     current_time = now.time()
@@ -369,11 +355,9 @@ def format_combined_metrics_with_deltas():
     previous_month_today = previous_month_start + datetime.timedelta(days=days_passed - 1)
     previous_month_today_str = previous_month_today.isoformat()
 
-    # Загружаем отгрузки за текущий и предыдущий месяц
     postings_current = fetch_postings(current_month_start_str, current_month_end_str)
     postings_prev = fetch_postings(previous_month_start_str, previous_month_end_str)
 
-    # Агрегируем сегодня с ограничением по времени
     agg_today = aggregate_postings(
         postings_current,
         date_from=today_str,
@@ -383,7 +367,6 @@ def format_combined_metrics_with_deltas():
     )
     today_metrics = agg_today.get(today_str, {}) if today_str in agg_today else {}
 
-    # Вчера с ограничением по времени
     agg_yesterday = aggregate_postings(
         postings_current,
         date_from=yesterday_str,
@@ -393,7 +376,6 @@ def format_combined_metrics_with_deltas():
     )
     yesterday_metrics = agg_yesterday.get(yesterday_str, {}) if yesterday_str in agg_yesterday else {}
 
-    # Текущий месяц (с ограничением для сегодня)
     agg_current_month = aggregate_postings(
         postings_current,
         date_from=current_month_start_str,
@@ -413,7 +395,6 @@ def format_combined_metrics_with_deltas():
         for key in month_metrics:
             month_metrics[key] += vals.get(key, 0)
 
-    # Предыдущий месяц (первые days_passed дней, для последнего дня ограничиваем время)
     prev_period_end = previous_month_start + datetime.timedelta(days=days_passed - 1)
     prev_period_end_str = prev_period_end.isoformat()
     agg_prev_month = aggregate_postings(
@@ -435,13 +416,11 @@ def format_combined_metrics_with_deltas():
         for key in prev_month_metrics:
             prev_month_metrics[key] += vals.get(key, 0)
 
-    # Рекламные расходы (пока без временного ограничения)
     ad_today = fetch_advertising_expense(today_str, today_str)
     ad_yesterday = fetch_advertising_expense(yesterday_str, yesterday_str)
     ad_month = fetch_advertising_expense(current_month_start_str, current_month_end_str)
     ad_prev_month = fetch_advertising_expense(previous_month_start_str, previous_month_end_str)
 
-    # Вспомогательные функции форматирования
     def fmt_num(val):
         return f"{val:,.2f}".replace(",", " ") if val else "0.00"
 
@@ -468,7 +447,6 @@ def format_combined_metrics_with_deltas():
         delta = calc_delta(current, previous)
         return f"{label}: {fmt_pct(delta)}"
 
-    # Блок "Сегодня"
     def format_today_block():
         ordered_sum = fmt_num(today_metrics.get("ordered_sum", 0))
         ordered_units = fmt_int(today_metrics.get("ordered_units", 0))
@@ -502,7 +480,6 @@ def format_combined_metrics_with_deltas():
             f"  ДРР общ: {drr_str} | ДРР дост: {eff_drr_str}"
         )
 
-    # Блок "Текущий месяц"
     def format_month_block():
         ordered_sum = fmt_num(month_metrics.get("ordered_sum", 0))
         ordered_units = fmt_int(month_metrics.get("ordered_units", 0))
@@ -541,7 +518,6 @@ def format_combined_metrics_with_deltas():
 
     return f"📊 *Текущие показатели*\n\n{today_block}\n\n{month_block}"
 
-# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ВЫБОРА ДАТЫ/ПЕРИОДА ----------
 def format_single_metrics(metrics, title):
     if not metrics:
         return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
@@ -807,7 +783,6 @@ async def remove_manager_input(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text("Управление менеджерами:", reply_markup=admin_keyboard())
     return ConversationHandler.END
 
-# ---------- ОТМЕНА ДИАЛОГА (ИСПРАВЛЕНИЕ) ----------
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     keyboard = main_admin_keyboard() if is_admin(chat_id) else main_user_keyboard()
@@ -920,7 +895,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text("Выберите действие:", reply_markup=reports_keyboard())
         return ConversationHandler.END
 
-    # Обработка выбора года для месяца/квартала
     if data.startswith("period_year_month_"):
         year = int(data.split("_")[-1])
         context.user_data['period_year'] = year
@@ -1086,14 +1060,12 @@ def main():
     application.add_handler(MessageHandler(filters.Text(["📅 Текущие показатели", "📆 Выбрать дату", "📊 Выбрать период", "🔙 Назад"]), handle_reports_menu))
     application.add_handler(MessageHandler(filters.Text(["📋 Список менеджеров", "🔙 Назад"]), handle_admin_menu))
 
-    # ConversationHandler для выбора даты
     conv_date = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📆 Выбрать дату"), handle_reports_menu)],
         states={WAITING_DATE_SINGLE: [CallbackQueryHandler(handle_callback_query)]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    # ConversationHandler для выбора периода
     conv_period = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📊 Выбрать период"), handle_reports_menu)],
         states={
@@ -1108,7 +1080,6 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    # ConversationHandler для добавления менеджера
     conv_add = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➕ Добавить менеджера"), add_manager_start)],
         states={
@@ -1118,7 +1089,6 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    # ConversationHandler для удаления менеджера
     conv_remove = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➖ Удалить менеджера"), remove_manager_start)],
         states={WAITING_REMOVE_MANAGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_manager_input)]},
@@ -1131,30 +1101,43 @@ def main():
     application.add_handler(conv_remove)
     application.add_handler(CallbackQueryHandler(handle_callback_query))
 
-    async def scheduled_report(context):
-        moscow_tz = MOSCOW_TZ
-        now = datetime.datetime.now(moscow_tz)
-        if not (9 <= now.hour <= 23):
-            return
-        managers = load_managers()
-        if not managers:
-            return
-        report = format_combined_metrics_with_deltas()
-        for m in managers:
-            try:
-                await context.bot.send_message(chat_id=m['id'], text=report, parse_mode="Markdown")
-            except Exception as e:
-                write_log(f"Ошибка отправки {m['id']}: {e}")
-
+    # ---------- НОВОЕ РАСПИСАНИЕ (10:00 и 22:00 МСК) ----------
     job_queue = application.job_queue
     if job_queue:
-        job_queue.run_repeating(scheduled_report, interval=60*60, first=0)
-        write_log("✅ Планировщик запущен.")
+        job_queue.run_daily(
+            scheduled_report,
+            time=datetime.time(10, 0, 0),
+            days=tuple(range(7)),
+            name="morning_report",
+            timezone=MOSCOW_TZ
+        )
+        job_queue.run_daily(
+            scheduled_report,
+            time=datetime.time(22, 0, 0),
+            days=tuple(range(7)),
+            name="evening_report",
+            timezone=MOSCOW_TZ
+        )
+        write_log("✅ Планировщик запущен (ежедневно в 10:00 и 22:00 МСК).")
     else:
         write_log("⚠️ JobQueue недоступен.")
 
     write_log("🚀 Бот готов.")
     application.run_polling(allowed_updates=Update.ALL_TYPES, timeout=30)
+
+async def scheduled_report(context):
+    moscow_tz = MOSCOW_TZ
+    now = datetime.datetime.now(moscow_tz)
+    # Отправка происходит по расписанию, дополнительная проверка времени не обязательна, но оставим для безопасности
+    managers = load_managers()
+    if not managers:
+        return
+    report = format_combined_metrics_with_deltas()
+    for m in managers:
+        try:
+            await context.bot.send_message(chat_id=m['id'], text=report, parse_mode="Markdown")
+        except Exception as e:
+            write_log(f"Ошибка отправки {m['id']}: {e}")
 
 if __name__ == "__main__":
     main()
