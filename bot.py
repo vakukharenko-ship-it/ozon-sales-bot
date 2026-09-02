@@ -606,13 +606,13 @@ def format_single_metrics(metrics, title):
     eff_drr_text = f"{eff_drr:.2f}%" if eff_drr is not None else "∞"
 
     return (
-        f"📊 *{title}*\n\n"+ "\n
+        f"📊 *{title}*\n\n"
         f"🛒 *Заказано*\n  На сумму: {metrics.get('ordered_sum', 0):,.2f} ₽\n"
-        f"  Штук: {metrics.get('ordered_units', 0)}\n\n"+ "\n
+        f"  Штук: {metrics.get('ordered_units', 0)}\n\n"
         f"📦 *Доставлено*\n  На сумму: {metrics.get('delivered_sum', 0):,.2f} ₽\n"
-        f"  Штук: {metrics.get('delivered_units', 0)}\n\n"+ "\n
+        f"  Штук: {metrics.get('delivered_units', 0)}\n\n"
         f"❌ *Отмены*\n  На сумму: {metrics.get('canceled_sum', 0):,.2f} ₽\n"
-        f"  Штук: {metrics.get('canceled_units', 0)}\n\n"+ "\n
+        f"  Штук: {metrics.get('canceled_units', 0)}\n\n"
         f"📢 *Реклама*\n"
         f"  Расходы: {ad_expense:,.2f} ₽\n"
         f"  ДРР (общий): {drr_text}\n"
