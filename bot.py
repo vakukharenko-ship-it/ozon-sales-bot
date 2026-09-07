@@ -1846,7 +1846,7 @@ def admin_keyboard():
     buttons = [
         [KeyboardButton("➕ Добавить менеджера"), KeyboardButton("➖ Удалить менеджера")],
         [KeyboardButton("📋 Список менеджеров")],
-        [KeyboardButton("⚙️ Настройка рассылок")],  # Новая кнопка
+        [KeyboardButton("⚙️ Настройка рассылок")],
         [KeyboardButton("🔙 Назад")]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
