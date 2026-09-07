@@ -1,9 +1,4 @@
-python-telegram-bot==20.6
-aiohttp
-aiodns
-cchardet
+python-telegram-bot[job-queue]==20.6
+requests
 matplotlib
 Pillow
-python-dotenv
-python-dateutil
-numpy
