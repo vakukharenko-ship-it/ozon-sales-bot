@@ -1,3 +1,5 @@
+from dotenv import load_dotenv
+load_dotenv()
 import datetime
 import json
 import os
@@ -38,7 +40,7 @@ except ImportError:
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ БОТА ====================
-VERSION = "2.1.6"  # Добавлена проверка наличия зависимостей при старте
+VERSION = "2.2.0"  # Добавлена расширенная настройка рассылок (режимы, тишина, флаг вчера для слотов)
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
@@ -117,10 +119,12 @@ WAITING_PRODUCT_PERIOD_CHOICE = 32
 WAITING_PRODUCT_SINGLE_YEAR = 33
 WAITING_PRODUCT_RANGE_START = 34
 WAITING_PRODUCT_RANGE_END = 35
-# Состояния для настроек рассылок
+# Состояния для настроек рассылок (новые)
 WAITING_SETTINGS = 40
-WAITING_SETTINGS_HOURLY = 41
-WAITING_SETTINGS_SLOTS = 42
+WAITING_SETTINGS_HOURLY_QUIET_START = 41
+WAITING_SETTINGS_HOURLY_QUIET_END = 42
+WAITING_SETTINGS_HOURLY_YESTERDAY_HOUR = 43
+WAITING_SETTINGS_SLOTS_ADD = 44
 
 MOSCOW_TZ = datetime.timezone(datetime.timedelta(hours=3))
 
@@ -497,40 +501,92 @@ def format_period_comparison_metrics(metrics_current, metrics_prev, period_name)
 
     return "\n".join(lines)
 
-# ==================== НАСТРОЙКИ РАССЫЛОК ====================
+# ==================== НАСТРОЙКИ РАССЫЛОК (НОВАЯ ВЕРСИЯ) ====================
+DEFAULT_SETTINGS = {
+    "mode": "hourly",  # "hourly" или "slots"
+    "hourly": {
+        "quiet_start": 23,
+        "quiet_end": 9,
+        "yesterday_hour": 9
+    },
+    "slots": [
+        {"hour": 10, "include_yesterday": True},
+        {"hour": 22, "include_yesterday": False}
+    ]
+}
+
 def load_settings() -> dict:
-    """Загружает настройки рассылок из файла."""
-    default = {
-        "hourly": False,   # Ежечасная рассылка
-        "slots": [10, 22]  # Список часов (0-23)
-    }
+    """Загружает настройки рассылок из файла, возвращает словарь с гарантированной структурой."""
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                # Проверяем наличие ключей
+                # Проверяем и дополняем недостающие ключи
+                if "mode" not in data:
+                    data["mode"] = DEFAULT_SETTINGS["mode"]
                 if "hourly" not in data:
-                    data["hourly"] = default["hourly"]
+                    data["hourly"] = DEFAULT_SETTINGS["hourly"].copy()
+                else:
+                    for key in DEFAULT_SETTINGS["hourly"]:
+                        if key not in data["hourly"]:
+                            data["hourly"][key] = DEFAULT_SETTINGS["hourly"][key]
                 if "slots" not in data or not isinstance(data["slots"], list):
-                    data["slots"] = default["slots"]
+                    data["slots"] = DEFAULT_SETTINGS["slots"].copy()
+                else:
+                    # Проверяем каждый слот на наличие ключей
+                    for slot in data["slots"]:
+                        if "hour" not in slot:
+                            slot["hour"] = 10  # fallback
+                        if "include_yesterday" not in slot:
+                            slot["include_yesterday"] = False
                 return data
-        except:
-            pass
-    return default
+        except Exception as e:
+            write_log(f"Ошибка загрузки settings.json: {e}, используются настройки по умолчанию")
+    return DEFAULT_SETTINGS.copy()
 
 def save_settings(settings: dict):
     """Сохраняет настройки рассылок в файл."""
+    # Приводим к стандартной структуре
+    safe_settings = {
+        "mode": settings.get("mode", DEFAULT_SETTINGS["mode"]),
+        "hourly": {
+            "quiet_start": settings.get("hourly", {}).get("quiet_start", DEFAULT_SETTINGS["hourly"]["quiet_start"]),
+            "quiet_end": settings.get("hourly", {}).get("quiet_end", DEFAULT_SETTINGS["hourly"]["quiet_end"]),
+            "yesterday_hour": settings.get("hourly", {}).get("yesterday_hour", DEFAULT_SETTINGS["hourly"]["yesterday_hour"])
+        },
+        "slots": []
+    }
+    for slot in settings.get("slots", []):
+        if isinstance(slot, dict) and "hour" in slot:
+            safe_settings["slots"].append({
+                "hour": slot["hour"],
+                "include_yesterday": slot.get("include_yesterday", False)
+            })
+        elif isinstance(slot, int):  # для обратной совместимости со старым форматом
+            safe_settings["slots"].append({"hour": slot, "include_yesterday": False})
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(settings, f, ensure_ascii=False, indent=2)
+        json.dump(safe_settings, f, ensure_ascii=False, indent=2)
 
 def get_schedule_hours() -> List[int]:
-    """Возвращает список часов, когда должна отправляться рассылка, с учётом настроек."""
+    """Возвращает список часов, когда должна проверяться отправка (все часы для hourly или слоты для slots)."""
     settings = load_settings()
-    if settings.get("hourly", False):
-        # Ежечасная – все часы 0-23
-        return list(range(24))
+    if settings.get("mode") == "slots":
+        return [slot["hour"] for slot in settings.get("slots", []) if isinstance(slot, dict) and "hour" in slot]
     else:
-        return settings.get("slots", [10, 22])
+        # hourly – возвращаем все часы, но тишина обрабатывается в scheduled_report
+        return list(range(24))
+
+def is_quiet_hour(hour: int, quiet_start: int, quiet_end: int) -> bool:
+    """Проверяет, входит ли час в интервал тишины (с учётом перехода через полночь)."""
+    if quiet_start <= quiet_end:
+        # обычный интервал, например 23-9 (23,0,1..9)
+        return quiet_start <= hour <= quiet_end
+    else:
+        # переход через полночь, например 23-9 -> с 23 до 9
+        return hour >= quiet_start or hour <= quiet_end
+
+# ---------- ОСТАЛЬНЫЕ ФУНКЦИИ (без изменений) ----------
+# (оставляем все остальные функции, кроме настроек и планировщика)
 
 # ==================== КЛАСС ДЛЯ РЕЙТ-ЛИМИТА ====================
 class RateLimiter:
@@ -1851,18 +1907,6 @@ def admin_keyboard():
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
-def settings_keyboard():
-    """Клавиатура для меню настроек рассылок."""
-    settings = load_settings()
-    hourly_status = "✅ Вкл" if settings.get("hourly", False) else "❌ Выкл"
-    slots_str = ", ".join(f"{h:02d}:00" for h in sorted(settings.get("slots", [10, 22])))
-    buttons = [
-        [KeyboardButton(f"🔄 Ежечасная: {hourly_status}")],
-        [KeyboardButton(f"⏰ Индивидуальные слоты: {slots_str}")],
-        [KeyboardButton("🔙 Назад")]
-    ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-
 # ---------- ОБРАБОТЧИКИ КОМАНД ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -1927,13 +1971,12 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "• ➖ Удалить менеджера – введите Telegram ID пользователя.\n"
                 "• 📋 Список менеджеров – просмотр всех добавленных пользователей (ID, username, имя, телефон).\n\n"
                 "🔹 *Настройка рассылок*\n"
-                "• Ежечасная – включить/выключить отправку отчётов каждый час.\n"
-                "• Индивидуальные слоты – выбрать конкретные часы (0-23) для отправки (например, 10:00, 22:00).\n"
-                "  Если ежечасная выключена, отчёты будут отправляться только в выбранные слоты.\n\n"
+                "• Два режима: Ежечасный или Индивидуальные слоты.\n"
+                "• Для ежечасного: настройка интервала тишины (часы, когда отчёты не отправляются) и часа, когда включается блок «Вчера».\n"
+                "• Для слотов: добавление/удаление конкретных часов и независимый флаг «Вчера» для каждого.\n\n"
                 "🔹 *Автоматические отчёты*\n"
-                "• В 10:00 МСК – отчёт с блоками «Вчера», «Сегодня» и «Текущий месяц».\n"
-                "• В 22:00 МСК – отчёт с блоками «Сегодня» и «Текущий месяц».\n"
-                "• Дополнительные слоты настраиваются в разделе администрирования.\n\n"
+                "• Отправляются согласно выбранным настройкам.\n"
+                "• Блок «Вчера» включается только если установлен соответствующий флаг.\n\n"
                 "🔹 *Метрики*\n"
                 "• 🛒 Заказано – сумма и количество всех заказов.\n"
                 "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
@@ -1958,9 +2001,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "• 📈 Динамика продаж – график доставленных заказов по месяцам за выбранный год (или несколько лет).\n"
                 "• 📈 Динамика по товару – график продаж конкретного товара по месяцам.\n\n"
                 "🔹 *Автоматические отчёты*\n"
-                "• В 10:00 МСК – отчёт с блоками «Вчера», «Сегодня» и «Текущий месяц».\n"
-                "• В 22:00 МСК – отчёт с блоками «Сегодня» и «Текущий месяц».\n"
-                "• Дополнительные слоты настраиваются администратором.\n\n"
+                "• Отправляются согласно настройкам администратора.\n\n"
                 "🔹 *Метрики*\n"
                 "• 🛒 Заказано – сумма и количество всех заказов.\n"
                 "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
@@ -2141,148 +2182,279 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Неизвестная команда.")
 
-# ---------- ОБРАБОТЧИКИ НАСТРОЕК РАССЫЛОК ----------
+# ==================== НОВЫЕ ОБРАБОТЧИКИ НАСТРОЕК РАССЫЛОК ====================
 async def show_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает текущие настройки рассылок."""
+    """Показывает главное меню настроек рассылок."""
     settings = load_settings()
-    hourly_status = "✅ Включена" if settings.get("hourly", False) else "❌ Выключена"
-    slots_str = ", ".join(f"{h:02d}:00" for h in sorted(settings.get("slots", [10, 22])))
+    mode = settings.get("mode", "hourly")
+    mode_text = "Ежечасный" if mode == "hourly" else "Индивидуальные слоты"
     text = (
-        f"⚙️ *Настройка рассылок*\n\n"
-        f"🔄 Ежечасная рассылка: {hourly_status}\n"
-        f"⏰ Индивидуальные слоты: {slots_str}\n\n"
+        f"⚙️ *Настройка рассылок*\n"
+        f"Режим: *{mode_text}*\n\n"
         "Выберите действие:"
     )
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Переключить ежечасную", callback_data="settings_toggle_hourly")],
-        [InlineKeyboardButton("⏰ Редактировать слоты", callback_data="settings_edit_slots")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="settings_back")]
-    ])
-    await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    keyboard = [
+        [InlineKeyboardButton(f"🔄 Переключить режим (сейчас {mode_text})", callback_data="settings_toggle_mode")],
+    ]
+    if mode == "hourly":
+        hourly = settings.get("hourly", {})
+        quiet_start = hourly.get("quiet_start", 23)
+        quiet_end = hourly.get("quiet_end", 9)
+        yesterday_hour = hourly.get("yesterday_hour", 9)
+        text += (
+            f"\nТишина: {quiet_start:02d}:00 – {quiet_end:02d}:00\n"
+            f"Час для блока «Вчера»: {yesterday_hour:02d}:00"
+        )
+        keyboard.extend([
+            [InlineKeyboardButton("🕒 Настроить тишину (начало)", callback_data="settings_hourly_quiet_start")],
+            [InlineKeyboardButton("🕒 Настроить тишину (конец)", callback_data="settings_hourly_quiet_end")],
+            [InlineKeyboardButton("📅 Настроить час для «Вчера»", callback_data="settings_hourly_yesterday_hour")],
+        ])
+    else:  # slots
+        slots = settings.get("slots", [])
+        if slots:
+            text += "\n\nТекущие слоты:"
+            for i, slot in enumerate(slots):
+                hour = slot.get("hour", 0)
+                incl = slot.get("include_yesterday", False)
+                flag = "✅" if incl else "❌"
+                text += f"\n• {hour:02d}:00 (Вчера: {flag})  [Удалить: /del_slot_{i}]"
+        else:
+            text += "\n\nНет добавленных слотов."
+        # Кнопки для управления слотами (через callback)
+        keyboard.append([InlineKeyboardButton("➕ Добавить слот", callback_data="settings_slots_add")])
+        # Для каждого слота добавим кнопки удалить и переключить флаг (в виде отдельных кнопок)
+        # Но так как мы не можем динамически добавлять много кнопок в инлайн-клавиатуру в одном сообщении?
+        # Можно сделать отдельный список, но ограничимся: добавим кнопку "Управление слотами" которая выведет список с кнопками.
+        # Или просто использовать текстовые команды, но проще сделать отдельное меню для слотов.
+        keyboard.append([InlineKeyboardButton("📋 Управление слотами", callback_data="settings_slots_manage")])
+
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="settings_back")])
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
     return WAITING_SETTINGS
 
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик inline-кнопок в настройках рассылок."""
+    """Обработчик инлайн-кнопок настроек рассылок."""
     query = update.callback_query
     await query.answer()
     data = query.data
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await query.edit_message_text("⛔ Только для администратора.")
+        return ConversationHandler.END
 
     if data == "settings_back":
         await query.edit_message_text("Возврат в администрирование.")
-        if is_admin(update.effective_chat.id):
+        if is_admin(chat_id):
             await query.message.reply_text("Управление менеджерами и настройками:", reply_markup=admin_keyboard())
         return ConversationHandler.END
 
-    if data == "settings_toggle_hourly":
+    if data == "settings_toggle_mode":
         settings = load_settings()
-        settings["hourly"] = not settings.get("hourly", False)
+        current = settings.get("mode", "hourly")
+        new_mode = "slots" if current == "hourly" else "hourly"
+        settings["mode"] = new_mode
+        if new_mode == "slots" and not settings.get("slots"):
+            # Если нет слотов, добавить дефолтные
+            settings["slots"] = [{"hour": 10, "include_yesterday": True}, {"hour": 22, "include_yesterday": False}]
         save_settings(settings)
-        await query.edit_message_text(f"✅ Ежечасная рассылка {'включена' if settings['hourly'] else 'выключена'}.")
-        # Показываем обновлённое меню
+        await query.edit_message_text(f"✅ Режим переключён на {'Ежечасный' if new_mode == 'hourly' else 'Индивидуальные слоты'}.")
         await show_settings_menu_from_query(query)
         return WAITING_SETTINGS
 
-    if data == "settings_edit_slots":
-        # Показать клавиатуру с часами для выбора
-        settings = load_settings()
-        current_slots = set(settings.get("slots", [10, 22]))
-        keyboard = []
-        row = []
-        for hour in range(24):
-            if hour % 6 == 0 and hour > 0:
-                keyboard.append(row)
-                row = []
-            label = f"{hour:02d}:00"
-            if hour in current_slots:
-                label = f"✅ {label}"
-            else:
-                label = f"❌ {label}"
-            row.append(InlineKeyboardButton(label, callback_data=f"settings_slot_toggle_{hour}"))
-        if row:
-            keyboard.append(row)
-        keyboard.append([InlineKeyboardButton("💾 Сохранить слоты", callback_data="settings_slots_save")])
-        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="settings_back_from_slots")])
-        await query.edit_message_text(
-            "Выберите часы для рассылки (нажмите на час, чтобы включить/выключить):\n"
-            "✅ – выбран, ❌ – не выбран",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return WAITING_SETTINGS_SLOTS
+    # Настройка ежечасного режима
+    if data == "settings_hourly_quiet_start":
+        # Показываем клавиатуру выбора часа (0-23)
+        keyboard = create_hour_keyboard("hqs_")  # hqs = hourly quiet start
+        await query.edit_message_text("Выберите час начала тишины (0-23):", reply_markup=keyboard)
+        return WAITING_SETTINGS_HOURLY_QUIET_START
 
-    if data.startswith("settings_slot_toggle_"):
+    if data == "settings_hourly_quiet_end":
+        keyboard = create_hour_keyboard("hqe_")
+        await query.edit_message_text("Выберите час окончания тишины (0-23):", reply_markup=keyboard)
+        return WAITING_SETTINGS_HOURLY_QUIET_END
+
+    if data == "settings_hourly_yesterday_hour":
+        keyboard = create_hour_keyboard("hyh_")
+        await query.edit_message_text("Выберите час, когда включать блок «Вчера» (0-23):", reply_markup=keyboard)
+        return WAITING_SETTINGS_HOURLY_YESTERDAY_HOUR
+
+    # Обработка выбора часа для настройки ежечасного режима
+    if data.startswith("hqs_"):
         hour = int(data.split("_")[-1])
-        # Временно сохраняем выбранные слоты в context.user_data
-        if "temp_slots" not in context.user_data:
-            settings = load_settings()
-            context.user_data["temp_slots"] = set(settings.get("slots", [10, 22]))
-        temp_slots = context.user_data["temp_slots"]
-        if hour in temp_slots:
-            temp_slots.remove(hour)
-        else:
-            temp_slots.add(hour)
-        # Обновляем клавиатуру
-        await update_settings_slots_keyboard(query, temp_slots)
-        return WAITING_SETTINGS_SLOTS
-
-    if data == "settings_slots_save":
-        temp_slots = context.user_data.get("temp_slots", set())
-        if not temp_slots:
-            await query.edit_message_text("❌ Вы не выбрали ни одного слота. Сохранение отменено.")
-            await show_settings_menu_from_query(query)
-            return WAITING_SETTINGS
         settings = load_settings()
-        settings["slots"] = sorted(temp_slots)
+        settings["hourly"]["quiet_start"] = hour
         save_settings(settings)
-        context.user_data.pop("temp_slots", None)
-        await query.edit_message_text(f"✅ Слоты сохранены: {', '.join(f'{h:02d}:00' for h in sorted(settings['slots']))}")
+        await query.edit_message_text(f"✅ Начало тишины установлено на {hour:02d}:00.")
         await show_settings_menu_from_query(query)
         return WAITING_SETTINGS
 
-    if data == "settings_back_from_slots":
-        context.user_data.pop("temp_slots", None)
+    if data.startswith("hqe_"):
+        hour = int(data.split("_")[-1])
+        settings = load_settings()
+        settings["hourly"]["quiet_end"] = hour
+        save_settings(settings)
+        await query.edit_message_text(f"✅ Окончание тишины установлено на {hour:02d}:00.")
         await show_settings_menu_from_query(query)
+        return WAITING_SETTINGS
+
+    if data.startswith("hyh_"):
+        hour = int(data.split("_")[-1])
+        settings = load_settings()
+        settings["hourly"]["yesterday_hour"] = hour
+        save_settings(settings)
+        await query.edit_message_text(f"✅ Час для блока «Вчера» установлен на {hour:02d}:00.")
+        await show_settings_menu_from_query(query)
+        return WAITING_SETTINGS
+
+    # Управление слотами
+    if data == "settings_slots_manage":
+        return await show_slots_management(query, context)
+
+    if data == "settings_slots_add":
+        # Показываем клавиатуру выбора часа для добавления слота
+        keyboard = create_hour_keyboard("slotadd_")
+        await query.edit_message_text("Выберите час для нового слота (0-23):", reply_markup=keyboard)
+        return WAITING_SETTINGS_SLOTS_ADD
+
+    if data.startswith("slotadd_"):
+        hour = int(data.split("_")[-1])
+        settings = load_settings()
+        # Проверяем, существует ли уже слот с таким часом
+        for slot in settings.get("slots", []):
+            if slot.get("hour") == hour:
+                await query.edit_message_text(f"⚠️ Слот на {hour:02d}:00 уже существует.")
+                await show_slots_management(query, context)
+                return WAITING_SETTINGS
+        settings["slots"].append({"hour": hour, "include_yesterday": False})
+        save_settings(settings)
+        await query.edit_message_text(f"✅ Добавлен слот {hour:02d}:00.")
+        await show_slots_management(query, context)
+        return WAITING_SETTINGS
+
+    if data.startswith("slot_toggle_"):
+        # Формат: slot_toggle_<index>
+        idx = int(data.split("_")[-1])
+        settings = load_settings()
+        if 0 <= idx < len(settings.get("slots", [])):
+            settings["slots"][idx]["include_yesterday"] = not settings["slots"][idx].get("include_yesterday", False)
+            save_settings(settings)
+            await show_slots_management(query, context)
+        else:
+            await query.edit_message_text("❌ Ошибка: слот не найден.")
+        return WAITING_SETTINGS
+
+    if data.startswith("slot_delete_"):
+        idx = int(data.split("_")[-1])
+        settings = load_settings()
+        if 0 <= idx < len(settings.get("slots", [])):
+            del settings["slots"][idx]
+            save_settings(settings)
+            await query.edit_message_text("✅ Слот удалён.")
+            await show_slots_management(query, context)
+        else:
+            await query.edit_message_text("❌ Ошибка: слот не найден.")
         return WAITING_SETTINGS
 
     await query.edit_message_text("❌ Неизвестная команда.")
     return ConversationHandler.END
 
 async def show_settings_menu_from_query(query):
-    """Показывает меню настроек после редактирования."""
+    """Показывает главное меню настроек после редактирования."""
     settings = load_settings()
-    hourly_status = "✅ Включена" if settings.get("hourly", False) else "❌ Выключена"
-    slots_str = ", ".join(f"{h:02d}:00" for h in sorted(settings.get("slots", [10, 22])))
+    mode = settings.get("mode", "hourly")
+    mode_text = "Ежечасный" if mode == "hourly" else "Индивидуальные слоты"
     text = (
-        f"⚙️ *Настройка рассылок*\n\n"
-        f"🔄 Ежечасная рассылка: {hourly_status}\n"
-        f"⏰ Индивидуальные слоты: {slots_str}\n\n"
+        f"⚙️ *Настройка рассылок*\n"
+        f"Режим: *{mode_text}*\n\n"
         "Выберите действие:"
     )
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Переключить ежечасную", callback_data="settings_toggle_hourly")],
-        [InlineKeyboardButton("⏰ Редактировать слоты", callback_data="settings_edit_slots")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="settings_back")]
-    ])
-    await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    keyboard = [
+        [InlineKeyboardButton(f"🔄 Переключить режим (сейчас {mode_text})", callback_data="settings_toggle_mode")],
+    ]
+    if mode == "hourly":
+        hourly = settings.get("hourly", {})
+        quiet_start = hourly.get("quiet_start", 23)
+        quiet_end = hourly.get("quiet_end", 9)
+        yesterday_hour = hourly.get("yesterday_hour", 9)
+        text += (
+            f"\nТишина: {quiet_start:02d}:00 – {quiet_end:02d}:00\n"
+            f"Час для блока «Вчера»: {yesterday_hour:02d}:00"
+        )
+        keyboard.extend([
+            [InlineKeyboardButton("🕒 Настроить тишину (начало)", callback_data="settings_hourly_quiet_start")],
+            [InlineKeyboardButton("🕒 Настроить тишину (конец)", callback_data="settings_hourly_quiet_end")],
+            [InlineKeyboardButton("📅 Настроить час для «Вчера»", callback_data="settings_hourly_yesterday_hour")],
+        ])
+    else:
+        slots = settings.get("slots", [])
+        if slots:
+            text += "\n\nТекущие слоты:"
+            for i, slot in enumerate(slots):
+                hour = slot.get("hour", 0)
+                incl = slot.get("include_yesterday", False)
+                flag = "✅" if incl else "❌"
+                text += f"\n• {hour:02d}:00 (Вчера: {flag})"
+        else:
+            text += "\n\nНет добавленных слотов."
+        keyboard.append([InlineKeyboardButton("📋 Управление слотами", callback_data="settings_slots_manage")])
 
-async def update_settings_slots_keyboard(query, temp_slots):
-    """Обновляет клавиатуру выбора слотов."""
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="settings_back")])
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def show_slots_management(query, context):
+    """Показывает меню управления слотами."""
+    settings = load_settings()
+    slots = settings.get("slots", [])
+    text = "📋 *Управление слотами*\n\n"
+    if not slots:
+        text += "Нет добавленных слотов."
+    else:
+        for i, slot in enumerate(slots):
+            hour = slot.get("hour", 0)
+            incl = slot.get("include_yesterday", False)
+            flag = "✅" if incl else "❌"
+            text += f"{i+1}. {hour:02d}:00 – Вчера: {flag}\n"
+
+    keyboard = []
+    if slots:
+        # Добавляем кнопки управления для каждого слота (переключить флаг, удалить)
+        for i, slot in enumerate(slots):
+            row = []
+            row.append(InlineKeyboardButton(
+                f"🔄 Слот {slot['hour']:02d}:00",
+                callback_data=f"slot_toggle_{i}"
+            ))
+            row.append(InlineKeyboardButton(
+                f"❌ Удалить",
+                callback_data=f"slot_delete_{i}"
+            ))
+            keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("➕ Добавить слот", callback_data="settings_slots_add")])
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="settings_back_from_slots_manage")])
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    return WAITING_SETTINGS
+
+async def settings_back_from_slots_manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик возврата из управления слотами."""
+    query = update.callback_query
+    await query.answer()
+    await show_settings_menu_from_query(query)
+    return WAITING_SETTINGS
+
+def create_hour_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    """Создаёт клавиатуру с часами от 0 до 23."""
     keyboard = []
     row = []
     for hour in range(24):
         if hour % 6 == 0 and hour > 0:
             keyboard.append(row)
             row = []
-        label = f"{hour:02d}:00"
-        if hour in temp_slots:
-            label = f"✅ {label}"
-        else:
-            label = f"❌ {label}"
-        row.append(InlineKeyboardButton(label, callback_data=f"settings_slot_toggle_{hour}"))
+        row.append(InlineKeyboardButton(f"{hour:02d}:00", callback_data=f"{prefix}{hour}"))
     if row:
         keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("💾 Сохранить слоты", callback_data="settings_slots_save")])
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="settings_back_from_slots")])
-    await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="settings_back_from_hour_select")])
+    return InlineKeyboardMarkup(keyboard)
 
 # ---------- ДИАЛОГИ АДМИНИСТРИРОВАНИЯ ----------
 async def add_manager_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2468,7 +2640,6 @@ async def product_period_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("⏳ Строю график...")
         chart_buf = await generate_product_chart_by_metric(sku, metric, [current_year])
         if chart_buf:
-            # Сохраняем год для переключения метрик
             context.user_data['product_year'] = current_year
             caption = f"Динамика по товару (SKU: {sku}) за {current_year} год"
             keyboard = [
@@ -2506,9 +2677,7 @@ async def product_chart_interactive_callback(update: Update, context: ContextTyp
 
     if data.startswith("change_metric_"):
         sku = data.split("_")[-1]
-        # Удаляем сообщение с графиком
         await query.message.delete()
-        # Показываем выбор метрики новым сообщением
         keyboard = [
             [InlineKeyboardButton("Заказано (₽)", callback_data=f"metric_ordered_sum")],
             [InlineKeyboardButton("Заказано (шт.)", callback_data=f"metric_ordered_units")],
@@ -2539,7 +2708,6 @@ async def product_chart_interactive_callback(update: Update, context: ContextTyp
         if not sku or not metric:
             await query.message.reply_text("❌ Ошибка: потеряны данные.")
             return ConversationHandler.END
-        # Удаляем сообщение с выбором года
         await query.message.delete()
         progress_msg = await query.message.reply_text("⏳ Строю график...")
         chart_buf = await generate_product_chart_by_metric(sku, metric, [year])
@@ -2631,7 +2799,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         return await product_chart_interactive_callback(update, context)
 
     # Обработка для настроек рассылок (только для админа)
-    if data.startswith("settings_"):
+    if data.startswith("settings_") or data.startswith("hqs_") or data.startswith("hqe_") or data.startswith("hyh_") or data.startswith("slotadd_") or data.startswith("slot_toggle_") or data.startswith("slot_delete_"):
         if not is_admin(chat_id):
             await query.edit_message_text("⛔ Только для администратора.")
             return ConversationHandler.END
@@ -3238,19 +3406,41 @@ async def dynamics_range_end(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data.pop('dynamics_range_start', None)
     return ConversationHandler.END
 
-# ---------- ПЛАНИРОВЩИК (обновлён с учётом настроек) ----------
+# ---------- ПЛАНИРОВЩИК (обновлён с учётом новых настроек) ----------
 async def scheduled_report(context):
     moscow_tz = MOSCOW_TZ
     now = datetime.datetime.now(moscow_tz)
     hour = now.hour
 
-    # Получаем список часов для отправки из настроек
-    schedule_hours = get_schedule_hours()
-    if hour not in schedule_hours:
-        return
+    settings = load_settings()
+    mode = settings.get("mode", "hourly")
+    include_yesterday = False
 
-    # Определяем, нужно ли включать вчерашний день (только для 10:00)
-    include_yesterday = (hour == 10)
+    if mode == "hourly":
+        hourly = settings.get("hourly", {})
+        quiet_start = hourly.get("quiet_start", 23)
+        quiet_end = hourly.get("quiet_end", 9)
+        yesterday_hour = hourly.get("yesterday_hour", 9)
+
+        # Проверяем тишину
+        if is_quiet_hour(hour, quiet_start, quiet_end):
+            return  # тишина, не отправляем
+
+        # Определяем, включать ли вчера
+        include_yesterday = (hour == yesterday_hour)
+
+    else:  # slots
+        slots = settings.get("slots", [])
+        found = None
+        for slot in slots:
+            if slot.get("hour") == hour:
+                found = slot
+                break
+        if not found:
+            return  # нет слота на этот час
+        include_yesterday = found.get("include_yesterday", False)
+
+    # Отправляем отчёт
     report = await format_combined_metrics_with_deltas(include_yesterday=include_yesterday, progress_callback=None)
     managers = load_managers()
     if not managers:
@@ -3310,13 +3500,12 @@ def main():
                 "• ➖ Удалить менеджера – введите Telegram ID пользователя.\n"
                 "• 📋 Список менеджеров – просмотр всех добавленных пользователей (ID, username, имя, телефон).\n\n"
                 "🔹 *Настройка рассылок*\n"
-                "• Ежечасная – включить/выключить отправку отчётов каждый час.\n"
-                "• Индивидуальные слоты – выбрать конкретные часы (0-23) для отправки (например, 10:00, 22:00).\n"
-                "  Если ежечасная выключена, отчёты будут отправляться только в выбранные слоты.\n\n"
+                "• Два режима: Ежечасный или Индивидуальные слоты.\n"
+                "• Для ежечасного: настройка интервала тишины (часы, когда отчёты не отправляются) и часа, когда включается блок «Вчера».\n"
+                "• Для слотов: добавление/удаление конкретных часов и независимый флаг «Вчера» для каждого.\n\n"
                 "🔹 *Автоматические отчёты*\n"
-                "• В 10:00 МСК – отчёт с блоками «Вчера», «Сегодня» и «Текущий месяц».\n"
-                "• В 22:00 МСК – отчёт с блоками «Сегодня» и «Текущий месяц».\n"
-                "• Дополнительные слоты настраиваются в разделе администрирования.\n\n"
+                "• Отправляются согласно выбранным настройкам.\n"
+                "• Блок «Вчера» включается только если установлен соответствующий флаг.\n\n"
                 "🔹 *Метрики*\n"
                 "• 🛒 Заказано – сумма и количество всех заказов.\n"
                 "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
@@ -3341,9 +3530,7 @@ def main():
                 "• 📈 Динамика продаж – график доставленных заказов по месяцам за выбранный год (или несколько лет).\n"
                 "• 📈 Динамика по товару – график продаж конкретного товара по месяцам.\n\n"
                 "🔹 *Автоматические отчёты*\n"
-                "• В 10:00 МСК – отчёт с блоками «Вчера», «Сегодня» и «Текущий месяц».\n"
-                "• В 22:00 МСК – отчёт с блоками «Сегодня» и «Текущий месяц».\n"
-                "• Дополнительные слоты настраиваются администратором.\n\n"
+                "• Отправляются согласно настройкам администратора.\n\n"
                 "🔹 *Метрики*\n"
                 "• 🛒 Заказано – сумма и количество всех заказов.\n"
                 "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
@@ -3366,12 +3553,15 @@ def main():
     application.add_handler(MessageHandler(filters.Text(["📅 Топ товаров за сегодня", "📆 Выбрать дату (товары)", "📊 Выбрать период (товары)", "📈 Динамика по товару", "🔙 Назад"]), handle_products_reports))
     application.add_handler(MessageHandler(filters.Text(["📋 Список менеджеров", "🔙 Назад", "⚙️ Настройка рассылок"]), handle_admin_menu))
 
-    # Диалог настроек рассылок (использует callback)
+    # Диалог настроек рассылок (обновлён)
     settings_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("⚙️ Настройка рассылок"), handle_admin_menu)],
         states={
-            WAITING_SETTINGS: [CallbackQueryHandler(settings_callback, pattern="^settings_")],
-            WAITING_SETTINGS_SLOTS: [CallbackQueryHandler(settings_callback, pattern="^settings_")],
+            WAITING_SETTINGS: [CallbackQueryHandler(settings_callback, pattern="^(settings_|hqs_|hqe_|hyh_|slotadd_|slot_toggle_|slot_delete_)")],
+            WAITING_SETTINGS_HOURLY_QUIET_START: [CallbackQueryHandler(settings_callback, pattern="^hqs_")],
+            WAITING_SETTINGS_HOURLY_QUIET_END: [CallbackQueryHandler(settings_callback, pattern="^hqe_")],
+            WAITING_SETTINGS_HOURLY_YESTERDAY_HOUR: [CallbackQueryHandler(settings_callback, pattern="^hyh_")],
+            WAITING_SETTINGS_SLOTS_ADD: [CallbackQueryHandler(settings_callback, pattern="^slotadd_")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
