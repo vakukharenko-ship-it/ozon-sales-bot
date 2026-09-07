@@ -5,27 +5,40 @@ import time
 import re
 import calendar
 import asyncio
-import aiohttp
 import warnings
 import sys
 from typing import Optional, List, Tuple, Dict
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, ContextTypes, MessageHandler,
-    filters, ConversationHandler, CallbackQueryHandler
-)
-from telegram.warnings import PTBUserWarning
 
-# Графики
-import matplotlib.pyplot as plt
-import io
-from matplotlib.dates import MonthLocator, DateFormatter
-import matplotlib.dates as mdates
+# Проверка наличия обязательных внешних модулей
+try:
+    import aiohttp
+except ImportError:
+    print("❌ Критическая ошибка: модуль 'aiohttp' не установлен. Установите зависимости из requirements.txt")
+    sys.exit(1)
+
+try:
+    from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram.ext import (
+        Application, CommandHandler, ContextTypes, MessageHandler,
+        filters, ConversationHandler, CallbackQueryHandler
+    )
+    from telegram.warnings import PTBUserWarning
+except ImportError:
+    print("❌ Критическая ошибка: модуль 'python-telegram-bot' не установлен. Установите зависимости из requirements.txt")
+    sys.exit(1)
+
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    from matplotlib.dates import MonthLocator, DateFormatter
+except ImportError:
+    print("❌ Критическая ошибка: модуль 'matplotlib' не установлен. Установите зависимости из requirements.txt")
+    sys.exit(1)
 
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ БОТА ====================
-VERSION = "2.1.5"  # Добавлена настройка рассылок (ежечасная и индивидуальные слоты)
+VERSION = "2.1.6"  # Добавлена проверка наличия зависимостей при старте
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
@@ -104,7 +117,7 @@ WAITING_PRODUCT_PERIOD_CHOICE = 32
 WAITING_PRODUCT_SINGLE_YEAR = 33
 WAITING_PRODUCT_RANGE_START = 34
 WAITING_PRODUCT_RANGE_END = 35
-# Новые состояния для настроек рассылок
+# Состояния для настроек рассылок
 WAITING_SETTINGS = 40
 WAITING_SETTINGS_HOURLY = 41
 WAITING_SETTINGS_SLOTS = 42
