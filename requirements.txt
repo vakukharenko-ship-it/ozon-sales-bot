@@ -1,6 +1,9 @@
-python-telegram-bot[job-queue]==20.6
+python-telegram-bot==20.6
 aiohttp
 aiodns
 cchardet
 matplotlib
 Pillow
+python-dotenv
+python-dateutil
+numpy
