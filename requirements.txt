@@ -2,3 +2,4 @@ python-telegram-bot[job-queue]==20.6
 requests
 matplotlib
 Pillow
+aiohttp==3.9.1
