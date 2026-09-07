@@ -1,5 +1,3 @@
-from dotenv import load_dotenv
-load_dotenv()
 import datetime
 import json
 import os
@@ -7,6 +5,7 @@ import time
 import re
 import calendar
 import asyncio
+import aiohttp
 import warnings
 import sys
 from typing import Optional, List, Tuple, Dict
