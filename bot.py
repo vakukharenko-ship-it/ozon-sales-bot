@@ -25,8 +25,8 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ И ИСТОРИЯ ====================
-VERSION = "2.3.2"
-CHANGELOG_MESSAGE = "Исправлен формат дат для финансового API (использование Z), добавлен company_id, улучшено логирование ошибок"
+VERSION = "2.3.3"
+CHANGELOG_MESSAGE = "Добавлено логирование тела ответа при ошибках финансового API"
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
@@ -589,10 +589,10 @@ async def api_request_with_retry(url, headers, payload=None, method='POST'):
                     resp.raise_for_status()
                     return await resp.json()
         except aiohttp.ClientResponseError as e:
-            # Попытка прочитать тело ответа
+            # Читаем тело ответа для диагностики
             try:
                 body = await e.response.text()
-                write_log(f"❌ API error {e.status}: {e.message}, тело: {body[:500]}")
+                write_log(f"❌ API error {e.status}: {e.message}, тело: {body[:1000]}")
             except:
                 write_log(f"❌ API error {e.status}: {e.message}")
             if attempt == API_RETRY_ATTEMPTS - 1:
