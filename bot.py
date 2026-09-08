@@ -26,7 +26,7 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ БОТА ====================
-VERSION = "2.2.5"  # Исправлено добавление времени (отправка нового сообщения, логи)
+VERSION = "2.2.6"  # Исправлено добавление времени (редактирование сообщения)
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
@@ -2125,8 +2125,8 @@ async def settings_callback_query(update: Update, context: ContextTypes.DEFAULT_
 
     if data == "add_time":
         await query.answer()
-        # Отправляем новое сообщение с просьбой ввести время, а не редактируем старое
-        await query.message.reply_text("⏰ Введите время в формате HH:MM (например, 09:00):")
+        # Редактируем текущее сообщение, чтобы пользователь ввел время
+        await query.edit_message_text("⏰ Введите время в формате HH:MM (например, 09:00):", reply_markup=None)
         write_log(f"🔔 Возвращаем WAITING_INDIVIDUAL_TIME для пользователя {chat_id}")
         return WAITING_INDIVIDUAL_TIME
 
