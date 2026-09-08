@@ -71,7 +71,7 @@ ADMIN_CHAT_ID = int(ADMIN_CHAT_ID_STR) if ADMIN_CHAT_ID_STR and ADMIN_CHAT_ID_ST
 OZON_COMPANY_ID = os.getenv("OZON_COMPANY_ID")  # необязательный параметр
 
 OZON_POSTING_FBO_URL = "https://api-seller.ozon.ru/v2/posting/fbo/list"
-OZON_FINANCE_URL = "https://api-seller.ozon.ru/v1/finance/transaction/list"
+OZON_FINANCE_URL = "https://api-seller.ozon.ru/v1/finance/accrual/postings"
 MANAGERS_FILE = "managers.json"
 
 # Состояния для диалогов (оставлены без изменений)
@@ -1719,7 +1719,43 @@ async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Нет доступа.")
         return
     await update.message.reply_text(f"🤖 Версия бота: {VERSION}")
+async def test_finance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not has_access(chat_id):
+        await update.message.reply_text("❌ Нет доступа.")
+        return
+    await update.message.reply_text("⏳ Делаю тестовый запрос к новому финансовому API...")
+    
+    headers = {
+        "Client-Id": OZON_CLIENT_ID,
+        "Api-Key": OZON_API_KEY,
+        "Content-Type": "application/json",
+    }
+    # Берём текущую дату и предыдущий день
+    today = get_moscow_today()
+    date_from = (today - datetime.timedelta(days=1)).isoformat()
+    date_to = today.isoformat()
+    
+    payload = {
+        "date_from": date_from,
+        "date_to": date_to,
+        "limit": 5,
+        "offset": 0,
+    }
+    
+    try:
+        data = await api_request_with_retry(OZON_FINANCE_URL, headers, payload, method='POST')
+        # Логируем весь ответ в лог-файл
+        write_log(f"🔍 Ответ от нового API: {json.dumps(data, ensure_ascii=False, indent=2)[:2000]}")
+        # Отправляем пользователю часть ответа
+        msg = f"✅ Запрос выполнен. В лог записан ответ.\nПервые 1000 символов:\n\n{json.dumps(data, ensure_ascii=False, indent=2)[:1000]}"
+        await update.message.reply_text(msg)
+    except Exception as e:
+        write_log(f"❌ Ошибка тестового запроса: {e}")
+        await update.message.reply_text(f"❌ Ошибка: {e}")
 
+# Добавляем обработчик команды
+application.add_handler(CommandHandler("testfinance", test_finance_command))
 # ---------- КЛАВИАТУРЫ ДЛЯ МЕНЮ ----------
 def main_admin_keyboard():
     buttons = [
