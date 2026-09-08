@@ -744,34 +744,27 @@ async def fetch_finance_transactions_parallel(date_from: str, date_to: str) -> L
         "Content-Type": "application/json",
     }
 
-    # Используем формат +00:00 вместо Z
-    from_iso = date_from + "T00:00:00.000+00:00"
-    to_iso = date_to + "T23:59:59.999+00:00"
-
-    # Опционально: если есть company_id, можно добавить
-    # company_id = os.getenv("OZON_COMPANY_ID")
-    # if company_id:
-    #     payload_extra = {"company_id": company_id}
-    # else:
-    payload_extra = {}
+    # Формат даты по спецификации Ozon: YYYY-MM-DDThh:mm:ss.sssZ
+    from_iso = date_from + "T00:00:00.000Z"
+    to_iso = date_to + "T23:59:59.999Z"
 
     payload_first = {
         "filter": {"date": {"from": from_iso, "to": to_iso}},
         "page": 1,
         "page_size": 1000,
-        **payload_extra
     }
 
     try:
         first_data = await api_request_with_retry(OZON_FINANCE_URL, headers, payload_first, method='POST')
     except Exception as e:
         write_log(f"❌ Ошибка получения первой страницы финансов: {e}")
-        if hasattr(e, 'response') and e.response:
-            try:
+        # Логируем тело ответа, если возможно
+        try:
+            if hasattr(e, 'response') and e.response:
                 body = await e.response.text()
                 write_log(f"Тело ответа: {body}")
-            except:
-                pass
+        except:
+            pass
         return []
 
     result = first_data.get("result", {})
@@ -790,7 +783,6 @@ async def fetch_finance_transactions_parallel(date_from: str, date_to: str) -> L
                 "filter": {"date": {"from": from_iso, "to": to_iso}},
                 "page": page_num,
                 "page_size": 1000,
-                **payload_extra
             }
             try:
                 data = await api_request_with_retry(OZON_FINANCE_URL, headers, payload, method='POST')
@@ -2511,22 +2503,21 @@ async def schedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_reply_markup(reply_markup=keyboard)
         return WAITING_AUTO_SCHEDULE
 
-    if data == "sch_save":
-        temp = context.user_data.get('temp_schedule_hours', [])
-        settings = await load_settings()
-        settings["schedule_hours"] = temp
-        if "yesterday_report_hours" in settings:
-            settings["yesterday_report_hours"] = [h for h in settings["yesterday_report_hours"] if h in temp]
-        await save_settings(settings)
-        write_log(f"Сохранены часы рассылок: {temp}")
-        # Убираем клавиатуру
-        await query.edit_message_text(f"✅ Настройки сохранены. Часы рассылок: {', '.join(f'{h:02d}:00' for h in sorted(temp)) if temp else 'не выбраны'}", reply_markup=None)
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔕 Настроить режим тишины", callback_data="sch_go_silence")],
-            [InlineKeyboardButton("🔙 В меню", callback_data="sch_go_back")]
-        ])
-        await query.message.reply_text("Хотите настроить режим тишины?", reply_markup=keyboard)
-        return ConversationHandler.END
+   if data == "sch_save":
+    temp = context.user_data.get('temp_schedule_hours', [])
+    settings = await load_settings()
+    settings["schedule_hours"] = temp
+    if "yesterday_report_hours" in settings:
+        settings["yesterday_report_hours"] = [h for h in settings["yesterday_report_hours"] if h in temp]
+    await save_settings(settings)
+    write_log(f"Сохранены часы рассылок: {temp}")
+    await query.edit_message_text(f"✅ Настройки сохранены. Часы рассылок: {', '.join(f'{h:02d}:00' for h in sorted(temp)) if temp else 'не выбраны'}", reply_markup=None)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔕 Настроить режим тишины", callback_data="sch_go_silence")],
+        [InlineKeyboardButton("🔙 В меню", callback_data="sch_go_back")]
+    ])
+    await query.message.reply_text("Хотите настроить режим тишины?", reply_markup=keyboard)
+    return ConversationHandler.END
 
     if data == "sch_go_silence":
         await query.edit_message_text("Переход к настройке режима тишины...")
@@ -2581,15 +2572,14 @@ async def yesterday_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return WAITING_AUTO_YESTERDAY
 
     if data == "yest_save":
-        temp = context.user_data.get('temp_yesterday_hours', [])
-        settings = await load_settings()
-        settings["yesterday_report_hours"] = temp
-        await save_settings(settings)
-        write_log(f"Сохранены часы для отчёта за вчера: {temp}")
-        # Убираем клавиатуру
-        await query.edit_message_text(f"✅ Настройки сохранены. Отчёт за Вчера будет отправляться в часы: {', '.join(f'{h:02d}:00' for h in sorted(temp)) if temp else 'не выбраны'}", reply_markup=None)
-        await query.message.reply_text("🔔 *Автоматические рассылки*\n\nВыберите действие:", reply_markup=auto_reports_keyboard(), parse_mode="Markdown")
-        return ConversationHandler.END
+    temp = context.user_data.get('temp_yesterday_hours', [])
+    settings = await load_settings()
+    settings["yesterday_report_hours"] = temp
+    await save_settings(settings)
+    write_log(f"Сохранены часы для отчёта за вчера: {temp}")
+    await query.edit_message_text(f"✅ Настройки сохранены. Отчёт за Вчера будет отправляться в часы: {', '.join(f'{h:02d}:00' for h in sorted(temp)) if temp else 'не выбраны'}", reply_markup=None)
+    await query.message.reply_text("🔔 *Автоматические рассылки*\n\nВыберите действие:", reply_markup=auto_reports_keyboard(), parse_mode="Markdown")
+    return ConversationHandler.END
 
 # ---------- 3. РЕЖИМ ТИШИНЫ ----------
 async def auto_silence_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
