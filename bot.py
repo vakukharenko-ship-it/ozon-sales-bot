@@ -25,8 +25,8 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ И ИСТОРИЯ ====================
-VERSION = "2.3.0"
-CHANGELOG_MESSAGE = "Добавлен раздел 'Автоматические рассылки' с настройкой времени, отчёта за вчера, режимом тишины и принудительной отправкой."
+VERSION = "2.3.1"
+CHANGELOG_MESSAGE = "Исправлен формат дат для финансового API, исправлены отступы и ошибка Inline keyboard expected"
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
@@ -590,6 +590,13 @@ async def api_request_with_retry(url, headers, payload=None, method='POST'):
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             if attempt == API_RETRY_ATTEMPTS - 1:
                 write_log(f"❌ API request failed after {API_RETRY_ATTEMPTS} attempts: {e}")
+                # Попытка получить тело ответа
+                if hasattr(e, 'response') and e.response:
+                    try:
+                        body = await e.response.text()
+                        write_log(f"Тело ответа: {body}")
+                    except:
+                        pass
                 raise
             write_log(f"⚠️ Request failed (attempt {attempt+1}/{API_RETRY_ATTEMPTS}): {e}")
             await asyncio.sleep(API_RETRY_DELAY * (attempt + 1))
@@ -730,7 +737,7 @@ async def fetch_advertising_expense(date_from, date_to, progress_callback=None):
         await progress_callback("Реклама загружена", 100)
     return total
 
-# ---------- ФИНАНСОВЫЕ ТРАНЗАКЦИИ (параллельно) ----------
+# ---------- ФИНАНСОВЫЕ ТРАНЗАКЦИИ (исправленная версия) ----------
 async def fetch_finance_transactions_parallel(date_from: str, date_to: str) -> List[Dict]:
     today_str = get_moscow_today().isoformat()
     if date_from > today_str:
@@ -744,9 +751,9 @@ async def fetch_finance_transactions_parallel(date_from: str, date_to: str) -> L
         "Content-Type": "application/json",
     }
 
-    # Формат даты по спецификации Ozon: YYYY-MM-DDThh:mm:ss.sssZ
-    from_iso = date_from + "T00:00:00.000Z"
-    to_iso = date_to + "T23:59:59.999Z"
+    # Используем формат +00:00 (совместим с Ozon API)
+    from_iso = date_from + "T00:00:00.000+00:00"
+    to_iso = date_to + "T23:59:59.999+00:00"
 
     payload_first = {
         "filter": {"date": {"from": from_iso, "to": to_iso}},
@@ -758,13 +765,6 @@ async def fetch_finance_transactions_parallel(date_from: str, date_to: str) -> L
         first_data = await api_request_with_retry(OZON_FINANCE_URL, headers, payload_first, method='POST')
     except Exception as e:
         write_log(f"❌ Ошибка получения первой страницы финансов: {e}")
-        # Логируем тело ответа, если возможно
-        try:
-            if hasattr(e, 'response') and e.response:
-                body = await e.response.text()
-                write_log(f"Тело ответа: {body}")
-        except:
-            pass
         return []
 
     result = first_data.get("result", {})
@@ -802,6 +802,7 @@ async def fetch_finance_transactions_parallel(date_from: str, date_to: str) -> L
 
     write_log(f"💰 Загружено финансовых транзакций: {len(all_operations)} за {date_from}–{date_to} (параллельно)")
     return all_operations
+
 async def fetch_finance_transactions(date_from, date_to, progress_callback=None):
     cache_key = f"fetch_finance_transactions_{date_from}_{date_to}"
     cached = await get_from_cache(cache_key)
@@ -2503,21 +2504,21 @@ async def schedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_reply_markup(reply_markup=keyboard)
         return WAITING_AUTO_SCHEDULE
 
-   if data == "sch_save":
-    temp = context.user_data.get('temp_schedule_hours', [])
-    settings = await load_settings()
-    settings["schedule_hours"] = temp
-    if "yesterday_report_hours" in settings:
-        settings["yesterday_report_hours"] = [h for h in settings["yesterday_report_hours"] if h in temp]
-    await save_settings(settings)
-    write_log(f"Сохранены часы рассылок: {temp}")
-    await query.edit_message_text(f"✅ Настройки сохранены. Часы рассылок: {', '.join(f'{h:02d}:00' for h in sorted(temp)) if temp else 'не выбраны'}", reply_markup=None)
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔕 Настроить режим тишины", callback_data="sch_go_silence")],
-        [InlineKeyboardButton("🔙 В меню", callback_data="sch_go_back")]
-    ])
-    await query.message.reply_text("Хотите настроить режим тишины?", reply_markup=keyboard)
-    return ConversationHandler.END
+    if data == "sch_save":
+        temp = context.user_data.get('temp_schedule_hours', [])
+        settings = await load_settings()
+        settings["schedule_hours"] = temp
+        if "yesterday_report_hours" in settings:
+            settings["yesterday_report_hours"] = [h for h in settings["yesterday_report_hours"] if h in temp]
+        await save_settings(settings)
+        write_log(f"Сохранены часы рассылок: {temp}")
+        await query.edit_message_text(f"✅ Настройки сохранены. Часы рассылок: {', '.join(f'{h:02d}:00' for h in sorted(temp)) if temp else 'не выбраны'}", reply_markup=None)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔕 Настроить режим тишины", callback_data="sch_go_silence")],
+            [InlineKeyboardButton("🔙 В меню", callback_data="sch_go_back")]
+        ])
+        await query.message.reply_text("Хотите настроить режим тишины?", reply_markup=keyboard)
+        return ConversationHandler.END
 
     if data == "sch_go_silence":
         await query.edit_message_text("Переход к настройке режима тишины...")
@@ -2572,14 +2573,14 @@ async def yesterday_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return WAITING_AUTO_YESTERDAY
 
     if data == "yest_save":
-    temp = context.user_data.get('temp_yesterday_hours', [])
-    settings = await load_settings()
-    settings["yesterday_report_hours"] = temp
-    await save_settings(settings)
-    write_log(f"Сохранены часы для отчёта за вчера: {temp}")
-    await query.edit_message_text(f"✅ Настройки сохранены. Отчёт за Вчера будет отправляться в часы: {', '.join(f'{h:02d}:00' for h in sorted(temp)) if temp else 'не выбраны'}", reply_markup=None)
-    await query.message.reply_text("🔔 *Автоматические рассылки*\n\nВыберите действие:", reply_markup=auto_reports_keyboard(), parse_mode="Markdown")
-    return ConversationHandler.END
+        temp = context.user_data.get('temp_yesterday_hours', [])
+        settings = await load_settings()
+        settings["yesterday_report_hours"] = temp
+        await save_settings(settings)
+        write_log(f"Сохранены часы для отчёта за вчера: {temp}")
+        await query.edit_message_text(f"✅ Настройки сохранены. Отчёт за Вчера будет отправляться в часы: {', '.join(f'{h:02d}:00' for h in sorted(temp)) if temp else 'не выбраны'}", reply_markup=None)
+        await query.message.reply_text("🔔 *Автоматические рассылки*\n\nВыберите действие:", reply_markup=auto_reports_keyboard(), parse_mode="Markdown")
+        return ConversationHandler.END
 
 # ---------- 3. РЕЖИМ ТИШИНЫ ----------
 async def auto_silence_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
