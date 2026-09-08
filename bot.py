@@ -25,9 +25,8 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ И ИСТОРИЯ ====================
-VERSION = "2.4.0"
-CHANGELOG_MESSAGE = "Исправлен URL финансового API (v3 → v2) для устранения ошибки obsolete method"
-
+VERSION = "2.4.1"
+CHANGELOG_MESSAGE = "Попытка использовать v1 финансового API (после 404 на v2)"
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
 API_MAX_DAYS_PER_REQUEST = 90
@@ -72,7 +71,7 @@ ADMIN_CHAT_ID = int(ADMIN_CHAT_ID_STR) if ADMIN_CHAT_ID_STR and ADMIN_CHAT_ID_ST
 OZON_COMPANY_ID = os.getenv("OZON_COMPANY_ID")  # необязательный параметр
 
 OZON_POSTING_FBO_URL = "https://api-seller.ozon.ru/v2/posting/fbo/list"
-OZON_FINANCE_URL = "https://api-seller.ozon.ru/v2/finance/transaction/list"
+OZON_FINANCE_URL = "https://api-seller.ozon.ru/v1/finance/transaction/list"
 MANAGERS_FILE = "managers.json"
 
 # Состояния для диалогов (оставлены без изменений)
