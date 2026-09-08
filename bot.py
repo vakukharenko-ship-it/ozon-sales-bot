@@ -26,7 +26,7 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ БОТА ====================
-VERSION = "2.2.4"  # Исправлена запись настроек, добавлено расширенное логирование
+VERSION = "2.2.5"  # Исправлено добавление времени (отправка нового сообщения, логи)
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
@@ -2098,11 +2098,13 @@ async def settings_callback_query(update: Update, context: ContextTypes.DEFAULT_
     write_log(f"🔔 settings_callback_query: {data} от {chat_id}")
 
     if data == "settings_back":
+        await query.answer()
         await query.edit_message_text("Возврат в меню рассылок.")
         await query.message.reply_text("Настройка автоматических рассылок:", reply_markup=settings_main_keyboard())
         return ConversationHandler.END
 
     if data == "hourly_yes":
+        await query.answer()
         settings = await get_settings()
         settings["mode"] = "hourly"
         settings["hourly_enabled"] = True
@@ -2112,6 +2114,7 @@ async def settings_callback_query(update: Update, context: ContextTypes.DEFAULT_
         return WAITING_QUIET_START
 
     if data == "hourly_no":
+        await query.answer()
         settings = await get_settings()
         settings["mode"] = "hourly"
         settings["hourly_enabled"] = False
@@ -2121,10 +2124,14 @@ async def settings_callback_query(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
 
     if data == "add_time":
-        await query.edit_message_text("Введите время в формате HH:MM (например, 09:00):")
+        await query.answer()
+        # Отправляем новое сообщение с просьбой ввести время, а не редактируем старое
+        await query.message.reply_text("⏰ Введите время в формате HH:MM (например, 09:00):")
+        write_log(f"🔔 Возвращаем WAITING_INDIVIDUAL_TIME для пользователя {chat_id}")
         return WAITING_INDIVIDUAL_TIME
 
     if data == "toggle_yesterday_hourly":
+        await query.answer()
         settings = await get_settings()
         settings["yesterday_for_hourly"] = not settings.get("yesterday_for_hourly", False)
         await save_settings()
@@ -2134,6 +2141,7 @@ async def settings_callback_query(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
 
     if data.startswith("toggle_yesterday_"):
+        await query.answer()
         time_str = data.replace("toggle_yesterday_", "").replace("_", ":")
         settings = await get_settings()
         yesterday_list = settings.get("yesterday_for_individual", [])
@@ -2159,6 +2167,7 @@ async def settings_callback_query(update: Update, context: ContextTypes.DEFAULT_
         return WAITING_YESTERDAY_TOGGLE
 
     if data == "send_yesterday_now":
+        await query.answer()
         await query.edit_message_text("⏳ Формирую отчёт за Вчера...")
         report = await format_yesterday_report()
         managers = load_managers()
@@ -2180,6 +2189,7 @@ async def settings_callback_query(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
 
     if data == "edit_quiet":
+        await query.answer()
         await query.edit_message_text("Введите время начала режима тишины (HH:MM):")
         return WAITING_QUIET_START
 
