@@ -26,7 +26,7 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ БОТА ====================
-VERSION = "2.2.6"  # Исправлено добавление времени (редактирование сообщения)
+VERSION = "2.2.7"  # Исправлен фильтр для ввода времени, добавлены логи
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
@@ -2198,7 +2198,7 @@ async def settings_callback_query(update: Update, context: ContextTypes.DEFAULT_
 async def handle_individual_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
-    write_log(f"⏰ handle_individual_time_input: '{text}' от {chat_id}")
+    write_log(f"⏰ handle_individual_time_input вызван! Текст: '{text}' от {chat_id}")
 
     if not re.match(r'^\d{2}:\d{2}$', text):
         await update.message.reply_text("❌ Неверный формат. Используйте HH:MM (например, 09:00).")
@@ -3636,7 +3636,7 @@ def main():
         states={
             WAITING_HOURLY_CONFIRM: [CallbackQueryHandler(handle_callback_query)],
             WAITING_INDIVIDUAL_TIME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_individual_time_input),
+                MessageHandler(filters.Regex(r'^\d{2}:\d{2}$'), handle_individual_time_input),  # точный перехват времени
                 CallbackQueryHandler(settings_callback_query),
             ],
             WAITING_QUIET_START: [
