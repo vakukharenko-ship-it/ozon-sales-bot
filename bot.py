@@ -25,7 +25,7 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ БОТА ====================
-VERSION = "2.2.0"  # Добавлен раздел "Автоматические рассылки", исправлена инициализация сессии
+VERSION = "2.2.1"  # Исправлен планировщик: используется JobQueue с интервалом 15 минут
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
@@ -570,9 +570,7 @@ async def close_http_session(app):
 async def init_http_session_and_settings(app):
     await init_http_session(app)
     await load_settings()
-    # Запускаем фоновый планировщик
-    asyncio.create_task(scheduler_loop(app))
-    write_log("✅ Настройки загружены и планировщик запущен.")
+    write_log("✅ Настройки загружены.")
 
 # ==================== ФУНКЦИИ API С RETRY И АСИНХРОННОСТЬЮ ====================
 async def api_request_with_retry(url, headers, payload=None, method='POST'):
@@ -3359,62 +3357,62 @@ async def dynamics_range_end(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data.pop('dynamics_range_start', None)
     return ConversationHandler.END
 
-# ==================== ПЛАНИРОВЩИК АВТОМАТИЧЕСКИХ РАССЫЛОК ====================
-async def scheduler_loop(app):
-    """Фоновый цикл, проверяющий каждую минуту, не пора ли отправить отчёты."""
-    while True:
-        try:
-            settings = await get_settings()
-            now = get_current_time_msk()
-            current_time = now.strftime("%H:%M")
+# ==================== ПЛАНИРОВЩИК АВТОМАТИЧЕСКИХ РАССЫЛОК (через JobQueue) ====================
+async def scheduled_check(context: ContextTypes.DEFAULT_TYPE):
+    """Проверка каждые 15 минут, нужно ли отправить отчёт."""
+    try:
+        settings = await get_settings()
+        now = get_current_time_msk()
+        current_time = now.strftime("%H:%M")
 
-            quiet_start = settings.get("quiet_start")
-            quiet_end = settings.get("quiet_end")
-            if quiet_start and quiet_end:
-                if quiet_start < quiet_end:
-                    in_quiet = quiet_start <= current_time <= quiet_end
+        # Проверка режима тишины
+        quiet_start = settings.get("quiet_start")
+        quiet_end = settings.get("quiet_end")
+        if quiet_start and quiet_end:
+            if quiet_start < quiet_end:
+                in_quiet = quiet_start <= current_time <= quiet_end
+            else:
+                in_quiet = current_time >= quiet_start or current_time <= quiet_end
+            if in_quiet:
+                return  # тишина, не отправляем
+
+        mode = settings.get("mode", "individual")
+        to_send = []
+
+        if mode == "hourly" and settings.get("hourly_enabled", False):
+            # Ежечасная рассылка – отправляем только если минуты равны 0
+            if now.minute == 0:
+                send_yesterday = settings.get("yesterday_for_hourly", False)
+                to_send.append(("hourly", send_yesterday))
+        elif mode == "individual":
+            times = settings.get("individual_times", [])
+            if current_time in times:
+                send_yesterday = current_time in settings.get("yesterday_for_individual", [])
+                to_send.append(("individual", send_yesterday))
+
+        if to_send:
+            for _, send_yesterday in to_send:
+                if send_yesterday:
+                    report = await format_yesterday_report()
                 else:
-                    in_quiet = current_time >= quiet_start or current_time <= quiet_end
-                if in_quiet:
-                    await asyncio.sleep(60)
-                    continue
-
-            mode = settings.get("mode", "individual")
-            to_send = []
-
-            if mode == "hourly" and settings.get("hourly_enabled", False):
-                if now.minute == 0:
-                    send_yesterday = settings.get("yesterday_for_hourly", False)
-                    to_send.append(("hourly", send_yesterday))
-            elif mode == "individual":
-                times = settings.get("individual_times", [])
-                if current_time in times:
-                    send_yesterday = current_time in settings.get("yesterday_for_individual", [])
-                    to_send.append(("individual", send_yesterday))
-
-            if to_send:
-                for _, send_yesterday in to_send:
-                    if send_yesterday:
-                        report = await format_yesterday_report()
-                    else:
-                        report = await format_combined_metrics_with_deltas(include_yesterday=False)
-                    managers = load_managers()
-                    for m in managers:
-                        try:
-                            await app.bot.send_message(chat_id=m['id'], text=report, parse_mode="Markdown")
-                        except Exception as e:
-                            write_log(f"Ошибка отправки менеджеру {m['id']}: {e}")
-                    if ADMIN_CHAT_ID:
-                        try:
-                            await app.bot.send_message(chat_id=ADMIN_CHAT_ID, text=report, parse_mode="Markdown")
-                        except Exception as e:
-                            write_log(f"Ошибка отправки администратору: {e}")
-                    write_log(f"📨 Отправлен автоматический отчёт (время {current_time}, за вчера: {send_yesterday})")
-
-            await asyncio.sleep(60)
-        except Exception as e:
-            write_log(f"❌ Ошибка в планировщике: {e}")
-            await asyncio.sleep(60)
+                    report = await format_combined_metrics_with_deltas(include_yesterday=False)
+                managers = load_managers()
+                sent = 0
+                for m in managers:
+                    try:
+                        await context.bot.send_message(chat_id=m['id'], text=report, parse_mode="Markdown")
+                        sent += 1
+                    except Exception as e:
+                        write_log(f"Ошибка отправки менеджеру {m['id']}: {e}")
+                if ADMIN_CHAT_ID:
+                    try:
+                        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=report, parse_mode="Markdown")
+                        sent += 1
+                    except Exception as e:
+                        write_log(f"Ошибка отправки администратору: {e}")
+                write_log(f"📨 Автоматический отчёт отправлен {sent} получателям (время {current_time}, за вчера: {send_yesterday})")
+    except Exception as e:
+        write_log(f"❌ Ошибка в планировщике: {e}")
 
 # ---------- ЗАПУСК ----------
 def main():
@@ -3468,7 +3466,8 @@ def main():
                 "• Выбор рассылок – настройка режима (ежечасные или индивидуальные времена).\n"
                 "• Добавление отчета за Вчера – для каждого времени можно включить отправку отчёта за вчера.\n"
                 "• Режим тишины – задаётся интервал времени, в который рассылки не отправляются.\n"
-                "• Отправка происходит всем менеджерам и администратору.\n\n"
+                "• Отправка происходит всем менеджерам и администратору.\n"
+                "• Проверка расписания выполняется каждые 15 минут.\n\n"
                 "🔹 *Метрики*\n"
                 "• 🛒 Заказано – сумма и количество всех заказов.\n"
                 "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
@@ -3497,7 +3496,8 @@ def main():
                 "• Выбор рассылок – настройка режима (ежечасные или индивидуальные времена).\n"
                 "• Добавление отчета за Вчера – для каждого времени можно включить отправку отчёта за вчера.\n"
                 "• Режим тишины – задаётся интервал времени, в который рассылки не отправляются.\n"
-                "• Отправка происходит всем менеджерам и администратору.\n\n"
+                "• Отправка происходит всем менеджерам и администратору.\n"
+                "• Проверка расписания выполняется каждые 15 минут.\n\n"
                 "🔹 *Метрики*\n"
                 "• 🛒 Заказано – сумма и количество всех заказов.\n"
                 "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
@@ -3630,6 +3630,14 @@ def main():
     application.add_handler(conv_add)
     application.add_handler(conv_remove)
     application.add_handler(CallbackQueryHandler(handle_callback_query))
+
+    # Добавляем задачу в JobQueue
+    job_queue = application.job_queue
+    if job_queue:
+        job_queue.run_repeating(scheduled_check, interval=900, first=10)  # 15 минут = 900 секунд
+        write_log("✅ Планировщик автоматических рассылок запущен (проверка каждые 15 минут).")
+    else:
+        write_log("⚠️ JobQueue недоступен, автоматические рассылки не будут работать.")
 
     write_log("🚀 Бот готов.")
     application.run_polling(allowed_updates=Update.ALL_TYPES, timeout=30)
