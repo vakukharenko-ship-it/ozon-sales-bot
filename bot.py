@@ -737,41 +737,79 @@ async def fetch_finance_transactions_parallel(date_from: str, date_to: str) -> L
         return []
     if date_to > today_str:
         date_to = today_str
-    headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY, "Content-Type": "application/json"}
-    from_iso = date_from + "T00:00:00.000Z"
-    to_iso = date_to + "T23:59:59.999Z"
-    payload_first = {"filter": {"date": {"from": from_iso, "to": to_iso}}, "page": 1, "page_size": 1000}
+
+    headers = {
+        "Client-Id": OZON_CLIENT_ID,
+        "Api-Key": OZON_API_KEY,
+        "Content-Type": "application/json",
+    }
+
+    # Используем формат +00:00 вместо Z
+    from_iso = date_from + "T00:00:00.000+00:00"
+    to_iso = date_to + "T23:59:59.999+00:00"
+
+    # Опционально: если есть company_id, можно добавить
+    # company_id = os.getenv("OZON_COMPANY_ID")
+    # if company_id:
+    #     payload_extra = {"company_id": company_id}
+    # else:
+    payload_extra = {}
+
+    payload_first = {
+        "filter": {"date": {"from": from_iso, "to": to_iso}},
+        "page": 1,
+        "page_size": 1000,
+        **payload_extra
+    }
+
     try:
         first_data = await api_request_with_retry(OZON_FINANCE_URL, headers, payload_first, method='POST')
     except Exception as e:
         write_log(f"❌ Ошибка получения первой страницы финансов: {e}")
+        if hasattr(e, 'response') and e.response:
+            try:
+                body = await e.response.text()
+                write_log(f"Тело ответа: {body}")
+            except:
+                pass
         return []
+
     result = first_data.get("result", {})
     total_items = result.get("total", 0)
     all_operations = result.get("operations", [])
+
     if total_items <= 1000:
         return all_operations
+
     total_pages = (total_items + 999) // 1000
     sem = asyncio.Semaphore(10)
+
     async def fetch_page(page_num: int):
         async with sem:
-            payload = {"filter": {"date": {"from": from_iso, "to": to_iso}}, "page": page_num, "page_size": 1000}
+            payload = {
+                "filter": {"date": {"from": from_iso, "to": to_iso}},
+                "page": page_num,
+                "page_size": 1000,
+                **payload_extra
+            }
             try:
                 data = await api_request_with_retry(OZON_FINANCE_URL, headers, payload, method='POST')
                 return data.get("result", {}).get("operations", [])
             except Exception as e:
                 write_log(f"⚠️ Ошибка загрузки страницы {page_num}: {e}")
                 return []
+
     tasks = [fetch_page(p) for p in range(2, total_pages + 1)]
     results = await asyncio.gather(*tasks, return_exceptions=True)
+
     for res in results:
         if isinstance(res, list):
             all_operations.extend(res)
         elif isinstance(res, Exception):
             write_log(f"⚠️ Исключение при загрузке страницы: {res}")
+
     write_log(f"💰 Загружено финансовых транзакций: {len(all_operations)} за {date_from}–{date_to} (параллельно)")
     return all_operations
-
 async def fetch_finance_transactions(date_from, date_to, progress_callback=None):
     cache_key = f"fetch_finance_transactions_{date_from}_{date_to}"
     cached = await get_from_cache(cache_key)
@@ -2481,7 +2519,8 @@ async def schedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             settings["yesterday_report_hours"] = [h for h in settings["yesterday_report_hours"] if h in temp]
         await save_settings(settings)
         write_log(f"Сохранены часы рассылок: {temp}")
-        await query.edit_message_text(f"✅ Настройки сохранены. Часы рассылок: {', '.join(f'{h:02d}:00' for h in sorted(temp)) if temp else 'не выбраны'}")
+        # Убираем клавиатуру
+        await query.edit_message_text(f"✅ Настройки сохранены. Часы рассылок: {', '.join(f'{h:02d}:00' for h in sorted(temp)) if temp else 'не выбраны'}", reply_markup=None)
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔕 Настроить режим тишины", callback_data="sch_go_silence")],
             [InlineKeyboardButton("🔙 В меню", callback_data="sch_go_back")]
@@ -2547,7 +2586,8 @@ async def yesterday_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         settings["yesterday_report_hours"] = temp
         await save_settings(settings)
         write_log(f"Сохранены часы для отчёта за вчера: {temp}")
-        await query.edit_message_text(f"✅ Настройки сохранены. Отчёт за Вчера будет отправляться в часы: {', '.join(f'{h:02d}:00' for h in sorted(temp)) if temp else 'не выбраны'}")
+        # Убираем клавиатуру
+        await query.edit_message_text(f"✅ Настройки сохранены. Отчёт за Вчера будет отправляться в часы: {', '.join(f'{h:02d}:00' for h in sorted(temp)) if temp else 'не выбраны'}", reply_markup=None)
         await query.message.reply_text("🔔 *Автоматические рассылки*\n\nВыберите действие:", reply_markup=auto_reports_keyboard(), parse_mode="Markdown")
         return ConversationHandler.END
 
