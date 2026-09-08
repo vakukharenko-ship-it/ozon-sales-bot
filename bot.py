@@ -26,7 +26,7 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ БОТА ====================
-VERSION = "2.2.3"  # Исправлен deadlock в load_settings()
+VERSION = "2.2.4"  # Исправлена запись настроек, добавлено расширенное логирование
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
@@ -499,32 +499,36 @@ DEFAULT_SETTINGS = {
 
 async def load_settings():
     global _settings
-    # Блокировка не используется, так как save_settings() имеет свою блокировку
+    write_log("🔍 Загрузка настроек...")
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                # Заполняем недостающие ключи значениями по умолчанию
                 for key, val in DEFAULT_SETTINGS.items():
                     if key not in data:
                         data[key] = val
                 _settings = data
+                write_log(f"✅ Настройки загружены: {_settings}")
                 return
         except Exception as e:
-            write_log(f"Ошибка загрузки настроек: {e}")
+            write_log(f"❌ Ошибка загрузки настроек: {e}")
     _settings = DEFAULT_SETTINGS.copy()
+    write_log("🔄 Используются настройки по умолчанию")
     await save_settings()
 
 async def save_settings():
     global _settings
+    write_log("💾 Сохранение настроек...")
     async with _settings_lock:
         if _settings is None:
+            write_log("⚠️ Настройки не загружены, пропускаем сохранение")
             return
         try:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump(_settings, f, ensure_ascii=False, indent=2)
+            write_log(f"✅ Настройки сохранены: {_settings}")
         except Exception as e:
-            write_log(f"Ошибка сохранения настроек: {e}")
+            write_log(f"❌ Ошибка сохранения настроек: {e}")
 
 async def get_settings():
     if _settings is None:
@@ -1991,6 +1995,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def settings_main_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat_id = update.effective_chat.id
+    write_log(f"⚙️ settings_main_handler: {text} от {chat_id}")
 
     if text == "🔙 Назад":
         if is_admin(chat_id):
@@ -2043,7 +2048,6 @@ async def settings_main_handler(update: Update, context: ContextTypes.DEFAULT_TY
         settings = await get_settings()
         mode = settings.get("mode", "individual")
         if mode == "hourly":
-            # Показываем один переключатель для ежечасной рассылки
             current = settings.get("yesterday_for_hourly", False)
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("Вкл" if not current else "Выкл", callback_data="toggle_yesterday_hourly")],
@@ -2055,14 +2059,12 @@ async def settings_main_handler(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return WAITING_YESTERDAY_TOGGLE
         else:
-            # Индивидуальные времена
             times = settings.get("individual_times", [])
             yesterday_list = settings.get("yesterday_for_individual", [])
             if not times:
                 await update.message.reply_text("❌ Сначала необходимо настроить «Выбор рассылок».")
                 await update.message.reply_text("Настройка автоматических рассылок:", reply_markup=settings_main_keyboard())
                 return
-            # Формируем инлайн-клавиатуру с переключателями для каждого времени
             keyboard = []
             for t in times:
                 is_on = t in yesterday_list
@@ -2070,7 +2072,6 @@ async def settings_main_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 callback = f"toggle_yesterday_{t.replace(':', '_')}"
                 keyboard.append([InlineKeyboardButton(label, callback_data=callback)])
             keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="settings_back")])
-            # Добавляем кнопку для принудительной отправки
             keyboard.append([InlineKeyboardButton("📤 Отправить отчет за Вчера сейчас", callback_data="send_yesterday_now")])
             await update.message.reply_text(
                 "Настройка отправки отчёта за Вчера для каждого времени:",
@@ -2094,13 +2095,13 @@ async def settings_callback_query(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     data = query.data
     chat_id = update.effective_chat.id
+    write_log(f"🔔 settings_callback_query: {data} от {chat_id}")
 
     if data == "settings_back":
         await query.edit_message_text("Возврат в меню рассылок.")
         await query.message.reply_text("Настройка автоматических рассылок:", reply_markup=settings_main_keyboard())
         return ConversationHandler.END
 
-    # Обработка подтверждения ежечасной рассылки
     if data == "hourly_yes":
         settings = await get_settings()
         settings["mode"] = "hourly"
@@ -2119,12 +2120,10 @@ async def settings_callback_query(update: Update, context: ContextTypes.DEFAULT_
         await query.message.reply_text("Настройка автоматических рассылок:", reply_markup=settings_main_keyboard())
         return ConversationHandler.END
 
-    # Добавление времени в индивидуальные
     if data == "add_time":
         await query.edit_message_text("Введите время в формате HH:MM (например, 09:00):")
         return WAITING_INDIVIDUAL_TIME
 
-    # Переключение отчёта за вчера для hourly
     if data == "toggle_yesterday_hourly":
         settings = await get_settings()
         settings["yesterday_for_hourly"] = not settings.get("yesterday_for_hourly", False)
@@ -2134,7 +2133,6 @@ async def settings_callback_query(update: Update, context: ContextTypes.DEFAULT_
         await query.message.reply_text("Настройка автоматических рассылок:", reply_markup=settings_main_keyboard())
         return ConversationHandler.END
 
-    # Переключение для индивидуальных времён
     if data.startswith("toggle_yesterday_"):
         time_str = data.replace("toggle_yesterday_", "").replace("_", ":")
         settings = await get_settings()
@@ -2145,7 +2143,6 @@ async def settings_callback_query(update: Update, context: ContextTypes.DEFAULT_
             yesterday_list.append(time_str)
         settings["yesterday_for_individual"] = yesterday_list
         await save_settings()
-        # Обновляем сообщение
         times = settings.get("individual_times", [])
         keyboard = []
         for t in times:
@@ -2161,7 +2158,6 @@ async def settings_callback_query(update: Update, context: ContextTypes.DEFAULT_
         )
         return WAITING_YESTERDAY_TOGGLE
 
-    # Принудительная отправка отчёта за вчера
     if data == "send_yesterday_now":
         await query.edit_message_text("⏳ Формирую отчёт за Вчера...")
         report = await format_yesterday_report()
@@ -2183,7 +2179,6 @@ async def settings_callback_query(update: Update, context: ContextTypes.DEFAULT_
         await query.message.reply_text("Настройка автоматических рассылок:", reply_markup=settings_main_keyboard())
         return ConversationHandler.END
 
-    # Редактирование режима тишины
     if data == "edit_quiet":
         await query.edit_message_text("Введите время начала режима тишины (HH:MM):")
         return WAITING_QUIET_START
@@ -2193,10 +2188,11 @@ async def settings_callback_query(update: Update, context: ContextTypes.DEFAULT_
 async def handle_individual_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
+    write_log(f"⏰ handle_individual_time_input: '{text}' от {chat_id}")
+
     if not re.match(r'^\d{2}:\d{2}$', text):
         await update.message.reply_text("❌ Неверный формат. Используйте HH:MM (например, 09:00).")
         return WAITING_INDIVIDUAL_TIME
-    # Проверка корректности часов и минут
     try:
         datetime.datetime.strptime(text, "%H:%M")
     except ValueError:
@@ -2204,6 +2200,8 @@ async def handle_individual_time_input(update: Update, context: ContextTypes.DEF
         return WAITING_INDIVIDUAL_TIME
 
     settings = await get_settings()
+    write_log(f"🔍 Текущие настройки перед добавлением: {settings}")
+
     times = settings.get("individual_times", [])
     if text in times:
         await update.message.reply_text("⚠️ Это время уже добавлено.")
@@ -2212,10 +2210,11 @@ async def handle_individual_time_input(update: Update, context: ContextTypes.DEF
         times.sort()
         settings["individual_times"] = times
         settings["mode"] = "individual"
+        write_log(f"💾 Сохраняем настройки: {settings}")
         await save_settings()
         await update.message.reply_text(f"✅ Время {text} добавлено.")
+        write_log(f"✅ Время {text} добавлено, настройки сохранены.")
 
-    # Показать обновлённый список
     if times:
         lines = ["⏰ Текущие времена:"]
         for t in times:
@@ -2229,6 +2228,7 @@ async def handle_individual_time_input(update: Update, context: ContextTypes.DEF
         [InlineKeyboardButton("🔙 Назад", callback_data="settings_back")]
     ])
     await update.message.reply_text("Выберите действие:", reply_markup=keyboard)
+    write_log("✅ Ответ на ввод времени отправлен, возвращаем WAITING_INDIVIDUAL_TIME")
     return WAITING_INDIVIDUAL_TIME
 
 async def handle_quiet_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3436,11 +3436,13 @@ async def scheduler_loop(bot):
 # ---------- ЗАПУСК ----------
 async def on_startup(app):
     """Выполняется при старте бота: инициализация HTTP-сессии, загрузка настроек, запуск планировщика."""
+    write_log("🔧 on_startup: начало")
     await init_http_session(app)
     await load_settings()
     write_log("✅ Настройки загружены.")
     asyncio.create_task(scheduler_loop(app.bot))
     write_log("✅ Планировщик автоматических рассылок запущен.")
+    write_log("🔧 on_startup: завершён")
 
 def main():
     if not validate_env_vars():
