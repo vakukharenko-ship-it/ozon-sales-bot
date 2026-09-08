@@ -25,8 +25,8 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ И ИСТОРИЯ ====================
-VERSION = "2.3.4"
-CHANGELOG_MESSAGE = "Добавлено логирование payload и тела ответа для финансового API"
+VERSION = "2.3.5"
+CHANGELOG_MESSAGE = "Исправлено чтение тела ответа при ошибках финансового API"
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
@@ -577,7 +577,13 @@ async def api_request_with_retry(url, headers, payload=None, method='POST'):
                         write_log(f"⚠️ Rate limit hit, waiting {wait_time}s...")
                         await asyncio.sleep(wait_time)
                         continue
-                    resp.raise_for_status()
+                    if resp.status >= 400:
+                        try:
+                            body = await resp.text()
+                            write_log(f"❌ API error {resp.status}, тело: {body[:1000]}")
+                        except:
+                            write_log(f"❌ API error {resp.status}, не удалось прочитать тело")
+                        resp.raise_for_status()
                     return await resp.json()
             else:
                 async with _http_session.get(url, headers=headers, params=payload) as resp:
@@ -586,18 +592,14 @@ async def api_request_with_retry(url, headers, payload=None, method='POST'):
                         write_log(f"⚠️ Rate limit hit, waiting {wait_time}s...")
                         await asyncio.sleep(wait_time)
                         continue
-                    resp.raise_for_status()
+                    if resp.status >= 400:
+                        try:
+                            body = await resp.text()
+                            write_log(f"❌ API error {resp.status}, тело: {body[:1000]}")
+                        except:
+                            write_log(f"❌ API error {resp.status}, не удалось прочитать тело")
+                        resp.raise_for_status()
                     return await resp.json()
-        except aiohttp.ClientResponseError as e:
-            try:
-                body = await e.response.text()
-                write_log(f"❌ API error {e.status}: {e.message}, тело: {body[:1000]}")
-            except Exception as read_err:
-                write_log(f"❌ API error {e.status}: {e.message}, не удалось прочитать тело: {read_err}")
-            if attempt == API_RETRY_ATTEMPTS - 1:
-                raise
-            write_log(f"⚠️ Request failed (attempt {attempt+1}/{API_RETRY_ATTEMPTS}), retrying...")
-            await asyncio.sleep(API_RETRY_DELAY * (attempt + 1))
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             if attempt == API_RETRY_ATTEMPTS - 1:
                 write_log(f"❌ API request failed after {API_RETRY_ATTEMPTS} attempts: {e}")
