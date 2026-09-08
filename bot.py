@@ -25,8 +25,8 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ И ИСТОРИЯ ====================
-VERSION = "2.3.1"
-CHANGELOG_MESSAGE = "Исправлен формат дат для финансового API, исправлены отступы и ошибка Inline keyboard expected"
+VERSION = "2.3.2"
+CHANGELOG_MESSAGE = "Исправлен формат дат для финансового API (использование Z), добавлен company_id, улучшено логирование ошибок"
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
@@ -69,12 +69,13 @@ OZON_PERFORMANCE_CLIENT_SECRET = os.getenv("OZON_PERFORMANCE_CLIENT_SECRET")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID_STR = os.getenv("ADMIN_CHAT_ID")
 ADMIN_CHAT_ID = int(ADMIN_CHAT_ID_STR) if ADMIN_CHAT_ID_STR and ADMIN_CHAT_ID_STR.isdigit() else 0
+OZON_COMPANY_ID = os.getenv("OZON_COMPANY_ID")  # необязательный параметр
 
 OZON_POSTING_FBO_URL = "https://api-seller.ozon.ru/v2/posting/fbo/list"
 OZON_FINANCE_URL = "https://api-seller.ozon.ru/v3/finance/transaction/list"
 MANAGERS_FILE = "managers.json"
 
-# Состояния для диалогов
+# Состояния для диалогов (оставлены без изменений)
 WAITING_DATE_SINGLE = 1
 WAITING_PERIOD_TYPE = 2
 WAITING_PERIOD_START = 3
@@ -587,16 +588,20 @@ async def api_request_with_retry(url, headers, payload=None, method='POST'):
                         continue
                     resp.raise_for_status()
                     return await resp.json()
+        except aiohttp.ClientResponseError as e:
+            # Попытка прочитать тело ответа
+            try:
+                body = await e.response.text()
+                write_log(f"❌ API error {e.status}: {e.message}, тело: {body[:500]}")
+            except:
+                write_log(f"❌ API error {e.status}: {e.message}")
+            if attempt == API_RETRY_ATTEMPTS - 1:
+                raise
+            write_log(f"⚠️ Request failed (attempt {attempt+1}/{API_RETRY_ATTEMPTS}), retrying...")
+            await asyncio.sleep(API_RETRY_DELAY * (attempt + 1))
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             if attempt == API_RETRY_ATTEMPTS - 1:
                 write_log(f"❌ API request failed after {API_RETRY_ATTEMPTS} attempts: {e}")
-                # Попытка получить тело ответа
-                if hasattr(e, 'response') and e.response:
-                    try:
-                        body = await e.response.text()
-                        write_log(f"Тело ответа: {body}")
-                    except:
-                        pass
                 raise
             write_log(f"⚠️ Request failed (attempt {attempt+1}/{API_RETRY_ATTEMPTS}): {e}")
             await asyncio.sleep(API_RETRY_DELAY * (attempt + 1))
@@ -737,7 +742,7 @@ async def fetch_advertising_expense(date_from, date_to, progress_callback=None):
         await progress_callback("Реклама загружена", 100)
     return total
 
-# ---------- ФИНАНСОВЫЕ ТРАНЗАКЦИИ (исправленная версия) ----------
+# ---------- ФИНАНСОВЫЕ ТРАНЗАКЦИИ (ИСПРАВЛЕННАЯ ВЕРСИЯ) ----------
 async def fetch_finance_transactions_parallel(date_from: str, date_to: str) -> List[Dict]:
     today_str = get_moscow_today().isoformat()
     if date_from > today_str:
@@ -751,18 +756,22 @@ async def fetch_finance_transactions_parallel(date_from: str, date_to: str) -> L
         "Content-Type": "application/json",
     }
 
-    # Используем формат +00:00 (совместим с Ozon API)
-    from_iso = date_from + "T00:00:00.000+00:00"
-    to_iso = date_to + "T23:59:59.999+00:00"
+    # Используем формат с Z (UTC)
+    from_iso = date_from + "T00:00:00.000Z"
+    to_iso = date_to + "T23:59:59.999Z"
 
-    payload_first = {
+    # Добавляем company_id, если он задан в переменных окружения
+    payload = {
         "filter": {"date": {"from": from_iso, "to": to_iso}},
         "page": 1,
         "page_size": 1000,
     }
+    if OZON_COMPANY_ID:
+        payload["company_id"] = OZON_COMPANY_ID
+        write_log(f"ℹ️ Используем company_id: {OZON_COMPANY_ID}")
 
     try:
-        first_data = await api_request_with_retry(OZON_FINANCE_URL, headers, payload_first, method='POST')
+        first_data = await api_request_with_retry(OZON_FINANCE_URL, headers, payload, method='POST')
     except Exception as e:
         write_log(f"❌ Ошибка получения первой страницы финансов: {e}")
         return []
@@ -779,13 +788,15 @@ async def fetch_finance_transactions_parallel(date_from: str, date_to: str) -> L
 
     async def fetch_page(page_num: int):
         async with sem:
-            payload = {
+            p = {
                 "filter": {"date": {"from": from_iso, "to": to_iso}},
                 "page": page_num,
                 "page_size": 1000,
             }
+            if OZON_COMPANY_ID:
+                p["company_id"] = OZON_COMPANY_ID
             try:
-                data = await api_request_with_retry(OZON_FINANCE_URL, headers, payload, method='POST')
+                data = await api_request_with_retry(OZON_FINANCE_URL, headers, p, method='POST')
                 return data.get("result", {}).get("operations", [])
             except Exception as e:
                 write_log(f"⚠️ Ошибка загрузки страницы {page_num}: {e}")
@@ -3358,6 +3369,10 @@ def main():
     write_log(f"✅ OZON_API_KEY: {mask_secret(OZON_API_KEY)}")
     write_log(f"✅ TELEGRAM_BOT_TOKEN: {mask_secret(TELEGRAM_BOT_TOKEN)}")
     write_log(f"✅ ADMIN_CHAT_ID: {ADMIN_CHAT_ID}")
+    if OZON_COMPANY_ID:
+        write_log(f"ℹ️ OZON_COMPANY_ID: {mask_secret(OZON_COMPANY_ID)} (будет передан в финансовый API)")
+    else:
+        write_log("ℹ️ OZON_COMPANY_ID не задан (необязательный параметр)")
     if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
         write_log("⚠️ ВНИМАНИЕ: OZON_PERFORMANCE_CLIENT_ID или CLIENT_SECRET не заданы. Рекламные расходы не будут отображаться.")
     else:
