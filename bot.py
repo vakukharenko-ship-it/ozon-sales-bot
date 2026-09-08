@@ -25,7 +25,7 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ БОТА ====================
-VERSION = "2.2.0"  # Добавлен раздел "Автоматические рассылки", удалён старый планировщик
+VERSION = "2.2.0"  # Добавлен раздел "Автоматические рассылки", исправлена инициализация сессии
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
@@ -503,7 +503,6 @@ async def load_settings():
             try:
                 with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    # Заполняем недостающие ключи значениями по умолчанию
                     for key, val in DEFAULT_SETTINGS.items():
                         if key not in data:
                             data[key] = val
@@ -566,6 +565,14 @@ async def close_http_session(app):
     if _http_session:
         await _http_session.close()
         write_log("🔒 HTTP-сессия закрыта.")
+
+# ==================== ОБЪЕДИНЁННАЯ ИНИЦИАЛИЗАЦИЯ ====================
+async def init_http_session_and_settings(app):
+    await init_http_session(app)
+    await load_settings()
+    # Запускаем фоновый планировщик
+    asyncio.create_task(scheduler_loop(app))
+    write_log("✅ Настройки загружены и планировщик запущен.")
 
 # ==================== ФУНКЦИИ API С RETRY И АСИНХРОННОСТЬЮ ====================
 async def api_request_with_retry(url, headers, payload=None, method='POST'):
@@ -2041,7 +2048,6 @@ async def settings_main_handler(update: Update, context: ContextTypes.DEFAULT_TY
         settings = await get_settings()
         mode = settings.get("mode", "individual")
         if mode == "hourly":
-            # Показываем один переключатель для ежечасной рассылки
             current = settings.get("yesterday_for_hourly", False)
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("Вкл" if not current else "Выкл", callback_data="toggle_yesterday_hourly")],
@@ -2053,14 +2059,12 @@ async def settings_main_handler(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return WAITING_YESTERDAY_TOGGLE
         else:
-            # Индивидуальные времена
             times = settings.get("individual_times", [])
             yesterday_list = settings.get("yesterday_for_individual", [])
             if not times:
                 await update.message.reply_text("❌ Сначала необходимо настроить «Выбор рассылок».")
                 await update.message.reply_text("Настройка автоматических рассылок:", reply_markup=settings_main_keyboard())
                 return
-            # Формируем инлайн-клавиатуру с переключателями для каждого времени
             keyboard = []
             for t in times:
                 is_on = t in yesterday_list
@@ -2068,7 +2072,6 @@ async def settings_main_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 callback = f"toggle_yesterday_{t.replace(':', '_')}"
                 keyboard.append([InlineKeyboardButton(label, callback_data=callback)])
             keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="settings_back")])
-            # Добавляем кнопку для принудительной отправки
             keyboard.append([InlineKeyboardButton("📤 Отправить отчет за Вчера сейчас", callback_data="send_yesterday_now")])
             await update.message.reply_text(
                 "Настройка отправки отчёта за Вчера для каждого времени:",
@@ -2098,7 +2101,6 @@ async def settings_callback_query(update: Update, context: ContextTypes.DEFAULT_
         await query.message.reply_text("Настройка автоматических рассылок:", reply_markup=settings_main_keyboard())
         return ConversationHandler.END
 
-    # Обработка подтверждения ежечасной рассылки
     if data == "hourly_yes":
         settings = await get_settings()
         settings["mode"] = "hourly"
@@ -2117,12 +2119,10 @@ async def settings_callback_query(update: Update, context: ContextTypes.DEFAULT_
         await query.message.reply_text("Настройка автоматических рассылок:", reply_markup=settings_main_keyboard())
         return ConversationHandler.END
 
-    # Добавление времени в индивидуальные
     if data == "add_time":
         await query.edit_message_text("Введите время в формате HH:MM (например, 09:00):")
         return WAITING_INDIVIDUAL_TIME
 
-    # Переключение отчёта за вчера для hourly
     if data == "toggle_yesterday_hourly":
         settings = await get_settings()
         settings["yesterday_for_hourly"] = not settings.get("yesterday_for_hourly", False)
@@ -2132,7 +2132,6 @@ async def settings_callback_query(update: Update, context: ContextTypes.DEFAULT_
         await query.message.reply_text("Настройка автоматических рассылок:", reply_markup=settings_main_keyboard())
         return ConversationHandler.END
 
-    # Переключение для индивидуальных времён
     if data.startswith("toggle_yesterday_"):
         time_str = data.replace("toggle_yesterday_", "").replace("_", ":")
         settings = await get_settings()
@@ -2143,7 +2142,6 @@ async def settings_callback_query(update: Update, context: ContextTypes.DEFAULT_
             yesterday_list.append(time_str)
         settings["yesterday_for_individual"] = yesterday_list
         await save_settings()
-        # Обновляем сообщение
         times = settings.get("individual_times", [])
         keyboard = []
         for t in times:
@@ -2159,7 +2157,6 @@ async def settings_callback_query(update: Update, context: ContextTypes.DEFAULT_
         )
         return WAITING_YESTERDAY_TOGGLE
 
-    # Принудительная отправка отчёта за вчера
     if data == "send_yesterday_now":
         await query.edit_message_text("⏳ Формирую отчёт за Вчера...")
         report = await format_yesterday_report()
@@ -2181,7 +2178,6 @@ async def settings_callback_query(update: Update, context: ContextTypes.DEFAULT_
         await query.message.reply_text("Настройка автоматических рассылок:", reply_markup=settings_main_keyboard())
         return ConversationHandler.END
 
-    # Редактирование режима тишины
     if data == "edit_quiet":
         await query.edit_message_text("Введите время начала режима тишины (HH:MM):")
         return WAITING_QUIET_START
@@ -2194,7 +2190,6 @@ async def handle_individual_time_input(update: Update, context: ContextTypes.DEF
     if not re.match(r'^\d{2}:\d{2}$', text):
         await update.message.reply_text("❌ Неверный формат. Используйте HH:MM (например, 09:00).")
         return WAITING_INDIVIDUAL_TIME
-    # Проверка корректности часов и минут
     try:
         datetime.datetime.strptime(text, "%H:%M")
     except ValueError:
@@ -2213,7 +2208,6 @@ async def handle_individual_time_input(update: Update, context: ContextTypes.DEF
         await save_settings()
         await update.message.reply_text(f"✅ Время {text} добавлено.")
 
-    # Показать обновлённый список
     if times:
         lines = ["⏰ Текущие времена:"]
         for t in times:
@@ -2764,15 +2758,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("❌ Нет доступа! Обратитесь к администратору.")
         return ConversationHandler.END
 
-    # Обработка для интерактивных графиков
     if data.startswith("change_metric_") or data.startswith("change_year_") or data.startswith("year_") or data == "product_chart_back":
         return await product_chart_interactive_callback(update, context)
 
-    # Обработка настроек автоматических рассылок
     if data in ("hourly_yes", "hourly_no", "add_time", "toggle_yesterday_hourly", "send_yesterday_now", "edit_quiet", "settings_back") or data.startswith("toggle_yesterday_"):
         return await settings_callback_query(update, context)
 
-    # Обработка выбора даты (продажи)
     if data.startswith("date_"):
         if data == "date_cancel":
             await query.edit_message_text("Выбор даты отменён.")
@@ -2814,7 +2805,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("❌ Ошибка формата даты.")
             return WAITING_DATE_SINGLE
 
-    # Обработка выбора периода (продажи)
     if data == "period_month":
         current_year = get_moscow_today().year
         years = list(range(current_year - 9, current_year + 1))
@@ -3042,7 +3032,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("❌ Ошибка формата даты.")
             return WAITING_PERIOD_END
 
-    # Динамика продаж (график)
     if data == "dynamics_current":
         await query.edit_message_text("⏳ Загружаю данные...")
         current_year = get_moscow_today().year
@@ -3082,7 +3071,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("Выберите действие:", reply_markup=sales_reports_keyboard())
         return ConversationHandler.END
 
-    # ---------- ТОВАРНЫЕ ОТЧЁТЫ (inline) ----------
     if data.startswith("pdate_"):
         if data == "pdate_cancel":
             await query.edit_message_text("Выбор даты отменён.")
@@ -3125,7 +3113,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("❌ Ошибка формата даты.")
             return WAITING_PRODUCT_DATE
 
-    # Периоды товаров
     if data == "pmonth":
         current_year = get_moscow_today().year
         years = list(range(current_year - 9, current_year + 1))
@@ -3319,7 +3306,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("❌ Ошибка формата даты.")
             return WAITING_PRODUCT_PERIOD_END
 
-    # ---------- ДИНАМИКА ПО ТОВАРУ ----------
     if data.startswith("prod_"):
         return await product_select_callback(update, context)
     if data.startswith("metric_"):
@@ -3374,7 +3360,7 @@ async def dynamics_range_end(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 # ==================== ПЛАНИРОВЩИК АВТОМАТИЧЕСКИХ РАССЫЛОК ====================
-async def scheduler_loop(context: ContextTypes.DEFAULT_TYPE):
+async def scheduler_loop(app):
     """Фоновый цикл, проверяющий каждую минуту, не пора ли отправить отчёты."""
     while True:
         try:
@@ -3382,11 +3368,9 @@ async def scheduler_loop(context: ContextTypes.DEFAULT_TYPE):
             now = get_current_time_msk()
             current_time = now.strftime("%H:%M")
 
-            # Проверка режима тишины
             quiet_start = settings.get("quiet_start")
             quiet_end = settings.get("quiet_end")
             if quiet_start and quiet_end:
-                # Если интервал пересекает полночь
                 if quiet_start < quiet_end:
                     in_quiet = quiet_start <= current_time <= quiet_end
                 else:
@@ -3399,9 +3383,7 @@ async def scheduler_loop(context: ContextTypes.DEFAULT_TYPE):
             to_send = []
 
             if mode == "hourly" and settings.get("hourly_enabled", False):
-                # Ежечасная рассылка – проверяем, что минуты равны 0
                 if now.minute == 0:
-                    # Отправляем отчёт
                     send_yesterday = settings.get("yesterday_for_hourly", False)
                     to_send.append(("hourly", send_yesterday))
             elif mode == "individual":
@@ -3410,23 +3392,21 @@ async def scheduler_loop(context: ContextTypes.DEFAULT_TYPE):
                     send_yesterday = current_time in settings.get("yesterday_for_individual", [])
                     to_send.append(("individual", send_yesterday))
 
-            # Если есть что отправлять
             if to_send:
                 for _, send_yesterday in to_send:
                     if send_yesterday:
                         report = await format_yesterday_report()
                     else:
                         report = await format_combined_metrics_with_deltas(include_yesterday=False)
-                    # Отправляем всем менеджерам и администратору
                     managers = load_managers()
                     for m in managers:
                         try:
-                            await context.bot.send_message(chat_id=m['id'], text=report, parse_mode="Markdown")
+                            await app.bot.send_message(chat_id=m['id'], text=report, parse_mode="Markdown")
                         except Exception as e:
                             write_log(f"Ошибка отправки менеджеру {m['id']}: {e}")
                     if ADMIN_CHAT_ID:
                         try:
-                            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=report, parse_mode="Markdown")
+                            await app.bot.send_message(chat_id=ADMIN_CHAT_ID, text=report, parse_mode="Markdown")
                         except Exception as e:
                             write_log(f"Ошибка отправки администратору: {e}")
                     write_log(f"📨 Отправлен автоматический отчёт (время {current_time}, за вчера: {send_yesterday})")
@@ -3457,7 +3437,7 @@ def main():
                    .connect_timeout(30.0)
                    .read_timeout(30.0)
                    .write_timeout(30.0)
-                   .post_init(init_http_session)
+                   .post_init(init_http_session_and_settings)
                    .post_shutdown(close_http_session)
                    .build())
 
@@ -3536,18 +3516,14 @@ def main():
 
     application.add_handler(MessageHandler(filters.Text(["📊 Отчёт по продажам", "📦 Отчёт по товарам", "📬 Автоматические рассылки", "⚙️ Администрирование", "📖 Справка"]), handle_main_menu))
 
-    # Обработчики для отчётов
     application.add_handler(MessageHandler(filters.Text(["📅 Продажи за сегодня", "📆 Выбрать дату", "📊 Выбрать период", "📈 Динамика продаж", "🔙 Назад"]), handle_sales_reports))
     application.add_handler(MessageHandler(filters.Text(["📅 Топ товаров за сегодня", "📆 Выбрать дату (товары)", "📊 Выбрать период (товары)", "📈 Динамика по товару", "🔙 Назад"]), handle_products_reports))
 
-    # Обработчики для администрирования
     application.add_handler(MessageHandler(filters.Text(["📋 Список менеджеров", "🔙 Назад"]), handle_admin_menu))
 
-    # Обработчики для автоматических рассылок
     application.add_handler(MessageHandler(filters.Text(["📋 Выбор рассылок", "📅 Добавление отчета за Вчера", "🔇 Режим тишины", "🔙 Назад"]), settings_main_handler))
     application.add_handler(MessageHandler(filters.Text(["🕒 Ежечасные рассылки", "⏰ Индивидуальные рассылки"]), settings_main_handler))
 
-    # Диалоги продаж
     conv_date = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📆 Выбрать дату"), handle_sales_reports)],
         states={WAITING_DATE_SINGLE: [CallbackQueryHandler(handle_callback_query)]},
@@ -3576,7 +3552,6 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    # Диалоги товаров
     conv_product_date = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📆 Выбрать дату (товары)"), handle_products_reports)],
         states={WAITING_PRODUCT_DATE: [CallbackQueryHandler(handle_callback_query)]},
@@ -3596,7 +3571,6 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    # Диалог динамики по товару
     conv_product_chart = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📈 Динамика по товару"), handle_products_reports)],
         states={
@@ -3610,7 +3584,6 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    # Диалоги автоматических рассылок
     conv_settings = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Text(["🕒 Ежечасные рассылки", "⏰ Индивидуальные рассылки"]), settings_main_handler),
@@ -3640,7 +3613,6 @@ def main():
     application.add_handler(conv_product_chart)
     application.add_handler(conv_settings)
 
-    # Администрирование
     conv_add = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➕ Добавить менеджера"), add_manager_start)],
         states={
@@ -3658,16 +3630,6 @@ def main():
     application.add_handler(conv_add)
     application.add_handler(conv_remove)
     application.add_handler(CallbackQueryHandler(handle_callback_query))
-
-    # Запускаем фоновый планировщик
-    async def start_scheduler(app):
-        await load_settings()
-        write_log("✅ Настройки загружены.")
-        # Запускаем планировщик в фоновой задаче
-        asyncio.create_task(scheduler_loop(app))
-        write_log("✅ Планировщик автоматических рассылок запущен.")
-
-    application.post_init = start_scheduler
 
     write_log("🚀 Бот готов.")
     application.run_polling(allowed_updates=Update.ALL_TYPES, timeout=30)
