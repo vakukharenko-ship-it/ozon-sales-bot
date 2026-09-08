@@ -26,7 +26,7 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ БОТА ====================
-VERSION = "2.2.2"  # Исправлен планировщик, добавлены логи
+VERSION = "2.2.3"  # Исправлен deadlock в load_settings()
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
@@ -499,21 +499,21 @@ DEFAULT_SETTINGS = {
 
 async def load_settings():
     global _settings
-    async with _settings_lock:
-        if os.path.exists(SETTINGS_FILE):
-            try:
-                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    # Заполняем недостающие ключи значениями по умолчанию
-                    for key, val in DEFAULT_SETTINGS.items():
-                        if key not in data:
-                            data[key] = val
-                    _settings = data
-                    return
-            except Exception as e:
-                write_log(f"Ошибка загрузки настроек: {e}")
-        _settings = DEFAULT_SETTINGS.copy()
-        await save_settings()
+    # Блокировка не используется, так как save_settings() имеет свою блокировку
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                # Заполняем недостающие ключи значениями по умолчанию
+                for key, val in DEFAULT_SETTINGS.items():
+                    if key not in data:
+                        data[key] = val
+                _settings = data
+                return
+        except Exception as e:
+            write_log(f"Ошибка загрузки настроек: {e}")
+    _settings = DEFAULT_SETTINGS.copy()
+    await save_settings()
 
 async def save_settings():
     global _settings
@@ -3439,7 +3439,6 @@ async def on_startup(app):
     await init_http_session(app)
     await load_settings()
     write_log("✅ Настройки загружены.")
-    # Запускаем планировщик, передавая объект bot
     asyncio.create_task(scheduler_loop(app.bot))
     write_log("✅ Планировщик автоматических рассылок запущен.")
 
