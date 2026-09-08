@@ -16,6 +16,7 @@ from telegram.ext import (
 )
 from telegram.warnings import PTBUserWarning
 
+# Графики
 import matplotlib.pyplot as plt
 import io
 from matplotlib.dates import MonthLocator, DateFormatter
@@ -272,7 +273,7 @@ def get_moscow_today():
 
 def create_calendar(year, month, callback_prefix):
     month_names = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-                   "Июль", "Август", "Сентябрь", "Окторябрь", "Ноябрь", "Декабрь"]
+                   "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
     keyboard = []
     header = f"{month_names[month-1]} {year}"
     keyboard.append([InlineKeyboardButton(header, callback_data="ignore")])
@@ -1215,7 +1216,6 @@ def format_expense_block(expenses_by_type, title):
         return f"🔹 *{title}*\nНет данных о расходах.\n"
     total = sum(expenses_by_type.values())
     lines = [f"🔹 *{title}*", f"  *Итого расходов:* {total:,.2f} ₽"]
-    # Используем тот же словарь, что и в format_expense_comparison
     name_map = {
         "Комиссия Ozon": "Комиссия",
         "Оплата эквайринга": "Эквайринг",
@@ -1327,165 +1327,6 @@ async def get_metrics_for_date(date_str, progress_callback=None):
         metrics["effective_drr"] = (ad_expense / delivered_revenue) * 100
     else:
         metrics["effective_drr"] = None
-    expenses = aggregate_finance_expenses(transactions)
-    metrics["expenses"] = expenses
-    if progress_callback:
-        await progress_callback("Готово", 100)
-    return metrics
-
-async def get_metrics_for_period(date_from, date_to, progress_callback=None):
-    return await fetch_metrics_for_period_parallel(date_from, date_to, progress_callback)
-
-# ==================== ФОРМАТИРОВАНИЕ ОТЧЁТОВ ====================
-
-def format_expense_block(expenses_by_type, title):
-    if not expenses_by_type:
-        return f"🔹 *{title}*\nНет данных о расходах.\n"
-
-    total = sum(expenses_by_type.values())
-    lines = [f"🔹 *{title}*", f"  *Итого расходов:* {total:,.2f} ₽"]
-
-    name_map = {
-        "Комиссия Ozon": "Комиссия",
-        "Оплата эквайринга": "Эквайринг",
-        "Доставка покупателю": "Доставка покупателю",
-        "Доставка и обработка возврата, отмены, невыкупа": "Доставка/возвраты",
-        "Кросс-докинг": "Кросс-докинг",
-        "Страхование товара от массовых повреждений": "Страхование",
-        "Обеспечение материалами для упаковки товара": "Обеспечение упаковкой",
-        "Упаковка товара партнёрами": "Упаковка",
-        "Подписка Управление отзывами": "Подписка",
-        "Оплата за клик": "Оплата за клик",
-        "Получение возврата, отмены, невыкупа от покупателя": "Получение возвратов",
-        "MarketplaceServiceItemDirectFlowLogistic": "Логистика прямая",
-        "MarketplaceServiceItemRedistributionLastMileCourier": "Логистика последняя миля",
-        "MarketplaceServiceItemReturnFlowLogistic": "Логистика возврат",
-        "MarketplaceServiceItemDeliveryToHandoverPlaceOzon": "Доставка до ПВЗ",
-        "MarketplaceRedistributionOfAcquiringOperation": "Эквайринг",
-        "MarketplaceServiceItemRedistributionReturnsPVZ": "Обработка возвратов (ПВЗ)",
-        "MarketplaceServiceItemPackageRedistribution": "Переупаковка",
-        "MarketplaceServiceItemPackageMaterialsProvision": "Обеспечение упаковкой",
-        "MarketplaceServiceItemProductReviewsManagementSubscription": "Подписка",
-        "MarketplaceServiceItemRedistributionLastMilePVZ": "Логистика последняя миля (ПВЗ)",
-        "MarketplaceServiceItemDirectFlowLogisticFBS": "Логистика прямая (FBS)",
-        "MarketplaceServiceItemReturnFlowLogisticFBS": "Логистика возврат (FBS)",
-        "ItemAgentServiceStarsMembership": "Звёздные товары",
-        "MarketplaceServiceSellerReturnsCargoAssortment": "Обработка возвратов партнёрами",
-        "MarketplaceServiceItemTemporaryStorageRedistribution": "Временное размещение",
-        "MarketplaceServiceProductMovementFromWarehouse": "Вывоз до ПВЗ",
-        "MarketplaceServiceItemDisposalDetailed": "Утилизация",
-        "Звёздные товары": "Звёздные товары",
-        "Временное размещение товара партнерами": "Временное размещение",
-        "Обработка товара в составе грузоместа: Поштучная приёмка": "Поштучная приёмка",
-        "Обработка товара в составе грузоместа на FBO": "Поштучная приёмка",
-        "Подготовка товара к вывозу: Брак": "Подготовка к вывозу (брак)",
-        "Вывоз товара со склада силами Ozon: Доставка до ПВЗ": "Вывоз до ПВЗ",
-        "Вывоз товара со Склада силами Ozon: Доставка до ПВЗ": "Вывоз до ПВЗ",
-        "Бронирование места и персонала для поставки с неполным составом в составе грузоместа": "Бронирование места",
-        "Услуга по бронированию места и персонала для поставки с неполным составом в составе ГМ": "Бронирование места",
-        "Обработка опознанных излишков в составе грузоместа": "Обработка излишков",
-        "Услуга по обработке опознанных излишков в составе ГМ": "Обработка излишков",
-        "Утилизация товара: Пролились/просыпались из-за упаковки": "Утилизация",
-        "Потеря по вине Ozon на складе": "Потеря (склад)",
-        "Потеря по вине Ozon в логистике": "Потеря (логистика)",
-        "Вознаграждение за продажу": "Вознаграждение",
-        "Возврат вознаграждения": "Возврат вознаграждения",
-        "Программы партнёров": "Программы партнёров",
-        "Баллы за скидки": "Баллы за скидки",
-        "Выручка": "Выручка",
-        "Возврат выручки": "Возврат выручки",
-    }
-
-    sorted_items = sorted(expenses_by_type.items(), key=lambda x: x[1], reverse=True)
-
-    for category, amount in sorted_items:
-        if category in name_map:
-            short_name = name_map[category]
-        else:
-            found = False
-            for key, value in name_map.items():
-                if key in category or category in key:
-                    short_name = value
-                    found = True
-                    break
-            if not found:
-                short_name = category[:40]
-                write_log(f"⚠️ Не найдено соответствие для категории: {category}")
-        lines.append(f"    {short_name}: {amount:,.2f} ₽")
-
-    return "\n".join(lines)
-
-def format_single_metrics(metrics, title):
-    if not metrics:
-        return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
-    has_data = False
-    for key, val in metrics.items():
-        if key in ["drr", "effective_drr", "ad_expense", "expenses"]:
-            continue
-        if isinstance(val, (int, float)) and val != 0:
-            has_data = True
-            break
-    if not has_data:
-        return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
-
-    ad_expense = metrics.get("ad_expense", 0)
-    drr = metrics.get("drr")
-    eff_drr = metrics.get("effective_drr")
-    drr_text = f"{drr:.2f}%" if drr is not None else "∞"
-    eff_drr_text = f"{eff_drr:.2f}%" if eff_drr is not None else "∞"
-
-    canceled_units = metrics.get('canceled_units', 0)
-    delivered_units = metrics.get('delivered_units', 0)
-    cancel_rate = (canceled_units / delivered_units * 100) if delivered_units > 0 else None
-    cancel_rate_text = f"{cancel_rate:.2f}%" if cancel_rate is not None else "∞"
-
-    main_text = (
-        f"📊 *{title}*\n\n"
-        f"🛒 *Заказано*\n  На сумму: {metrics.get('ordered_sum', 0):,.2f} ₽\n"
-        f"  Штук: {metrics.get('ordered_units', 0)}\n\n"
-        f"📦 *Доставлено*\n  На сумму: {metrics.get('delivered_sum', 0):,.2f} ₽\n"
-        f"  Штук: {metrics.get('delivered_units', 0)}\n\n"
-        f"❌ *Отменено*\n  На сумму: {metrics.get('canceled_sum', 0):,.2f} ₽\n"
-        f"  Штук: {metrics.get('canceled_units', 0)}\n"
-        f"  Доля отмен: {cancel_rate_text}\n\n"
-        f"📢 *Реклама*\n"
-        f"  Расходы: {ad_expense:,.2f} ₽\n"
-        f"  ДРР (общий): {drr_text}\n"
-        f"  ДРР (по доставленным): {eff_drr_text}"
-    )
-
-    expenses = metrics.get("expenses", {})
-    if expenses:
-        expense_block = format_expense_block(expenses, "Расходы за период")
-        main_text += "\n\n" + expense_block
-
-    return main_text
-
-# ---------- АСИНХРОННЫЕ ФУНКЦИИ ДЛЯ ПОЛУЧЕНИЯ МЕТРИК ----------
-async def get_metrics_for_date(date_str, progress_callback=None):
-    today = get_moscow_today()
-    start = (today - datetime.timedelta(days=183)).strftime("%Y-%m-%d")
-    end = today.strftime("%Y-%m-%d")
-    postings_task = fetch_postings(start, end, progress_callback)
-    ad_task = fetch_advertising_expense(date_str, date_str, progress_callback)
-    fin_task = fetch_finance_transactions(date_str, date_str, progress_callback)
-    postings, ad_expense, transactions = await asyncio.gather(postings_task, ad_task, fin_task)
-    if progress_callback:
-        await progress_callback("Агрегируем данные...", 80)
-    agg = aggregate_postings(postings, date_from=date_str, date_to=date_str)
-    metrics = agg.get(date_str, {})
-    metrics["ad_expense"] = ad_expense if ad_expense is not None else 0.0
-    revenue = metrics.get("ordered_sum", 0)
-    if revenue > 0 and ad_expense is not None:
-        metrics["drr"] = (ad_expense / revenue) * 100
-    else:
-        metrics["drr"] = None
-    delivered_revenue = metrics.get("delivered_sum", 0)
-    if delivered_revenue > 0 and ad_expense is not None:
-        metrics["effective_drr"] = (ad_expense / delivered_revenue) * 100
-    else:
-        metrics["effective_drr"] = None
-
     expenses = aggregate_finance_expenses(transactions)
     metrics["expenses"] = expenses
     if progress_callback:
@@ -2249,7 +2090,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, reply_markup=keyboard)
     return ConversationHandler.END
 
-# ---------- ОБРАБОТЧИКИ ДИНАМИКИ ПО ТОВАРУ (callback) ----------
+# ---------- ОБРАБОТЧИКИ ДИНАМИКИ ПО ТОВАРУ ----------
 async def product_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -2517,182 +2358,7 @@ async def dynamics_range_end(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data.pop('dynamics_range_start', None)
     return ConversationHandler.END
 
-# ==================== НОВЫЙ РАЗДЕЛ "АВТОМАТИЧЕСКИЕ РАССЫЛКИ" ====================
-
-# (здесь идут функции, которые я уже дал в предыдущем ответе:
-# auto_reports_keyboard, build_hours_keyboard, build_hours_keyboard_with_filter,
-# build_hours_keyboard_for_silence, auto_reports_menu, auto_schedule_start,
-# schedule_callback, auto_yesterday_start, yesterday_callback,
-# auto_silence_start, silence_callback, silence_start_callback, silence_end_callback,
-# auto_send_yesterday_now, send_report_to_all_users, check_auto_reports)
-
-# Я их не повторяю, так как они уже были в первой части, но в финальном файле они будут.
-
-# ==================== ОБРАБОТЧИК CALLBACK (полный) ====================
-# Он должен объединять все callback-вызовы: для дат, периодов, динамики, товаров, автоматических рассылок.
-# Я приведу его в третьей части, чтобы не перегружать.
-
-# ==================== ЗАПУСК ====================
-def main():
-    if not validate_env_vars():
-        sys.exit(1)
-    write_log(f"🚀 Бот запускается (версия {VERSION})")
-    write_log(f"✅ OZON_CLIENT_ID: {mask_secret(OZON_CLIENT_ID)}")
-    write_log(f"✅ OZON_API_KEY: {mask_secret(OZON_API_KEY)}")
-    write_log(f"✅ TELEGRAM_BOT_TOKEN: {mask_secret(TELEGRAM_BOT_TOKEN)}")
-    write_log(f"✅ ADMIN_CHAT_ID: {ADMIN_CHAT_ID}")
-    if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
-        write_log("⚠️ ВНИМАНИЕ: OZON_PERFORMANCE_CLIENT_ID или CLIENT_SECRET не заданы. Рекламные расходы не будут отображаться.")
-    else:
-        write_log(f"✅ OZON_PERFORMANCE_CLIENT_ID: {mask_secret(OZON_PERFORMANCE_CLIENT_ID)}")
-    update_version_history(VERSION, CHANGELOG_MESSAGE)
-
-    application = (Application.builder()
-                   .token(TELEGRAM_BOT_TOKEN)
-                   .connect_timeout(30.0)
-                   .read_timeout(30.0)
-                   .write_timeout(30.0)
-                   .post_init(init_http_session)
-                   .post_shutdown(close_http_session)
-                   .build())
-
-    write_log("🚀 Запуск бота...")
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("top", top_products_command))
-    application.add_handler(CommandHandler("version", version_command))
-
-    async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # (полный текст справки, как выше)
-        pass
-    application.add_handler(CommandHandler("help", help_command))
-
-    # Обработчики меню
-    application.add_handler(MessageHandler(filters.Text(["📊 Отчёт по продажам", "📦 Отчёт по товарам", "🔔 Автоматические рассылки", "⚙️ Администрирование", "📖 Справка"]), handle_main_menu))
-
-    application.add_handler(MessageHandler(filters.Text(["📅 Продажи за сегодня", "📆 Выбрать дату", "📊 Выбрать период", "📈 Динамика продаж", "🔙 Назад"]), handle_sales_reports))
-    application.add_handler(MessageHandler(filters.Text(["📅 Топ товаров за сегодня", "📆 Выбрать дату (товары)", "📊 Выбрать период (товары)", "📈 Динамика по товару", "🔙 Назад"]), handle_products_reports))
-    application.add_handler(MessageHandler(filters.Text(["📋 Список менеджеров", "🔙 Назад"]), handle_admin_menu))
-
-    # Диалоги продаж
-    conv_date = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("📆 Выбрать дату"), handle_sales_reports)],
-        states={WAITING_DATE_SINGLE: [CallbackQueryHandler(handle_callback_query)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    conv_period = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("📊 Выбрать период"), handle_sales_reports)],
-        states={
-            WAITING_PERIOD_TYPE: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PERIOD_START: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PERIOD_END: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PERIOD_YEAR: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PERIOD_MONTH: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PERIOD_QUARTER: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_YEAR_SELECT: [CallbackQueryHandler(handle_callback_query)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    conv_dynamics = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("📈 Динамика продаж"), handle_sales_reports)],
-        states={
-            WAITING_DYNAMICS_SELECT: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_DYNAMICS_RANGE_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, dynamics_range_start)],
-            WAITING_DYNAMICS_RANGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, dynamics_range_end)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    # Диалоги товаров
-    conv_product_date = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("📆 Выбрать дату (товары)"), handle_products_reports)],
-        states={WAITING_PRODUCT_DATE: [CallbackQueryHandler(handle_callback_query)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    conv_product_period = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("📊 Выбрать период (товары)"), handle_products_reports)],
-        states={
-            WAITING_PRODUCT_PERIOD_TYPE: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PRODUCT_PERIOD_START: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PRODUCT_PERIOD_END: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PRODUCT_YEAR: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PRODUCT_MONTH: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PRODUCT_QUARTER: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PRODUCT_YEAR_SELECT: [CallbackQueryHandler(handle_callback_query)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    conv_product_chart = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("📈 Динамика по товару"), handle_products_reports)],
-        states={
-            WAITING_PRODUCT_SELECT: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PRODUCT_METRIC: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PRODUCT_PERIOD_CHOICE: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PRODUCT_SINGLE_YEAR: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PRODUCT_RANGE_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_range_start)],
-            WAITING_PRODUCT_RANGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_range_end)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    # Администрирование
-    conv_add = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("➕ Добавить менеджера"), add_manager_start)],
-        states={
-            WAITING_ADD_MANAGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_manager_input)],
-            WAITING_MANAGER_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_manager_phone)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    conv_remove = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("➖ Удалить менеджера"), remove_manager_start)],
-        states={WAITING_REMOVE_MANAGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_manager_input)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    application.add_handler(conv_date)
-    application.add_handler(conv_period)
-    application.add_handler(conv_dynamics)
-    application.add_handler(conv_product_date)
-    application.add_handler(conv_product_period)
-    application.add_handler(conv_product_chart)
-    application.add_handler(conv_add)
-    application.add_handler(conv_remove)
-
-    # Обработчик для автоматических рассылок
-    async def auto_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = update.message.text
-        if text == "🕒 Выбор времени рассылок":
-            await auto_schedule_start(update, context)
-        elif text == "📅 Добавление отчета за Вчера":
-            await auto_yesterday_start(update, context)
-        elif text == "🔕 Режим тишины":
-            await auto_silence_start(update, context)
-        elif text == "📤 Отправить отчет за Вчера сейчас":
-            await auto_send_yesterday_now(update, context)
-        elif text == "🔙 Назад":
-            if is_admin(update.effective_chat.id):
-                await update.message.reply_text(f"Главное меню\n\n🤖 Версия бота: {VERSION}", reply_markup=main_admin_keyboard())
-            else:
-                await update.message.reply_text(f"Главное меню\n\n🤖 Версия бота: {VERSION}", reply_markup=main_user_keyboard())
-    application.add_handler(MessageHandler(filters.Regex("^(🕒 Выбор времени рассылок|📅 Добавление отчета за Вчера|🔕 Режим тишины|📤 Отправить отчет за Вчера сейчас|🔙 Назад)$"), auto_menu_router))
-
-    # Единый обработчик всех callback-запросов
-    application.add_handler(CallbackQueryHandler(handle_callback_query))
-
-    # Планировщик
-    job_queue = application.job_queue
-    if job_queue:
-        job_queue.run_repeating(check_auto_reports, interval=900, first=0)
-        write_log("✅ Планировщик автоматических рассылок запущен (интервал 15 минут).")
-    else:
-        write_log("⚠️ JobQueue недоступен.")
-
-    write_log("🚀 Бот готов.")
-    application.run_polling(allowed_updates=Update.ALL_TYPES, timeout=30)
-
-if __name__ == "__main__":
-    main()
-    # ==================== РАЗДЕЛ "АВТОМАТИЧЕСКИЕ РАССЫЛКИ" (ПОЛНЫЙ КОД) ====================
+# ==================== РАЗДЕЛ "АВТОМАТИЧЕСКИЕ РАССЫЛКИ" ====================
 
 def auto_reports_keyboard():
     buttons = [
@@ -3172,7 +2838,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         year = int(data.split("_")[-1])
         context.user_data['period_year'] = year
         months = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-                  "Июль", "Август", "Сентябрь", "Окторябрь", "Ноябрь", "Декабрь"]
+                  "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
         buttons = [[InlineKeyboardButton(name, callback_data=f"period_month_{i}_{year}")] for i, name in enumerate(months, 1)]
         buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="period_cancel")])
         await query.edit_message_text(f"Выберите месяц {year}:", reply_markup=InlineKeyboardMarkup(buttons))
@@ -3229,7 +2895,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         metrics_prev = await get_metrics_for_period(prev_first_day.strftime("%Y-%m-%d"), prev_last_day.strftime("%Y-%m-%d"), progress_callback=None)
         await progress_msg.delete()
         month_names = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-                       "Июль", "Август", "Сентябрь", "Окторябрь", "Ноябрь", "Декабрь"]
+                       "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
         period_name = f"{month_names[month_num-1]} {year}"
         report = format_period_comparison_metrics(metrics_current, metrics_prev, period_name)
         await query.edit_message_text(report, parse_mode="Markdown")
@@ -3482,7 +3148,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         year = int(data.split("_")[-1])
         context.user_data['p_year'] = year
         months = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-                  "Июль", "Август", "Сентябрь", "Окторябрь", "Ноябрь", "Декабрь"]
+                  "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
         buttons = [[InlineKeyboardButton(name, callback_data=f"pmonth_{i}_{year}")] for i, name in enumerate(months, 1)]
         buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="pcancel")])
         await query.edit_message_text(f"Выберите месяц {year}:", reply_markup=InlineKeyboardMarkup(buttons))
@@ -3651,3 +3317,227 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     # ---------- Если ничего не подошло ----------
     await query.edit_message_text("❌ Неизвестная команда.")
     return ConversationHandler.END
+
+# ==================== ЗАПУСК ====================
+def main():
+    if not validate_env_vars():
+        sys.exit(1)
+    write_log(f"🚀 Бот запускается (версия {VERSION})")
+    write_log(f"✅ OZON_CLIENT_ID: {mask_secret(OZON_CLIENT_ID)}")
+    write_log(f"✅ OZON_API_KEY: {mask_secret(OZON_API_KEY)}")
+    write_log(f"✅ TELEGRAM_BOT_TOKEN: {mask_secret(TELEGRAM_BOT_TOKEN)}")
+    write_log(f"✅ ADMIN_CHAT_ID: {ADMIN_CHAT_ID}")
+    if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
+        write_log("⚠️ ВНИМАНИЕ: OZON_PERFORMANCE_CLIENT_ID или CLIENT_SECRET не заданы. Рекламные расходы не будут отображаться.")
+    else:
+        write_log(f"✅ OZON_PERFORMANCE_CLIENT_ID: {mask_secret(OZON_PERFORMANCE_CLIENT_ID)}")
+    update_version_history(VERSION, CHANGELOG_MESSAGE)
+
+    application = (Application.builder()
+                   .token(TELEGRAM_BOT_TOKEN)
+                   .connect_timeout(30.0)
+                   .read_timeout(30.0)
+                   .write_timeout(30.0)
+                   .post_init(init_http_session)
+                   .post_shutdown(close_http_session)
+                   .build())
+
+    write_log("🚀 Запуск бота...")
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("top", top_products_command))
+    application.add_handler(CommandHandler("version", version_command))
+
+    async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        if is_admin(chat_id):
+            help_text = (
+                "📖 *Справка для администратора*\n\n"
+                "🔹 *Основные функции*\n"
+                "• 📊 Отчёт по продажам – актуальная сводка по продажам за сегодня и текущий месяц.\n"
+                "• 📦 Отчёт по товарам – топ товаров по выручке за сегодня и текущий месяц.\n"
+                "• 📆 Выбрать дату – просмотр данных за конкретный день (продажи или товары).\n"
+                "• 📊 Выбрать период – гибкий выбор отчётного периода (месяц, квартал, год, произвольный).\n"
+                "• 📈 Динамика продаж – график доставленных заказов по месяцам за выбранный год (или несколько лет).\n"
+                "• 📈 Динамика по товару – график продаж конкретного товара по месяцам.\n"
+                "• ⚙️ Администрирование – управление доступом менеджеров.\n"
+                "• 🔔 Автоматические рассылки – настройка времени и содержания автоматических отчётов.\n\n"
+                "🔹 *Управление менеджерами*\n"
+                "• ➕ Добавить менеджера – введите Telegram ID или @username пользователя, затем номер телефона (или '-' для пропуска).\n"
+                "• ➖ Удалить менеджера – введите Telegram ID пользователя.\n"
+                "• 📋 Список менеджеров – просмотр всех добавленных пользователей (ID, username, имя, телефон).\n\n"
+                "🔹 *Автоматические отчёты*\n"
+                "• Настройка времени рассылок – задаются часы (01:00..24:00), в которые разрешена отправка.\n"
+                "• Добавление отчёта за Вчера – из разрешённых часов выбираются те, в которые будет отправляться отчёт с блоком «Вчера».\n"
+                "• Режим тишины – задаётся интервал, в течение которого рассылки не отправляются.\n"
+                "• Отправить сейчас – принудительная отправка отчёта за вчера всем пользователям.\n\n"
+                "🔹 *Метрики*\n"
+                "• 🛒 Заказано – сумма и количество всех заказов.\n"
+                "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
+                "• ❌ Отменено – сумма и количество отменённых заказов.\n"
+                "• 📢 Реклама – расходы на рекламу, ДРР (общий) и ДРР (по доставленным).\n"
+                "• 💰 Расходы (финансовые) – детальная разбивка: комиссии, логистика, эквайринг, кросс-докинг, хранение, возвраты и др.\n\n"
+                "🔹 *Сравнение динамики*\n"
+                "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
+                "• Для «Текущий месяц» – сравнение с аналогичным периодом предыдущего месяца (с учётом времени).\n\n"
+                "🔹 *Часовой пояс*\n"
+                "• Все расчёты ведутся по московскому времени (МСК, UTC+3).\n\n"
+                f"🤖 Версия бота: {VERSION}"
+            )
+        else:
+            help_text = (
+                "📖 *Справка для менеджера*\n\n"
+                "🔹 *Основные функции*\n"
+                "• 📊 Отчёт по продажам – актуальная сводка по продажам за сегодня и текущий месяц.\n"
+                "• 📦 Отчёт по товарам – топ товаров по выручке за сегодня и текущий месяц.\n"
+                "• 📆 Выбрать дату – просмотр данных за конкретный день (продажи или товары).\n"
+                "• 📊 Выбрать период – гибкий выбор отчётного периода (месяц, квартал, год, произвольный).\n"
+                "• 📈 Динамика продаж – график доставленных заказов по месяцам за выбранный год (или несколько лет).\n"
+                "• 📈 Динамика по товару – график продаж конкретного товара по месяцам.\n"
+                "• 🔔 Автоматические рассылки – настройка времени и содержания автоматических отчётов.\n\n"
+                "🔹 *Автоматические отчёты*\n"
+                "• Настройка времени рассылок – задаются часы (01:00..24:00), в которые разрешена отправка.\n"
+                "• Добавление отчёта за Вчера – из разрешённых часов выбираются те, в которые будет отправляться отчёт с блоком «Вчера».\n"
+                "• Режим тишины – задаётся интервал, в течение которого рассылки не отправляются.\n"
+                "• Отправить сейчас – принудительная отправка отчёта за вчера всем пользователям.\n\n"
+                "🔹 *Метрики*\n"
+                "• 🛒 Заказано – сумма и количество всех заказов.\n"
+                "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
+                "• ❌ Отменено – сумма и количество отменённых заказов.\n"
+                "• 📢 Реклама – расходы на рекламу, ДРР (общий) и ДРР (по доставленным).\n"
+                "• 💰 Расходы (финансовые) – детальная разбивка: комиссии, логистика, эквайринг, кросс-докинг, хранение, возвраты и др.\n\n"
+                "🔹 *Сравнение динамики*\n"
+                "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
+                "• Для «Текущий месяц» – сравнение с аналогичным периодом предыдущего месяца (с учётом времени).\n\n"
+                "🔹 *Часовой пояс*\n"
+                "• Все расчёты ведутся по московскому времени (МСК, UTC+3).\n\n"
+                f"🤖 Версия бота: {VERSION}"
+            )
+        await update.message.reply_text(help_text, parse_mode="Markdown")
+    application.add_handler(CommandHandler("help", help_command))
+
+    # Обработчики меню
+    application.add_handler(MessageHandler(filters.Text(["📊 Отчёт по продажам", "📦 Отчёт по товарам", "🔔 Автоматические рассылки", "⚙️ Администрирование", "📖 Справка"]), handle_main_menu))
+
+    application.add_handler(MessageHandler(filters.Text(["📅 Продажи за сегодня", "📆 Выбрать дату", "📊 Выбрать период", "📈 Динамика продаж", "🔙 Назад"]), handle_sales_reports))
+    application.add_handler(MessageHandler(filters.Text(["📅 Топ товаров за сегодня", "📆 Выбрать дату (товары)", "📊 Выбрать период (товары)", "📈 Динамика по товару", "🔙 Назад"]), handle_products_reports))
+    application.add_handler(MessageHandler(filters.Text(["📋 Список менеджеров", "🔙 Назад"]), handle_admin_menu))
+
+    # Диалоги продаж
+    conv_date = ConversationHandler(
+        entry_points=[MessageHandler(filters.Text("📆 Выбрать дату"), handle_sales_reports)],
+        states={WAITING_DATE_SINGLE: [CallbackQueryHandler(handle_callback_query)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    conv_period = ConversationHandler(
+        entry_points=[MessageHandler(filters.Text("📊 Выбрать период"), handle_sales_reports)],
+        states={
+            WAITING_PERIOD_TYPE: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_PERIOD_START: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_PERIOD_END: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_PERIOD_YEAR: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_PERIOD_MONTH: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_PERIOD_QUARTER: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_YEAR_SELECT: [CallbackQueryHandler(handle_callback_query)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    conv_dynamics = ConversationHandler(
+        entry_points=[MessageHandler(filters.Text("📈 Динамика продаж"), handle_sales_reports)],
+        states={
+            WAITING_DYNAMICS_SELECT: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_DYNAMICS_RANGE_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, dynamics_range_start)],
+            WAITING_DYNAMICS_RANGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, dynamics_range_end)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    # Диалоги товаров
+    conv_product_date = ConversationHandler(
+        entry_points=[MessageHandler(filters.Text("📆 Выбрать дату (товары)"), handle_products_reports)],
+        states={WAITING_PRODUCT_DATE: [CallbackQueryHandler(handle_callback_query)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    conv_product_period = ConversationHandler(
+        entry_points=[MessageHandler(filters.Text("📊 Выбрать период (товары)"), handle_products_reports)],
+        states={
+            WAITING_PRODUCT_PERIOD_TYPE: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_PRODUCT_PERIOD_START: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_PRODUCT_PERIOD_END: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_PRODUCT_YEAR: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_PRODUCT_MONTH: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_PRODUCT_QUARTER: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_PRODUCT_YEAR_SELECT: [CallbackQueryHandler(handle_callback_query)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    conv_product_chart = ConversationHandler(
+        entry_points=[MessageHandler(filters.Text("📈 Динамика по товару"), handle_products_reports)],
+        states={
+            WAITING_PRODUCT_SELECT: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_PRODUCT_METRIC: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_PRODUCT_PERIOD_CHOICE: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_PRODUCT_SINGLE_YEAR: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_PRODUCT_RANGE_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_range_start)],
+            WAITING_PRODUCT_RANGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_range_end)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    # Администрирование
+    conv_add = ConversationHandler(
+        entry_points=[MessageHandler(filters.Text("➕ Добавить менеджера"), add_manager_start)],
+        states={
+            WAITING_ADD_MANAGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_manager_input)],
+            WAITING_MANAGER_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_manager_phone)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    conv_remove = ConversationHandler(
+        entry_points=[MessageHandler(filters.Text("➖ Удалить менеджера"), remove_manager_start)],
+        states={WAITING_REMOVE_MANAGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_manager_input)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    application.add_handler(conv_date)
+    application.add_handler(conv_period)
+    application.add_handler(conv_dynamics)
+    application.add_handler(conv_product_date)
+    application.add_handler(conv_product_period)
+    application.add_handler(conv_product_chart)
+    application.add_handler(conv_add)
+    application.add_handler(conv_remove)
+
+    # Обработчик для автоматических рассылок
+    async def auto_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text = update.message.text
+        if text == "🕒 Выбор времени рассылок":
+            await auto_schedule_start(update, context)
+        elif text == "📅 Добавление отчета за Вчера":
+            await auto_yesterday_start(update, context)
+        elif text == "🔕 Режим тишины":
+            await auto_silence_start(update, context)
+        elif text == "📤 Отправить отчет за Вчера сейчас":
+            await auto_send_yesterday_now(update, context)
+        elif text == "🔙 Назад":
+            if is_admin(update.effective_chat.id):
+                await update.message.reply_text(f"Главное меню\n\n🤖 Версия бота: {VERSION}", reply_markup=main_admin_keyboard())
+            else:
+                await update.message.reply_text(f"Главное меню\n\n🤖 Версия бота: {VERSION}", reply_markup=main_user_keyboard())
+    application.add_handler(MessageHandler(filters.Regex("^(🕒 Выбор времени рассылок|📅 Добавление отчета за Вчера|🔕 Режим тишины|📤 Отправить отчет за Вчера сейчас|🔙 Назад)$"), auto_menu_router))
+
+    # Единый обработчик всех callback-запросов
+    application.add_handler(CallbackQueryHandler(handle_callback_query))
+
+    # Планировщик
+    job_queue = application.job_queue
+    if job_queue:
+        job_queue.run_repeating(check_auto_reports, interval=900, first=0)
+        write_log("✅ Планировщик автоматических рассылок запущен (интервал 15 минут).")
+    else:
+        write_log("⚠️ JobQueue недоступен.")
+
+    write_log("🚀 Бот готов.")
+    application.run_polling(allowed_updates=Update.ALL_TYPES, timeout=30)
+
+if __name__ == "__main__":
+    main()
