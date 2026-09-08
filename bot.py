@@ -8,6 +8,7 @@ import asyncio
 import aiohttp
 import warnings
 import sys
+import traceback
 from typing import Optional, List, Tuple, Dict
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -25,7 +26,7 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ БОТА ====================
-VERSION = "2.2.1"  # Исправлен post_init, интервал планировщика 15 минут
+VERSION = "2.2.2"  # Исправлен планировщик, добавлены логи
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
@@ -1866,7 +1867,7 @@ def settings_choice_keyboard():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
-    write_log(f"Команда /start от пользователя {chat_id} ({user.first_name})")
+    write_log(f"🔔 Команда /start от пользователя {chat_id} (@{user.username if user.username else 'no_username'})")
     if is_admin(chat_id):
         name = user.first_name if user.first_name else ""
         greeting = get_greeting(name)
@@ -3375,7 +3376,7 @@ async def dynamics_range_end(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 # ==================== ПЛАНИРОВЩИК АВТОМАТИЧЕСКИХ РАССЫЛОК ====================
-async def scheduler_loop(context: ContextTypes.DEFAULT_TYPE):
+async def scheduler_loop(bot):
     """Фоновый цикл, проверяющий каждые 15 минут, не пора ли отправить отчёты."""
     while True:
         try:
@@ -3387,7 +3388,6 @@ async def scheduler_loop(context: ContextTypes.DEFAULT_TYPE):
             quiet_start = settings.get("quiet_start")
             quiet_end = settings.get("quiet_end")
             if quiet_start and quiet_end:
-                # Если интервал пересекает полночь
                 if quiet_start < quiet_end:
                     in_quiet = quiet_start <= current_time <= quiet_end
                 else:
@@ -3400,9 +3400,7 @@ async def scheduler_loop(context: ContextTypes.DEFAULT_TYPE):
             to_send = []
 
             if mode == "hourly" and settings.get("hourly_enabled", False):
-                # Ежечасная рассылка – проверяем, что минуты равны 0
                 if now.minute == 0:
-                    # Отправляем отчёт
                     send_yesterday = settings.get("yesterday_for_hourly", False)
                     to_send.append(("hourly", send_yesterday))
             elif mode == "individual":
@@ -3411,30 +3409,28 @@ async def scheduler_loop(context: ContextTypes.DEFAULT_TYPE):
                     send_yesterday = current_time in settings.get("yesterday_for_individual", [])
                     to_send.append(("individual", send_yesterday))
 
-            # Если есть что отправлять
             if to_send:
                 for _, send_yesterday in to_send:
                     if send_yesterday:
                         report = await format_yesterday_report()
                     else:
                         report = await format_combined_metrics_with_deltas(include_yesterday=False)
-                    # Отправляем всем менеджерам и администратору
                     managers = load_managers()
                     for m in managers:
                         try:
-                            await context.bot.send_message(chat_id=m['id'], text=report, parse_mode="Markdown")
+                            await bot.send_message(chat_id=m['id'], text=report, parse_mode="Markdown")
                         except Exception as e:
                             write_log(f"Ошибка отправки менеджеру {m['id']}: {e}")
                     if ADMIN_CHAT_ID:
                         try:
-                            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=report, parse_mode="Markdown")
+                            await bot.send_message(chat_id=ADMIN_CHAT_ID, text=report, parse_mode="Markdown")
                         except Exception as e:
                             write_log(f"Ошибка отправки администратору: {e}")
                     write_log(f"📨 Отправлен автоматический отчёт (время {current_time}, за вчера: {send_yesterday})")
 
-            await asyncio.sleep(900)  # проверка каждые 15 минут
+            await asyncio.sleep(900)
         except Exception as e:
-            write_log(f"❌ Ошибка в планировщике: {e}")
+            write_log(f"❌ Ошибка в планировщике: {e}\n{traceback.format_exc()}")
             await asyncio.sleep(900)
 
 # ---------- ЗАПУСК ----------
@@ -3443,8 +3439,8 @@ async def on_startup(app):
     await init_http_session(app)
     await load_settings()
     write_log("✅ Настройки загружены.")
-    # Запускаем планировщик в фоновой задаче
-    asyncio.create_task(scheduler_loop(app))
+    # Запускаем планировщик, передавая объект bot
+    asyncio.create_task(scheduler_loop(app.bot))
     write_log("✅ Планировщик автоматических рассылок запущен.")
 
 def main():
@@ -3467,7 +3463,7 @@ def main():
                    .connect_timeout(30.0)
                    .read_timeout(30.0)
                    .write_timeout(30.0)
-                   .post_init(on_startup)          # единая функция инициализации
+                   .post_init(on_startup)
                    .post_shutdown(close_http_session)
                    .build())
 
