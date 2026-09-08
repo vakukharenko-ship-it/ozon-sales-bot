@@ -8,7 +8,7 @@ import asyncio
 import aiohttp
 import warnings
 import sys
-from typing import Optional
+from typing import Optional, List, Tuple, Dict
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, MessageHandler,
@@ -25,7 +25,7 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ БОТА ====================
-VERSION = "2.1.3"  # Исправлена ошибка редактирования сообщения с фото
+VERSION = "2.1.4"  # Оптимизация производительности: агрегация за один проход, параллельная загрузка финансов
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
@@ -713,13 +713,11 @@ async def fetch_advertising_expense(date_from, date_to, progress_callback=None):
         await progress_callback("Реклама загружена", 100)
     return total
 
-# ---------- ФИНАНСОВЫЕ ТРАНЗАКЦИИ ----------
-async def fetch_finance_transactions_single(date_from, date_to):
-    cache_key = f"fetch_finance_transactions_single_{date_from}_{date_to}"
-    cached = await get_from_cache(cache_key)
-    if cached is not None:
-        return cached
-
+# ---------- ФИНАНСОВЫЕ ТРАНЗАКЦИИ (оптимизированная параллельная загрузка) ----------
+async def fetch_finance_transactions_parallel(date_from: str, date_to: str) -> List[Dict]:
+    """
+    Загружает финансовые транзакции за период, используя параллельные запросы страниц.
+    """
     today_str = get_moscow_today().isoformat()
     if date_from > today_str:
         return []
@@ -735,37 +733,55 @@ async def fetch_finance_transactions_single(date_from, date_to):
     from_iso = date_from + "T00:00:00.000Z"
     to_iso = date_to + "T23:59:59.999Z"
 
-    all_transactions = []
-    page = 1
-    page_size = 1000
+    # Первый запрос – получаем total и первую страницу
+    payload_first = {
+        "filter": {"date": {"from": from_iso, "to": to_iso}},
+        "page": 1,
+        "page_size": 1000,
+    }
+    try:
+        first_data = await api_request_with_retry(OZON_FINANCE_URL, headers, payload_first, method='POST')
+    except Exception as e:
+        write_log(f"❌ Ошибка получения первой страницы финансов: {e}")
+        return []
 
-    while True:
-        payload = {
-            "filter": {
-                "date": {
-                    "from": from_iso,
-                    "to": to_iso
-                }
-            },
-            "page": page,
-            "page_size": page_size,
-        }
+    result = first_data.get("result", {})
+    total_items = result.get("total", 0)
+    all_operations = result.get("operations", [])
 
-        try:
-            data = await api_request_with_retry(OZON_FINANCE_URL, headers, payload, method='POST')
-            items = data.get("result", {}).get("operations", [])
-            if not items:
-                break
-            all_transactions.extend(items)
-            if len(items) < page_size:
-                break
-            page += 1
-        except Exception as e:
-            write_log(f"❌ Ошибка получения финансовых транзакций: {e}")
-            break
+    if total_items <= 1000:
+        return all_operations
 
-    await save_to_cache(cache_key, all_transactions)
-    return all_transactions
+    total_pages = (total_items + 999) // 1000
+    # Ограничиваем количество параллельных запросов (не более 10)
+    sem = asyncio.Semaphore(10)
+
+    async def fetch_page(page_num: int):
+        async with sem:
+            payload = {
+                "filter": {"date": {"from": from_iso, "to": to_iso}},
+                "page": page_num,
+                "page_size": 1000,
+            }
+            try:
+                data = await api_request_with_retry(OZON_FINANCE_URL, headers, payload, method='POST')
+                return data.get("result", {}).get("operations", [])
+            except Exception as e:
+                write_log(f"⚠️ Ошибка загрузки страницы {page_num}: {e}")
+                return []
+
+    # Создаем задачи для страниц 2..total_pages
+    tasks = [fetch_page(p) for p in range(2, total_pages + 1)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for res in results:
+        if isinstance(res, list):
+            all_operations.extend(res)
+        elif isinstance(res, Exception):
+            write_log(f"⚠️ Исключение при загрузке страницы: {res}")
+
+    write_log(f"💰 Загружено финансовых транзакций: {len(all_operations)} за {date_from}–{date_to} (параллельно)")
+    return all_operations
 
 async def fetch_finance_transactions(date_from, date_to, progress_callback=None):
     cache_key = f"fetch_finance_transactions_{date_from}_{date_to}"
@@ -783,7 +799,7 @@ async def fetch_finance_transactions(date_from, date_to, progress_callback=None)
 
     delta = (end_dt - start_dt).days
     if delta <= API_MAX_DAYS_PER_REQUEST:
-        result = await fetch_finance_transactions_single(date_from, end_dt.strftime("%Y-%m-%d"))
+        result = await fetch_finance_transactions_parallel(date_from, end_dt.strftime("%Y-%m-%d"))
         await save_to_cache(cache_key, result)
         if progress_callback:
             await progress_callback("Финансы загружены", 100)
@@ -808,7 +824,7 @@ async def fetch_finance_transactions(date_from, date_to, progress_callback=None)
         if progress_callback:
             progress = int((i / total_months) * 100) if total_months > 0 else 100
             await progress_callback(f"Загрузка финансов {m_start}–{m_end}", progress)
-        all_transactions.extend(await fetch_finance_transactions_single(m_start, m_end))
+        all_transactions.extend(await fetch_finance_transactions_parallel(m_start, m_end))
     write_log(f"💰 Всего загружено финансовых транзакций: {len(all_transactions)} за {date_from}–{date_to}")
     await save_to_cache(cache_key, all_transactions)
     if progress_callback:
@@ -858,8 +874,11 @@ def aggregate_finance_expenses(transactions):
 
     return expense_by_type
 
-# ---------- АГРЕГАЦИЯ ОТГРУЗОК ----------
+# ---------- АГРЕГАЦИЯ ОТГРУЗОК (оптимизированная многопроходная) ----------
 def aggregate_postings(postings, date_from=None, date_to=None, time_limit=None, apply_limit_on_day=None):
+    """
+    Оригинальная функция агрегации – оставлена для совместимости.
+    """
     aggregated = {}
     for posting in postings:
         created_at = posting.get("created_at", "")
@@ -915,6 +934,71 @@ def aggregate_postings(postings, date_from=None, date_to=None, time_limit=None, 
             aggregated[date_str]["delivered_sum"] += total_sum
 
     return aggregated
+
+def aggregate_postings_multi(postings, ranges):
+    """
+    Агрегирует постинги за один проход для нескольких диапазонов.
+    ranges: список кортежей (label, date_from, date_to, time_limit, apply_limit_on_day)
+    Возвращает словарь {label: aggregated_dict}
+    """
+    # Инициализация результатов для каждого диапазона
+    results = {label: {
+        "ordered_units": 0,
+        "ordered_sum": 0.0,
+        "delivered_units": 0,
+        "delivered_sum": 0.0,
+        "canceled_units": 0,
+        "canceled_sum": 0.0,
+    } for label, _, _, _, _ in ranges}
+
+    for posting in postings:
+        created_at = posting.get("created_at", "")
+        if not created_at:
+            continue
+        try:
+            dt = datetime.datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+            dt_msk = dt.astimezone(MOSCOW_TZ)
+        except:
+            continue
+        date_str = dt_msk.date().isoformat()
+        time = dt_msk.time()
+
+        # Проверяем каждый диапазон
+        for label, date_from, date_to, time_limit, apply_day in ranges:
+            if date_from and date_str < date_from:
+                continue
+            if date_to and date_str > date_to:
+                continue
+            if time_limit is not None and apply_day is not None and date_str == apply_day:
+                if time > time_limit:
+                    continue
+
+            # Попадает в диапазон – добавляем
+            products = posting.get("products", [])
+            total_units = 0
+            total_sum = 0.0
+            for product in products:
+                qty = int(product.get("quantity", 0))
+                price_str = product.get("price", "0")
+                try:
+                    price = float(price_str)
+                except:
+                    price = 0.0
+                total_units += qty
+                total_sum += price * qty
+
+            status = posting.get("status", "")
+            res = results[label]
+            res["ordered_units"] += total_units
+            res["ordered_sum"] += total_sum
+            if status in ("cancelled", "canceled"):
+                res["canceled_units"] += total_units
+                res["canceled_sum"] += total_sum
+            elif status in ("delivered", "completed"):
+                res["delivered_units"] += total_units
+                res["delivered_sum"] += total_sum
+
+    return results
 
 # ---------- ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА ДАННЫХ ----------
 async def fetch_metrics_parallel(date_from, date_to, progress_callback=None):
@@ -1398,68 +1482,25 @@ async def format_combined_metrics_with_deltas(include_yesterday=False, progress_
     if progress_callback:
         await progress_callback("Отгрузки загружены, агрегируем...", 30)
 
-    agg_yesterday_full = aggregate_postings(
-        postings_current,
-        date_from=yesterday_str,
-        date_to=yesterday_str
-    )
-    yesterday_full_metrics = agg_yesterday_full.get(yesterday_str, {}) if yesterday_str in agg_yesterday_full else {}
+    # Используем оптимизированную агрегацию за один проход для каждого набора постингов
+    ranges_current = [
+        ("today", today_str, today_str, current_time, today_str),
+        ("yesterday", yesterday_str, yesterday_str, current_time, yesterday_str),
+        ("yesterday_full", yesterday_str, yesterday_str, None, None),
+        ("month", current_month_start_str, current_month_end_str, current_time, today_str),
+    ]
+    ranges_prev = [
+        ("prev_month", previous_month_start_str, prev_period_end_str, current_time, prev_period_end_str),
+    ]
 
-    agg_today = aggregate_postings(
-        postings_current,
-        date_from=today_str,
-        date_to=today_str,
-        time_limit=current_time,
-        apply_limit_on_day=today_str
-    )
-    today_metrics = agg_today.get(today_str, {}) if today_str in agg_today else {}
+    agg_results_current = aggregate_postings_multi(postings_current, ranges_current)
+    agg_results_prev = aggregate_postings_multi(postings_prev, ranges_prev)
 
-    agg_yesterday = aggregate_postings(
-        postings_current,
-        date_from=yesterday_str,
-        date_to=yesterday_str,
-        time_limit=current_time,
-        apply_limit_on_day=yesterday_str
-    )
-    yesterday_metrics = agg_yesterday.get(yesterday_str, {}) if yesterday_str in agg_yesterday else {}
-
-    agg_current_month = aggregate_postings(
-        postings_current,
-        date_from=current_month_start_str,
-        date_to=current_month_end_str,
-        time_limit=current_time,
-        apply_limit_on_day=today_str
-    )
-    month_metrics = {
-        "ordered_units": 0,
-        "ordered_sum": 0.0,
-        "delivered_units": 0,
-        "delivered_sum": 0.0,
-        "canceled_units": 0,
-        "canceled_sum": 0.0,
-    }
-    for vals in agg_current_month.values():
-        for key in month_metrics:
-            month_metrics[key] += vals.get(key, 0)
-
-    agg_prev_month = aggregate_postings(
-        postings_prev,
-        date_from=previous_month_start_str,
-        date_to=prev_period_end_str,
-        time_limit=current_time,
-        apply_limit_on_day=prev_period_end_str
-    )
-    prev_month_metrics = {
-        "ordered_units": 0,
-        "ordered_sum": 0.0,
-        "delivered_units": 0,
-        "delivered_sum": 0.0,
-        "canceled_units": 0,
-        "canceled_sum": 0.0,
-    }
-    for vals in agg_prev_month.values():
-        for key in prev_month_metrics:
-            prev_month_metrics[key] += vals.get(key, 0)
+    today_metrics = agg_results_current.get("today", {})
+    yesterday_metrics = agg_results_current.get("yesterday", {})
+    yesterday_full_metrics = agg_results_current.get("yesterday_full", {})
+    month_metrics = agg_results_current.get("month", {})
+    prev_month_metrics = agg_results_prev.get("prev_month", {})
 
     if progress_callback:
         await progress_callback("Загрузка рекламы и финансов...", 50)
