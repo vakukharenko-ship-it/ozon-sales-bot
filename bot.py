@@ -25,8 +25,8 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ И ИСТОРИЯ ====================
-VERSION = "2.3.4"
-CHANGELOG_MESSAGE = "Снижен лимит запросов до 0.5/сек, увеличены задержки ретраев. Исправлено зависание из-за 429 Too Many Requests."
+VERSION = "2.3.5"
+CHANGELOG_MESSAGE = "Семафор на 1 одновременный запрос к Ozon API, последовательная загрузка данных. Исправлено зависание из-за 429."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 30
@@ -34,7 +34,7 @@ API_MAX_DAYS_PER_REQUEST = 90
 API_RETRY_ATTEMPTS = 3
 API_RETRY_DELAY = 5
 CACHE_TTL_SECONDS = 300
-RATE_LIMIT_REQUESTS_PER_SECOND = 0.5
+RATE_LIMIT_REQUESTS_PER_SECOND = 1.0
 SETTINGS_FILE = "settings.json"
 VERSION_HISTORY_FILE = "version_history.json"
 SETTINGS_LOCK = asyncio.Lock()
@@ -43,6 +43,7 @@ LOG_FILE = "/app/data/ozon_log.txt"
 # ==================== ГЛОБАЛЬНЫЕ ОБЪЕКТЫ ====================
 _http_session = None
 _rate_limiter = None
+_api_semaphore = None
 _cache_lock = asyncio.Lock()
 _api_cache = {}
 _cache_timestamps = {}
@@ -70,7 +71,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID_STR = os.getenv("ADMIN_CHAT_ID")
 ADMIN_CHAT_ID = int(ADMIN_CHAT_ID_STR) if ADMIN_CHAT_ID_STR and ADMIN_CHAT_ID_STR.isdigit() else 0
 
-# Актуальные эндпоинты Ozon API
 OZON_POSTING_FBO_URL = "https://api-seller.ozon.ru/v2/posting/fbo/list"
 OZON_FINANCE_ACCRUAL_BY_DAY_URL = "https://api-seller.ozon.ru/v1/finance/accrual/by-day"
 MANAGERS_FILE = "managers.json"
@@ -105,7 +105,6 @@ WAITING_PRODUCT_SINGLE_YEAR = 33
 WAITING_PRODUCT_RANGE_START = 34
 WAITING_PRODUCT_RANGE_END = 35
 
-# Состояния для раздела "Автоматические рассылки"
 WAITING_AUTO_SCHEDULE = 40
 WAITING_AUTO_YESTERDAY = 41
 WAITING_AUTO_SILENCE_START = 42
@@ -188,15 +187,6 @@ async def save_settings(settings: Dict):
             write_log("✅ Настройки сохранены.")
         except Exception as e:
             write_log(f"❌ Ошибка сохранения настроек: {e}")
-
-def get_default_settings() -> Dict:
-    return {
-        "schedule_hours": [],
-        "yesterday_report_hours": [],
-        "silence_start": None,
-        "silence_end": None,
-        "last_yesterday_report_sent": None
-    }
 
 # ---------- РАБОТА С МЕНЕДЖЕРАМИ ----------
 def load_managers():
@@ -551,8 +541,9 @@ class RateLimiter:
 
 # ==================== ИНИЦИАЛИЗАЦИЯ HTTP СЕССИИ ====================
 async def init_http_session(app):
-    global _http_session, _rate_limiter
+    global _http_session, _rate_limiter, _api_semaphore
     _rate_limiter = RateLimiter()
+    _api_semaphore = asyncio.Semaphore(1)
     timeout = aiohttp.ClientTimeout(total=API_TIMEOUT)
     connector = aiohttp.TCPConnector(limit=50, limit_per_host=10, ttl_dns_cache=300)
     _http_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
@@ -566,47 +557,48 @@ async def close_http_session(app):
 
 # ==================== ФУНКЦИИ API С RETRY ====================
 async def api_request_with_retry(url, headers, payload=None, method='POST'):
-    global _http_session, _rate_limiter
-    for attempt in range(API_RETRY_ATTEMPTS):
-        try:
-            await _rate_limiter.acquire()
-            if method == 'POST':
-                async with _http_session.post(url, headers=headers, json=payload) as resp:
-                    if resp.status == 429:
-                        wait_time = API_RETRY_DELAY * (2 ** attempt)
-                        write_log(f"⚠️ Rate limit hit, waiting {wait_time}s...")
-                        await asyncio.sleep(wait_time)
-                        continue
-                    if resp.status >= 400:
-                        body = await resp.text()
-                        write_log(f"❌ API error {resp.status} для {url}: {body[:500]}")
-                    resp.raise_for_status()
-                    return await resp.json()
-            else:
-                async with _http_session.get(url, headers=headers, params=payload) as resp:
-                    if resp.status == 429:
-                        wait_time = API_RETRY_DELAY * (2 ** attempt)
-                        write_log(f"⚠️ Rate limit hit, waiting {wait_time}s...")
-                        await asyncio.sleep(wait_time)
-                        continue
-                    if resp.status >= 400:
-                        body = await resp.text()
-                        write_log(f"❌ API error {resp.status} для {url}: {body[:500]}")
-                    resp.raise_for_status()
-                    return await resp.json()
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            if attempt == API_RETRY_ATTEMPTS - 1:
-                write_log(f"❌ API request failed after {API_RETRY_ATTEMPTS} attempts: {e}")
-                if hasattr(e, 'response') and e.response:
-                    try:
-                        body = await e.response.text()
-                        write_log(f"Тело ответа: {body[:500]}")
-                    except:
-                        pass
-                raise
-            write_log(f"⚠️ Request failed (attempt {attempt+1}/{API_RETRY_ATTEMPTS}): {e}")
-            await asyncio.sleep(API_RETRY_DELAY * (attempt + 1))
-    raise Exception("API request failed after retries")
+    global _http_session, _rate_limiter, _api_semaphore
+    async with _api_semaphore:
+        for attempt in range(API_RETRY_ATTEMPTS):
+            try:
+                await _rate_limiter.acquire()
+                if method == 'POST':
+                    async with _http_session.post(url, headers=headers, json=payload) as resp:
+                        if resp.status == 429:
+                            wait_time = API_RETRY_DELAY * (2 ** attempt)
+                            write_log(f"⚠️ Rate limit hit, waiting {wait_time}s...")
+                            await asyncio.sleep(wait_time)
+                            continue
+                        if resp.status >= 400:
+                            body = await resp.text()
+                            write_log(f"❌ API error {resp.status} для {url}: {body[:500]}")
+                        resp.raise_for_status()
+                        return await resp.json()
+                else:
+                    async with _http_session.get(url, headers=headers, params=payload) as resp:
+                        if resp.status == 429:
+                            wait_time = API_RETRY_DELAY * (2 ** attempt)
+                            write_log(f"⚠️ Rate limit hit, waiting {wait_time}s...")
+                            await asyncio.sleep(wait_time)
+                            continue
+                        if resp.status >= 400:
+                            body = await resp.text()
+                            write_log(f"❌ API error {resp.status} для {url}: {body[:500]}")
+                        resp.raise_for_status()
+                        return await resp.json()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                if attempt == API_RETRY_ATTEMPTS - 1:
+                    write_log(f"❌ API request failed after {API_RETRY_ATTEMPTS} attempts: {e}")
+                    if hasattr(e, 'response') and e.response:
+                        try:
+                            body = await e.response.text()
+                            write_log(f"Тело ответа: {body[:500]}")
+                        except:
+                            pass
+                    raise
+                write_log(f"⚠️ Request failed (attempt {attempt+1}/{API_RETRY_ATTEMPTS}): {e}")
+                await asyncio.sleep(API_RETRY_DELAY * (attempt + 1))
+        raise Exception("API request failed after retries")
 
 # ---------- ТОКЕН PERFORMANCE ----------
 async def get_performance_token():
@@ -813,8 +805,6 @@ async def fetch_finance_transactions(date_from, date_to, progress_callback=None)
         day_accruals = await fetch_finance_accruals_by_day(date_str)
         all_accruals.extend(day_accruals)
         current += datetime.timedelta(days=1)
-        # Дополнительная пауза между днями, чтобы не превышать лимит
-        await asyncio.sleep(0.5)
 
     write_log(f"💰 Загружено начислений: {len(all_accruals)} за {date_from}–{date_to}")
     await save_to_cache(cache_key, all_accruals)
@@ -940,14 +930,13 @@ def aggregate_postings_multi(postings, ranges):
                 res["delivered_sum"] += total_sum
     return results
 
-# ---------- ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА ДАННЫХ ----------
+# ---------- ПОСЛЕДОВАТЕЛЬНАЯ ЗАГРУЗКА ДАННЫХ ----------
 async def fetch_metrics_parallel(date_from, date_to, progress_callback=None):
     if progress_callback:
         await progress_callback("Начинаем загрузку данных...", 0)
-    postings_task = fetch_postings(date_from, date_to)
-    ad_task = fetch_advertising_expense(date_from, date_to)
-    finance_task = fetch_finance_transactions(date_from, date_to)
-    postings, ad_expense, transactions = await asyncio.gather(postings_task, ad_task, finance_task)
+    postings = await fetch_postings(date_from, date_to)
+    ad_expense = await fetch_advertising_expense(date_from, date_to)
+    transactions = await fetch_finance_transactions(date_from, date_to)
     if progress_callback:
         await progress_callback("Все данные загружены", 100)
     return postings, ad_expense, transactions
@@ -1297,10 +1286,9 @@ async def get_metrics_for_date(date_str, progress_callback=None):
     today = get_moscow_today()
     start = (today - datetime.timedelta(days=183)).strftime("%Y-%m-%d")
     end = today.strftime("%Y-%m-%d")
-    postings_task = fetch_postings(start, end, progress_callback)
-    ad_task = fetch_advertising_expense(date_str, date_str, progress_callback)
-    fin_task = fetch_finance_transactions(date_str, date_str, progress_callback)
-    postings, ad_expense, transactions = await asyncio.gather(postings_task, ad_task, fin_task)
+    postings = await fetch_postings(start, end)
+    ad_expense = await fetch_advertising_expense(date_str, date_str)
+    transactions = await fetch_finance_transactions(date_str, date_str)
     if progress_callback:
         await progress_callback("Агрегируем данные...", 80)
     agg = aggregate_postings(postings, date_from=date_str, date_to=date_str)
@@ -1349,9 +1337,8 @@ async def format_combined_metrics_with_deltas(include_yesterday=False, progress_
 
     if progress_callback:
         await progress_callback("Загрузка отгрузок за текущий месяц...", 10)
-    postings_current_task = fetch_postings(current_month_start_str, current_month_end_str)
-    postings_prev_task = fetch_postings(previous_month_start_str, previous_month_end_str)
-    postings_current, postings_prev = await asyncio.gather(postings_current_task, postings_prev_task)
+    postings_current = await fetch_postings(current_month_start_str, current_month_end_str)
+    postings_prev = await fetch_postings(previous_month_start_str, previous_month_end_str)
     if progress_callback:
         await progress_callback("Отгрузки загружены, агрегируем...", 30)
 
@@ -1377,17 +1364,13 @@ async def format_combined_metrics_with_deltas(include_yesterday=False, progress_
     if progress_callback:
         await progress_callback("Загрузка рекламы и финансов...", 50)
 
-    ad_today_task = fetch_advertising_expense(today_str, today_str)
-    ad_yesterday_task = fetch_advertising_expense(yesterday_str, yesterday_str)
-    ad_month_task = fetch_advertising_expense(current_month_start_str, today_str)
-    ad_prev_task = fetch_advertising_expense(previous_month_start_str, prev_period_end_str)
-    fin_today_task = fetch_finance_transactions(today_str, today_str)
-    fin_month_task = fetch_finance_transactions(current_month_start_str, today_str)
+    ad_today = await fetch_advertising_expense(today_str, today_str)
+    ad_yesterday = await fetch_advertising_expense(yesterday_str, yesterday_str)
+    ad_month = await fetch_advertising_expense(current_month_start_str, today_str)
+    ad_prev_period = await fetch_advertising_expense(previous_month_start_str, prev_period_end_str)
+    fin_today = await fetch_finance_transactions(today_str, today_str)
+    fin_month = await fetch_finance_transactions(current_month_start_str, today_str)
 
-    ad_today, ad_yesterday, ad_month, ad_prev_period, fin_today, fin_month = await asyncio.gather(
-        ad_today_task, ad_yesterday_task, ad_month_task, ad_prev_task,
-        fin_today_task, fin_month_task
-    )
     if progress_callback:
         await progress_callback("Данные загружены, формируем отчёт...", 80)
 
@@ -1585,11 +1568,9 @@ async def get_product_data_prev_month():
     return products
 
 async def format_product_combined():
-    products_today, products_month, products_prev_month = await asyncio.gather(
-        get_product_data_today(),
-        get_product_data_month(),
-        get_product_data_prev_month()
-    )
+    products_today = await get_product_data_today()
+    products_month = await get_product_data_month()
+    products_prev_month = await get_product_data_prev_month()
 
     parts = []
     parts.append(format_top_products(products_today, "Топ товаров за сегодня", limit=15))
