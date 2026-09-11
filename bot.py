@@ -25,16 +25,16 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ И ИСТОРИЯ ====================
-VERSION = "2.3.5"
-CHANGELOG_MESSAGE = "Семафор на 1 одновременный запрос к Ozon API, последовательная загрузка данных. Исправлено зависание из-за 429."
+VERSION = "2.3.6"
+CHANGELOG_MESSAGE = "Переход на /v3/posting/fbo/list. Увеличен интервал между запросами до 3 секунд. Исправлено зависание из-за 429."
 
 # ==================== КОНСТАНТЫ ====================
-API_TIMEOUT = 30
+API_TIMEOUT = 60
 API_MAX_DAYS_PER_REQUEST = 90
 API_RETRY_ATTEMPTS = 3
-API_RETRY_DELAY = 5
+API_RETRY_DELAY = 10
 CACHE_TTL_SECONDS = 300
-RATE_LIMIT_REQUESTS_PER_SECOND = 1.0
+RATE_LIMIT_REQUESTS_PER_SECOND = 0.33  # ~1 запрос в 3 секунды
 SETTINGS_FILE = "settings.json"
 VERSION_HISTORY_FILE = "version_history.json"
 SETTINGS_LOCK = asyncio.Lock()
@@ -71,7 +71,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID_STR = os.getenv("ADMIN_CHAT_ID")
 ADMIN_CHAT_ID = int(ADMIN_CHAT_ID_STR) if ADMIN_CHAT_ID_STR and ADMIN_CHAT_ID_STR.isdigit() else 0
 
-OZON_POSTING_FBO_URL = "https://api-seller.ozon.ru/v2/posting/fbo/list"
+# Актуальные эндпоинты Ozon API
+OZON_POSTING_FBO_URL = "https://api-seller.ozon.ru/v3/posting/fbo/list"
 OZON_FINANCE_ACCRUAL_BY_DAY_URL = "https://api-seller.ozon.ru/v1/finance/accrual/by-day"
 MANAGERS_FILE = "managers.json"
 
@@ -621,7 +622,7 @@ async def get_performance_token():
         write_log(f"❌ Ошибка при запросе токена: {e}")
         return None
 
-# ---------- ОТГРУЗКИ (FBO v2) ----------
+# ---------- ОТГРУЗКИ (FBO v3) ----------
 async def fetch_postings(date_from, date_to, progress_callback=None):
     cache_key = f"fetch_postings_{date_from}_{date_to}"
     cached = await get_from_cache(cache_key)
