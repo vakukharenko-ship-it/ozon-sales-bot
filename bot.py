@@ -25,16 +25,16 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ И ИСТОРИЯ ====================
-VERSION = "2.3.3"
-CHANGELOG_MESSAGE = "Исправлен метод получения отгрузок FBO: /v2/posting/fbo/list с filter.since/filter.to. Улучшена агрегация финансовых начислений."
+VERSION = "2.3.4"
+CHANGELOG_MESSAGE = "Снижен лимит запросов до 0.5/сек, увеличены задержки ретраев. Исправлено зависание из-за 429 Too Many Requests."
 
 # ==================== КОНСТАНТЫ ====================
-API_TIMEOUT = 15
+API_TIMEOUT = 30
 API_MAX_DAYS_PER_REQUEST = 90
 API_RETRY_ATTEMPTS = 3
-API_RETRY_DELAY = 2
+API_RETRY_DELAY = 5
 CACHE_TTL_SECONDS = 300
-RATE_LIMIT_REQUESTS_PER_SECOND = 2
+RATE_LIMIT_REQUESTS_PER_SECOND = 0.5
 SETTINGS_FILE = "settings.json"
 VERSION_HISTORY_FILE = "version_history.json"
 SETTINGS_LOCK = asyncio.Lock()
@@ -534,7 +534,7 @@ def format_period_comparison_metrics(metrics_current, metrics_prev, period_name)
 
     return "\n".join(lines)
 
-# ==================== КЛАСС ДЛЯ РЕЙТ-ЛИМИТА ====================
+# ==================== КЛАСС ДЛЯ РЕЙТ-ЛИМИТА (СЕРИАЛИЗУЮЩИЙ) ====================
 class RateLimiter:
     def __init__(self, rate=RATE_LIMIT_REQUESTS_PER_SECOND):
         self.rate = rate
@@ -636,7 +636,6 @@ async def fetch_postings(date_from, date_to, progress_callback=None):
     if cached is not None:
         return cached
     headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY, "Content-Type": "application/json"}
-    # Формируем ISO-даты с временем
     since_iso = f"{date_from}T00:00:00.000Z"
     to_iso = f"{date_to}T23:59:59.999Z"
     payload = {
@@ -762,7 +761,6 @@ async def fetch_advertising_expense(date_from, date_to, progress_callback=None):
 
 # ---------- ФИНАНСОВЫЕ НАЧИСЛЕНИЯ (новый метод) ----------
 async def fetch_finance_accruals_by_day(date_str: str) -> List[Dict]:
-    """Загружает начисления за один день через /v1/finance/accrual/by-day."""
     headers = {
         "Client-Id": OZON_CLIENT_ID,
         "Api-Key": OZON_API_KEY,
@@ -790,7 +788,6 @@ async def fetch_finance_accruals_by_day(date_str: str) -> List[Dict]:
     return all_accruals
 
 async def fetch_finance_transactions(date_from, date_to, progress_callback=None):
-    """Собирает финансовые начисления за период, разбивая его по дням."""
     cache_key = f"fetch_finance_transactions_{date_from}_{date_to}"
     cached = await get_from_cache(cache_key)
     if cached is not None:
@@ -816,6 +813,8 @@ async def fetch_finance_transactions(date_from, date_to, progress_callback=None)
         day_accruals = await fetch_finance_accruals_by_day(date_str)
         all_accruals.extend(day_accruals)
         current += datetime.timedelta(days=1)
+        # Дополнительная пауза между днями, чтобы не превышать лимит
+        await asyncio.sleep(0.5)
 
     write_log(f"💰 Загружено начислений: {len(all_accruals)} за {date_from}–{date_to}")
     await save_to_cache(cache_key, all_accruals)
@@ -823,12 +822,10 @@ async def fetch_finance_transactions(date_from, date_to, progress_callback=None)
         await progress_callback("Финансы загружены", 100)
     return all_accruals
 
-# ---------- АГРЕГАЦИЯ ФИНАНСОВ (под новую структуру) ----------
+# ---------- АГРЕГАЦИЯ ФИНАНСОВ ----------
 def aggregate_finance_expenses(accruals: List[Dict]) -> Dict[str, float]:
-    """Агрегирует расходы из списка начислений нового метода."""
     expense_by_type = {}
     for item in accruals:
-        # Пытаемся извлечь сумму
         amount = item.get("amount")
         if amount is None:
             amount = item.get("value", 0)
@@ -836,14 +833,11 @@ def aggregate_finance_expenses(accruals: List[Dict]) -> Dict[str, float]:
             amount = float(amount)
         except (TypeError, ValueError):
             continue
-        # Категория
         category = item.get("accrued_category") or item.get("name") or item.get("type") or "Прочее"
         if isinstance(category, dict):
             category = category.get("name", "Прочее")
-        # Если сумма отрицательная — это расход, берём модуль
         if amount < 0:
             expense_by_type[category] = expense_by_type.get(category, 0) + abs(amount)
-        # Если сумма положительная, но категория явно расходная (содержит ключевые слова)
         elif amount > 0 and any(kw in category.lower() for kw in ["комиссия", "доставка", "логистика", "эквайринг", "хранение", "возврат", "упаковка", "страхование", "утилизация", "потеря", "кросс-докинг"]):
             expense_by_type[category] = expense_by_type.get(category, 0) + abs(amount)
     return expense_by_type
