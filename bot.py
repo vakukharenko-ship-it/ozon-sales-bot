@@ -29,8 +29,8 @@ from telegram.warnings import PTBUserWarning
 
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
-VERSION = "2.9.1"
-CHANGELOG_MESSAGE = "Справка и руководство теперь содержат ASCII-схемы меню (визуальные 'скриншоты' разделов). Кнопка '📚 Руководство' добавлена в главное меню и в раздел '⚙️ Администрирование'."
+VERSION = "2.9.2"
+CHANGELOG_MESSAGE = "Исправлена кнопка '🔙 Назад' (не работала из подменю после 2.9.1). Справочник расходов теперь подменяет устаревшие названия '(type XX)' актуальными из accrual_types.json. Улучшена разбивка длинных сообщений — код-блоки (```) больше не разрезаются, устранена ошибка 'Can't parse entities'."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 60
@@ -567,6 +567,8 @@ def prev_period(df, dt):
 
 # ==================== РАЗБИВКА ДЛИННЫХ СООБЩЕНИЙ ====================
 def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> List[str]:
+    """Разбивает текст на части. Не разрезает код-блоки (```) — если естественная
+    точка разбивки попадает внутрь открытого код-блока, сдвигаем её к закрывающим ```."""
     if not text: return [""]
     if len(text) <= max_len: return [text]
     parts: List[str] = []
@@ -577,6 +579,17 @@ def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> List[str]:
         split_pos = remaining.rfind('\n', 0, max_len)
         if split_pos <= 0: split_pos = remaining.rfind(' ', 0, max_len)
         if split_pos <= 0: split_pos = max_len
+        # Проверяем: не разрезаем ли мы открытый код-блок
+        prefix = remaining[:split_pos]
+        if prefix.count('```') % 2 == 1:
+            last_open = prefix.rfind('```')
+            closing = remaining.find('```', last_open + 3)
+            if closing > 0:
+                next_nl = remaining.find('\n', closing + 3)
+                if next_nl > 0 and next_nl < max_len + 500:
+                    split_pos = next_nl
+                else:
+                    split_pos = closing + 3
         chunk = remaining[:split_pos].rstrip()
         if not chunk:
             chunk = remaining[:max_len]; split_pos = max_len
@@ -1871,7 +1884,7 @@ def hours_kb_silence(prefix):
     kb.append([InlineKeyboardButton("🔙 Назад", callback_data=f"{prefix}back")])
     return InlineKeyboardMarkup(kb)
 
-# ==================== ASCII-СХЕМЫ МЕНЮ (визуальные "скриншоты") ====================
+# ==================== ASCII-СХЕМЫ МЕНЮ ====================
 def _scheme_main_menu() -> str:
     return (
         "```\n"
@@ -2294,11 +2307,13 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "📚 Руководство":
         await send_guide(update, context)
 
-async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик кнопки «📚 Руководство» из раздела администрирования."""
-    text = update.message.text
-    if text == "📚 Руководство":
-        await send_guide(update, context)
+async def back_to_main_menu(update, context):
+    """Глобальный обработчик кнопки «🔙 Назад» — возврат в главное меню."""
+    chat_id = update.effective_chat.id
+    if not has_access(chat_id):
+        await update.message.reply_text("❌ Нет доступа.", reply_markup=access_check_kb())
+        return
+    await update.message.reply_text("🏠 Главное меню:", reply_markup=main_kb(chat_id))
 
 # ==================== ОТЧЁТ ПО РЕКЛАМЕ — текущий месяц ====================
 async def ad_report_month_handler(update, context):
@@ -2674,18 +2689,35 @@ async def show_expense_types(update, context):
     data = get_expense_types()
     if not data:
         await update.message.reply_text("Справочник пуст."); return
+    # Подгружаем справочник начислений Ozon для актуализации названий
+    accrual = _accrual_types_cache
+    if not accrual:
+        accrual = _load_accrual_types_sync()
     items = []
+    updated = False
     for tid, entry in data.items():
         if isinstance(entry, dict):
             name = entry.get("name", "?"); cnt = entry.get("count", 0); sm = entry.get("sum", 0.0)
         else:
             name = str(entry); cnt = 0; sm = 0.0
+        # Если есть официальное название — заменяем устаревшее "(type XX)"
+        if tid in accrual:
+            official = accrual[tid]
+            if name != official:
+                if isinstance(entry, dict):
+                    entry["name"] = official
+                else:
+                    data[tid] = {"name": official, "count": cnt, "sum": sm}
+                name = official
+                updated = True
         items.append((tid, name, cnt, sm))
+    if updated:
+        _save_expense_types_sync(data)
     def sort_key(x):
         is_unknown = x[1].startswith("❓") or "(type " in x[1]
         return (is_unknown, -x[3])
     items.sort(key=sort_key)
-    known = [i for i in items if not (i[1].startswith("❓") or "(type " in i[1] and "Услуги" in i[1])]
+    known = [i for i in items if not (i[1].startswith("❓") or "(type " in i[1])]
     unknown = [i for i in items if i not in known]
     lines = ["📚 *Справочник расходов*", ""]
     lines.append(f"*Распознано:* {len(known)} | *Требуют уточнения:* {len(unknown)}")
@@ -2710,7 +2742,7 @@ async def expense_types_cb(update, context):
         await q.edit_message_text("⛔ Только для админа."); return
     if d == "et_back":
         await q.edit_message_text("Главное меню:", reply_markup=None)
-        await q.message.reply_text("Выберите действие:", reply_markup=main_kb(chat_id))
+        await q.message.reply_text("🏠 Главное меню:", reply_markup=main_kb(chat_id))
     elif d == "et_refresh":
         global _expense_types_cache, _accrual_types_cache
         _expense_types_cache = _load_expense_types_sync()
@@ -3433,8 +3465,6 @@ async def auto_menu_router(update, context):
     elif t == "📅 Добавление отчета за Вчера": await auto_yesterday_start(update, context)
     elif t == "🔕 Режим тишины": await auto_silence_start(update, context)
     elif t == "📤 Отправить отчет за Вчера сейчас": await auto_send_now(update, context)
-    elif t == "🔙 Назад":
-        await update.message.reply_text("Главное меню:", reply_markup=main_kb(update.effective_chat.id))
 
 async def schedule_cb(update, context):
     q = update.callback_query; await q.answer(); d = q.data
@@ -3716,7 +3746,7 @@ def main():
     app.add_handler(CommandHandler("clearcache", clearcache_command))
     app.add_handler(CommandHandler("accrual_types", accrual_types_command))
 
-    # ===== Главное меню =====
+    # ===== Главное меню (все кнопки верхнего уровня) =====
     app.add_handler(MessageHandler(filters.Regex(
         "^(📊 Отчёт по продажам|📦 Отчёт по товарам|📈 Отчёт по рекламе|"
         "🔔 Автоматические рассылки|⚙️ Администрирование|"
@@ -3730,6 +3760,8 @@ def main():
     app.add_handler(MessageHandler(filters.Text(["📅 Топ товаров за сегодня"]), top_today))
     app.add_handler(MessageHandler(filters.Text(["📋 Список менеджеров"]), admin_list))
     app.add_handler(MessageHandler(filters.Text(["📅 Реклама за текущий месяц"]), ad_report_month_handler))
+    # Глобальная кнопка «Назад» — возвращает в главное меню
+    app.add_handler(MessageHandler(filters.Text(["🔙 Назад"]), back_to_main_menu))
 
     # ===== Меню автоматических рассылок =====
     app.add_handler(MessageHandler(filters.Regex(
