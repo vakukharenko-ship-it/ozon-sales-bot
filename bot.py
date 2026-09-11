@@ -16,8 +16,8 @@ from telegram.warnings import PTBUserWarning
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ ====================
-VERSION = "2.3.11"
-CHANGELOG_MESSAGE = "Полное логирование структуры начислений для составления маппинга type_id → название услуги."
+VERSION = "2.3.12"
+CHANGELOG_MESSAGE = "Новая агрегация расходов: разбор POSTING (комиссия+логистика), ITEM и NON_ITEM с человекочитаемыми названиями."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 60
@@ -50,12 +50,27 @@ OZON_FINANCE_ACCRUAL_BY_DAY_URL = "https://api-seller.ozon.ru/v1/finance/accrual
 
 MOSCOW_TZ = datetime.timezone(datetime.timedelta(hours=3))
 
-# ==================== СПРАВОЧНИК КАТЕГОРИЙ ====================
-CATEGORY_NAMES = {
-    "ITEM": "Товарные операции",
-    "NON_ITEM": "Не товарные операции",
+# ==================== СПРАВОЧНИКИ ====================
+# Названия услуг Ozon по type_id (лучшие известные + пометка для неизвестных)
+# В комментариях — как встречается в новых логах.
+TYPE_ID_NAMES = {
+    # === ITEM (по товарам) ===
+    1: "Обработка товара",                       # ITEM: -19 ₽/шт — приёмка/обработка
+    # === POSTING (по отправлениям) ===
+    29: "Последняя миля",                        # POSTING.delivery: -7..10 ₽
+    32: "Логистика",                             # POSTING.delivery: -75..146 ₽
+    98: "Доп. услуги отправления",               # POSTING.delivery: -25 ₽ (редко)
+    # === NON_ITEM (внешние услуги) ===
+    12: "Прочие услуги Ozon",                    # NON_ITEM: -340..667 ₽ (разово)
+    76: "Внешние услуги Ozon",                   # NON_ITEM: -170..190 ₽/день
+}
+
+# Fallback-названия по категории
+CATEGORY_FALLBACK = {
+    "ITEM": "Услуги по товарам",
+    "NON_ITEM": "Внешние услуги Ozon",
+    "POSTING": "Услуги отправления",
     "CONTAINER": "Контейнеры",
-    "POSTING": "Отправления",
 }
 
 # ==================== ЛОГИ ====================
@@ -125,6 +140,7 @@ def fmt_int(val):
     return str(val) if val else "0"
 
 def parse_money(obj) -> float:
+    """Универсальный парсер: {'amount': '-19.09'} | '-19.09' | -19.09 → float"""
     if obj is None:
         return 0.0
     if isinstance(obj, dict):
@@ -138,6 +154,13 @@ def parse_money(obj) -> float:
 
 def parse_price(product) -> float:
     return parse_money(product.get("price"))
+
+def type_name(type_id, category_code):
+    """Возвращает человекочитаемое имя type_id. Fallback: 'Категория (type N)'."""
+    if type_id in TYPE_ID_NAMES:
+        return TYPE_ID_NAMES[type_id]
+    fallback = CATEGORY_FALLBACK.get(category_code, "Услуги")
+    return f"{fallback} (type {type_id})" if type_id else fallback
 
 # ==================== КЭШ ====================
 async def get_from_cache(key):
@@ -239,10 +262,7 @@ async def get_performance_token():
     try:
         data = await api_request_with_retry(url, headers, payload, method='POST')
         token = data.get("access_token")
-        if token:
-            return token
-        write_log(f"❌ Токен: {data}")
-        return None
+        return token
     except Exception as e:
         write_log(f"❌ Ошибка токена: {e}")
         return None
@@ -328,32 +348,12 @@ async def fetch_finance_accruals_by_day(date_str: str) -> List[Dict]:
     headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY, "Content-Type": "application/json"}
     payload = {"date": date_str}
     all_accruals = []
-    first_page = True
     while True:
         try:
             data = await api_request_with_retry(OZON_FINANCE_ACCRUAL_BY_DAY_URL, headers, payload, method='POST')
         except Exception as e:
             write_log(f"❌ Финансы {date_str}: {e}")
             break
-
-        if first_page:
-            accruals_sample = data.get("accruals", [])
-            if accruals_sample:
-                # Полное логирование первого начисления (без обрезки)
-                write_log(f"🔎 [FIN {date_str}] ПОЛНЫЙ JSON первого начисления:")
-                write_log(json.dumps(accruals_sample[0], ensure_ascii=False, indent=2)[:3000])
-                # Если первое начисление NON_ITEM, поищем ITEM и наоборот
-                seen_cats = set()
-                for acc in accruals_sample[:30]:
-                    cat = acc.get("accrued_category", "?")
-                    if cat not in seen_cats:
-                        seen_cats.add(cat)
-                        write_log(f"🔎 [FIN {date_str}] Пример категории {cat}:")
-                        write_log(json.dumps(acc, ensure_ascii=False, indent=2)[:2500])
-                        if len(seen_cats) >= 3:
-                            break
-            first_page = False
-
         accruals = data.get("accruals", [])
         if not accruals:
             break
@@ -391,45 +391,82 @@ async def fetch_finance_transactions(date_from, date_to):
     await save_to_cache(cache_key, all_accruals)
     return all_accruals
 
-# ==================== АГРЕГАЦИЯ ====================
+# ==================== АГРЕГАЦИЯ ФИНАНСОВ (новая) ====================
 def aggregate_finance_expenses(accruals: List[Dict]) -> Dict[str, float]:
-    """Пока оставляем технические названия — маппинг будет в следующей версии."""
-    result = {}
+    """
+    Разбирает начисления по компонентам и возвращает {человекочитаемое_имя: сумма_расхода}.
+    
+    Структура accrual:
+      - POSTING: содержит posting.products[].commission (комиссия Ozon) 
+                 и posting.products[].delivery.services[] (логистика и пр.)
+      - ITEM: содержит item_fees.fees[].fees[].{type_id, accrued}
+      - NON_ITEM: содержит non_item_fee.{type_id, accrued}
+      - CONTAINER: содержит container_fees
+    """
+    result: Dict[str, float] = {}
+
+    def add(name: str, amount: float):
+        if amount > 0:
+            result[name] = result.get(name, 0.0) + amount
+
     for item in accruals:
         if not isinstance(item, dict):
             continue
-        total_amt = parse_money(item.get("total_amount", {}))
-        category_code = item.get("accrued_category", "UNKNOWN")
-        category_name = CATEGORY_NAMES.get(category_code, category_code)
+        cat = item.get("accrued_category", "")
 
-        # sub-разбивка
-        subcategories = []
-        item_fees = item.get("item_fees")
-        if isinstance(item_fees, dict):
-            for fee_group in item_fees.get("fees", []):
-                for fee in fee_group.get("fees", []):
-                    type_id = fee.get("type_id")
-                    accrued = parse_money(fee.get("accrued", {}))
-                    subcategories.append((f"type{type_id}", accrued))
-        non_item = item.get("non_item_fee")
-        if isinstance(non_item, dict):
-            # Пытаемся вытащить type_id и name, если есть
-            type_id = non_item.get("type_id")
-            name = non_item.get("name") or non_item.get("service_name")
-            accrued = parse_money(non_item.get("accrued", {}))
-            key = name or (f"type{type_id}" if type_id else "nonitem")
-            subcategories.append((key, accrued))
-        container = item.get("container_fees")
-        if isinstance(container, dict):
-            subcategories.append(("container", parse_money(container.get("accrued", container))))
+        # ---------- POSTING: комиссия + услуги доставки ----------
+        if cat == "POSTING":
+            posting = item.get("posting") or {}
+            for product in posting.get("products", []) or []:
+                # 1. Комиссия Ozon
+                comm = product.get("commission") or {}
+                sc = parse_money(comm.get("sale_commission"))
+                if sc < 0:
+                    add("Комиссия Ozon", abs(sc))
+                # 2. Услуги доставки (логистика, последняя миля, доп.)
+                delivery = product.get("delivery") or {}
+                for svc in delivery.get("services", []) or []:
+                    tid = svc.get("type_id")
+                    amt = parse_money(svc.get("accrued"))
+                    if amt < 0:
+                        name = type_name(tid, cat)
+                        add(name, abs(amt))
+            continue
 
-        if subcategories:
-            for sub_name, sub_amt in subcategories:
-                if sub_amt < 0:
-                    key = f"{category_name} / {sub_name}"
-                    result[key] = result.get(key, 0) + abs(sub_amt)
-        elif total_amt < 0:
-            result[category_name] = result.get(category_name, 0) + abs(total_amt)
+        # ---------- ITEM: услуги по товарам ----------
+        if cat == "ITEM":
+            item_fees = item.get("item_fees") or {}
+            for fee_group in item_fees.get("fees", []) or []:
+                for fee in fee_group.get("fees", []) or []:
+                    tid = fee.get("type_id")
+                    amt = parse_money(fee.get("accrued"))
+                    if amt < 0:
+                        name = type_name(tid, cat)
+                        add(name, abs(amt))
+            continue
+
+        # ---------- NON_ITEM: внешние услуги ----------
+        if cat == "NON_ITEM":
+            non = item.get("non_item_fee") or {}
+            tid = non.get("type_id")
+            amt = parse_money(non.get("accrued"))
+            if amt < 0:
+                name = type_name(tid, cat)
+                add(name, abs(amt))
+            continue
+
+        # ---------- CONTAINER ----------
+        if cat == "CONTAINER":
+            cont = item.get("container_fees") or {}
+            amt = parse_money(cont.get("accrued", cont))
+            if amt < 0:
+                add("Контейнеры", abs(amt))
+            continue
+
+        # ---------- Fallback (неизвестная категория) ----------
+        total = parse_money(item.get("total_amount"))
+        if total < 0:
+            add(cat or "Прочее", abs(total))
 
     return result
 
@@ -484,8 +521,8 @@ def format_expense_block(expenses_by_type, title):
         return f"🔹 *{title}*\nНет данных о расходах.\n"
     total = sum(expenses_by_type.values())
     lines = [f"🔹 *{title}*", f"  *Итого:* {total:,.2f} ₽"]
-    for category, amount in sorted(expenses_by_type.items(), key=lambda x: x[1], reverse=True)[:25]:
-        lines.append(f"    {str(category)[:50]}: {amount:,.2f} ₽")
+    for category, amount in sorted(expenses_by_type.items(), key=lambda x: x[1], reverse=True):
+        lines.append(f"    {category}: {amount:,.2f} ₽")
     return "\n".join(lines)
 
 def calc_delta(current, previous):
@@ -549,9 +586,9 @@ async def build_today_report():
     exp_today = aggregate_finance_expenses(fin_today)
     exp_month = aggregate_finance_expenses(fin_month)
     if ad_today > 0:
-        exp_today["Оплата за клик"] = ad_today
+        exp_today["Оплата за клик"] = exp_today.get("Оплата за клик", 0) + ad_today
     if ad_month > 0:
-        exp_month["Оплата за клик"] = ad_month
+        exp_month["Оплата за клик"] = exp_month.get("Оплата за клик", 0) + ad_month
 
     def block_today():
         os_ = today_m.get("ordered_sum", 0)
