@@ -25,8 +25,8 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ И ИСТОРИЯ ====================
-VERSION = "2.3.2"
-CHANGELOG_MESSAGE = "Миграция на /v3/posting/fbo/list и /v1/finance/accrual/by-day. Исправлена работа финансовых отчётов после отключения старых методов Ozon API."
+VERSION = "2.3.3"
+CHANGELOG_MESSAGE = "Исправлен метод получения отгрузок FBO: /v2/posting/fbo/list с filter.since/filter.to. Улучшена агрегация финансовых начислений."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
@@ -70,8 +70,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID_STR = os.getenv("ADMIN_CHAT_ID")
 ADMIN_CHAT_ID = int(ADMIN_CHAT_ID_STR) if ADMIN_CHAT_ID_STR and ADMIN_CHAT_ID_STR.isdigit() else 0
 
-# Актуальные эндпоинты Ozon API (после миграции)
-OZON_POSTING_FBO_URL = "https://api-seller.ozon.ru/v3/posting/fbo/list"
+# Актуальные эндпоинты Ozon API
+OZON_POSTING_FBO_URL = "https://api-seller.ozon.ru/v2/posting/fbo/list"
 OZON_FINANCE_ACCRUAL_BY_DAY_URL = "https://api-seller.ozon.ru/v1/finance/accrual/by-day"
 MANAGERS_FILE = "managers.json"
 
@@ -577,6 +577,9 @@ async def api_request_with_retry(url, headers, payload=None, method='POST'):
                         write_log(f"⚠️ Rate limit hit, waiting {wait_time}s...")
                         await asyncio.sleep(wait_time)
                         continue
+                    if resp.status >= 400:
+                        body = await resp.text()
+                        write_log(f"❌ API error {resp.status} для {url}: {body[:500]}")
                     resp.raise_for_status()
                     return await resp.json()
             else:
@@ -586,6 +589,9 @@ async def api_request_with_retry(url, headers, payload=None, method='POST'):
                         write_log(f"⚠️ Rate limit hit, waiting {wait_time}s...")
                         await asyncio.sleep(wait_time)
                         continue
+                    if resp.status >= 400:
+                        body = await resp.text()
+                        write_log(f"❌ API error {resp.status} для {url}: {body[:500]}")
                     resp.raise_for_status()
                     return await resp.json()
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -594,7 +600,7 @@ async def api_request_with_retry(url, headers, payload=None, method='POST'):
                 if hasattr(e, 'response') and e.response:
                     try:
                         body = await e.response.text()
-                        write_log(f"Тело ответа: {body}")
+                        write_log(f"Тело ответа: {body[:500]}")
                     except:
                         pass
                 raise
@@ -623,14 +629,31 @@ async def get_performance_token():
         write_log(f"❌ Ошибка при запросе токена: {e}")
         return None
 
-# ---------- ОТГРУЗКИ (FBO v3) ----------
+# ---------- ОТГРУЗКИ (FBO v2) ----------
 async def fetch_postings(date_from, date_to, progress_callback=None):
     cache_key = f"fetch_postings_{date_from}_{date_to}"
     cached = await get_from_cache(cache_key)
     if cached is not None:
         return cached
     headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY, "Content-Type": "application/json"}
-    payload = {"date_from": date_from, "date_to": date_to, "status": "", "limit": 1000, "offset": 0}
+    # Формируем ISO-даты с временем
+    since_iso = f"{date_from}T00:00:00.000Z"
+    to_iso = f"{date_to}T23:59:59.999Z"
+    payload = {
+        "dir": "ASC",
+        "filter": {
+            "since": since_iso,
+            "to": to_iso,
+            "status": ""
+        },
+        "limit": 1000,
+        "offset": 0,
+        "translit": False,
+        "with": {
+            "analytics_data": True,
+            "financial_data": True
+        }
+    }
     all_postings = []
     total_pages = None
     page = 0
@@ -759,9 +782,8 @@ async def fetch_finance_accruals_by_day(date_str: str) -> List[Dict]:
         if not accruals:
             break
         all_accruals.extend(accruals)
-        # Пагинация: если есть last_id или cursor — используем; иначе выходим
         last_id = data.get("last_id")
-        if last_id:
+        if last_id is not None:
             payload["last_id"] = last_id
         else:
             break
@@ -803,42 +825,27 @@ async def fetch_finance_transactions(date_from, date_to, progress_callback=None)
 
 # ---------- АГРЕГАЦИЯ ФИНАНСОВ (под новую структуру) ----------
 def aggregate_finance_expenses(accruals: List[Dict]) -> Dict[str, float]:
-    """Агрегирует расходы из списка начислений нового метода.
-    Предполагаем, что каждый элемент содержит поле 'amount' и категорию ('name' или 'accrued_category').
-    Если структура отличается — функция вернёт пустой словарь, и отчёт покажет 'Нет данных о расходах'."""
+    """Агрегирует расходы из списка начислений нового метода."""
     expense_by_type = {}
     for item in accruals:
+        # Пытаемся извлечь сумму
         amount = item.get("amount")
         if amount is None:
-            # возможно, сумма лежит в другом поле
             amount = item.get("value", 0)
         try:
             amount = float(amount)
         except (TypeError, ValueError):
             continue
-        if amount >= 0:
-            continue  # расходы отрицательные, но в новом API могут быть положительные — проверим знак
         # Категория
-        category = item.get("name") or item.get("accrued_category") or item.get("type") or "Прочее"
+        category = item.get("accrued_category") or item.get("name") or item.get("type") or "Прочее"
         if isinstance(category, dict):
             category = category.get("name", "Прочее")
-        expense_by_type[category] = expense_by_type.get(category, 0) + abs(amount)
-    # Если все суммы оказались положительными (новый API может так отдавать),
-    # попробуем взять модуль по всем элементам, у которых есть категория расхода.
-    if not expense_by_type:
-        for item in accruals:
-            amount = item.get("amount")
-            if amount is None:
-                amount = item.get("value", 0)
-            try:
-                amount = float(amount)
-            except (TypeError, ValueError):
-                continue
-            category = item.get("name") or item.get("accrued_category") or item.get("type") or "Прочее"
-            if isinstance(category, dict):
-                category = category.get("name", "Прочее")
-            if amount != 0:
-                expense_by_type[category] = expense_by_type.get(category, 0) + abs(amount)
+        # Если сумма отрицательная — это расход, берём модуль
+        if amount < 0:
+            expense_by_type[category] = expense_by_type.get(category, 0) + abs(amount)
+        # Если сумма положительная, но категория явно расходная (содержит ключевые слова)
+        elif amount > 0 and any(kw in category.lower() for kw in ["комиссия", "доставка", "логистика", "эквайринг", "хранение", "возврат", "упаковка", "страхование", "утилизация", "потеря", "кросс-докинг"]):
+            expense_by_type[category] = expense_by_type.get(category, 0) + abs(amount)
     return expense_by_type
 
 # ---------- АГРЕГАЦИЯ ОТГРУЗОК ----------
