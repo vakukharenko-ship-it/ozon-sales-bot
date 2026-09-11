@@ -29,8 +29,8 @@ from telegram.warnings import PTBUserWarning
 
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
-VERSION = "2.7.3"
-CHANGELOG_MESSAGE = "Исправлена обрезка длинных сообщений в Telegram (окончательно): сменён ключ кэша отчётов по рекламе (_v2 -> _v3), из-за чего старые обрезанные отчёты больше не подставляются. Добавлена команда /clearcache для сброса кэша вручную."
+VERSION = "2.8.0"
+CHANGELOG_MESSAGE = "Добавлена автоматическая подгрузка официальных названий расходов из Ozon API (/v1/finance/accrual/types). Теперь в отчётах вместо 'type 41' и подобных отображаются человеческие названия услуг Ozon."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 60
@@ -40,16 +40,18 @@ POSTINGS_RATE = 0.5
 FINANCE_RATE = 0.5
 PERFORMANCE_RATE = 1.0
 CACHE_TTL_SECONDS = 3600
+ACCRUAL_TYPES_TTL = 86400  # справочник начислений кэшируем на сутки
 DATA_DIR = "/app/data"
 DISK_CACHE_DIR = "/app/data/cache"
 VERSION_HISTORY_FILE = "/app/data/version_history.json"
 SETTINGS_FILE = "/app/data/settings.json"
 MANAGERS_FILE = "/app/data/managers.json"
 EXPENSE_TYPES_FILE = "/app/data/expense_types.json"
+ACCRUAL_TYPES_FILE = "/app/data/accrual_types.json"
 LOG_FILE = "/app/data/ozon_log.txt"
 
 AD_CHUNK_DAYS = 60
-TELEGRAM_MAX_LEN = 4000  # безопасный лимит (у Telegram 4096)
+TELEGRAM_MAX_LEN = 4000
 
 WAITING_DATE_SINGLE = 1
 WAITING_PERIOD_TYPE = 2
@@ -116,6 +118,7 @@ _api_cache = {}
 _cache_timestamps = {}
 _settings_lock = asyncio.Lock()
 _expense_types_cache = None
+_accrual_types_cache = None
 
 OZON_CLIENT_ID = os.getenv("OZON_CLIENT_ID")
 OZON_API_KEY = os.getenv("OZON_API_KEY")
@@ -127,6 +130,7 @@ ADMIN_CHAT_ID = int(ADMIN_CHAT_ID_STR) if ADMIN_CHAT_ID_STR and ADMIN_CHAT_ID_ST
 
 OZON_POSTING_FBO_URL = "https://api-seller.ozon.ru/v3/posting/fbo/list"
 OZON_FINANCE_ACCRUAL_BY_DAY_URL = "https://api-seller.ozon.ru/v1/finance/accrual/by-day"
+OZON_FINANCE_ACCRUAL_TYPES_URL = "https://api-seller.ozon.ru/v1/finance/accrual/types"
 
 MOSCOW_TZ = datetime.timezone(datetime.timedelta(hours=3))
 
@@ -241,16 +245,96 @@ def get_expense_types():
         _expense_types_cache = _load_expense_types_sync()
     return _expense_types_cache
 
+# ==================== СПРАВОЧНИК НАЧИСЛЕНИЙ OZON ====================
+def _load_accrual_types_sync():
+    if not os.path.exists(ACCRUAL_TYPES_FILE): return {}
+    try:
+        with open(ACCRUAL_TYPES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        write_log(f"⚠️ Чтение accrual_types: {e}"); return {}
+
+def _save_accrual_types_sync(data):
+    try:
+        os.makedirs(os.path.dirname(ACCRUAL_TYPES_FILE), exist_ok=True)
+        with open(ACCRUAL_TYPES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        write_log(f"❌ Запись accrual_types: {e}")
+
+async def fetch_accrual_types():
+    """Получает справочник начислений из Ozon API. Кэширует на сутки."""
+    global _accrual_types_cache
+    if _accrual_types_cache is not None:
+        return _accrual_types_cache
+    cached = _load_accrual_types_sync()
+    if cached:
+        _accrual_types_cache = cached
+        # проверяем TTL (по mtime файла)
+        try:
+            mtime = os.path.getmtime(ACCRUAL_TYPES_FILE)
+            if time.time() - mtime < ACCRUAL_TYPES_TTL:
+                return _accrual_types_cache
+        except Exception:
+            pass
+    headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY,
+               "Content-Type": "application/json"}
+    payload = {}
+    try:
+        data = await api_request_with_retry(OZON_FINANCE_ACCRUAL_TYPES_URL, headers,
+                                            payload, method='POST', kind='finance')
+        types_list = []
+        if isinstance(data, dict):
+            types_list = data.get("types", data.get("result", []))
+        elif isinstance(data, list):
+            types_list = data
+        result = {}
+        for item in types_list:
+            if isinstance(item, dict):
+                tid = str(item.get("id", item.get("type_id", "")))
+                name = item.get("name", item.get("title", ""))
+                if tid and name:
+                    result[tid] = name
+        if result:
+            _accrual_types_cache = result
+            _save_accrual_types_sync(result)
+            write_log(f"✅ Справочник начислений Ozon загружен ({len(result)} типов)")
+        return result
+    except Exception as e:
+        write_log(f"❌ Ошибка загрузки справочника начислений: {e}")
+        return _accrual_types_cache if _accrual_types_cache is not None else {}
+
+def get_accrual_type_name(type_id):
+    """Возвращает человеческое название типа начисления."""
+    if type_id is None:
+        return None
+    tid = str(type_id)
+    if _accrual_types_cache and tid in _accrual_types_cache:
+        return _accrual_types_cache[tid]
+    # если кэша нет — пробуем загрузить из файла
+    cached = _load_accrual_types_sync()
+    if cached and tid in cached:
+        return cached[tid]
+    return None
+
 def type_name(type_id, category_code):
     if type_id is None:
         return CATEGORY_FALLBACK.get(category_code, "Услуги")
     tid = str(type_id)
+    # 1. Пытаемся получить официальное название из Ozon
+    official = get_accrual_type_name(tid)
+    if official:
+        return official
+    # 2. Fallback из локального справочника
     data = get_expense_types()
     if tid in data:
         entry = data[tid]
         if isinstance(entry, dict):
-            return entry.get("name", f"❓ Неизвестно (type {tid})")
-        return entry
+            name = entry.get("name", "")
+            if name and not name.startswith("❓"):
+                return name
+        return str(entry)
+    # 3. Совсем fallback
     fallback = CATEGORY_FALLBACK.get(category_code, "Услуги")
     placeholder = f"{fallback} (type {tid})"
     data[tid] = {"name": placeholder, "count": 0, "sum": 0.0}
@@ -261,7 +345,10 @@ def register_expense_hit(type_id, amount):
     if type_id is None: return
     tid = str(type_id)
     data = get_expense_types()
-    if tid not in data: return
+    if tid not in data:
+        # создаём запись, но с человеческим названием, если есть
+        name = get_accrual_type_name(tid) or f"Услуги (type {tid})"
+        data[tid] = {"name": name, "count": 0, "sum": 0.0}
     entry = data[tid]
     if not isinstance(entry, dict):
         entry = {"name": entry, "count": 0, "sum": 0.0}
@@ -314,10 +401,10 @@ async def save_to_cache(key, value):
     disk_cache_set(key, value)
 
 def clear_all_cache():
-    """Полный сброс дискового и in-memory кэша."""
-    global _api_cache, _cache_timestamps
+    global _api_cache, _cache_timestamps, _accrual_types_cache
     _api_cache = {}
     _cache_timestamps = {}
+    _accrual_types_cache = None
     try:
         if os.path.isdir(DISK_CACHE_DIR):
             for f in os.listdir(DISK_CACHE_DIR):
@@ -478,7 +565,6 @@ def prev_period(df, dt):
 
 # ==================== РАЗБИВКА ДЛИННЫХ СООБЩЕНИЙ ====================
 def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> List[str]:
-    """Разбивает длинный текст на части по max_len символов, сохраняя переносы строк."""
     if not text:
         return [""]
     if len(text) <= max_len:
@@ -503,8 +589,6 @@ def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> List[str]:
     return parts
 
 async def _safe_edit(msg, text, parse_mode="Markdown"):
-    """Редактирует сообщение. Если текст длинный — редактирует первой частью,
-    остальные части отправляет отдельными сообщениями."""
     chunks = split_message(text)
     first = chunks[0]
     edited = False
@@ -1284,7 +1368,6 @@ def ad_build_report(cur_total, prev_total, cur_camps, prev_camps,
         lines.append(Lc("CTR, %", "ctr", ad_fmt_pct, True))
         lines.append("")
 
-    # БЕЗ ОБРЕЗКИ: длинный текст будет разбит функцией split_message
     return "\n".join(lines)
 
 async def _get_all_campaign_data(token, status_msg=None):
@@ -1303,7 +1386,6 @@ async def _get_all_campaign_data(token, status_msg=None):
     return campaigns, skus_by_campaign
 
 async def build_ad_report_month(status_msg=None):
-    # ВАЖНО: ключ кэша содержит _v3 — старые обрезанные отчёты _v2 больше не подтянутся
     cache_key = f"ad_report_month_{get_moscow_today().isoformat()}_v3"
     cached = await get_from_cache(cache_key)
     if cached is not None: return cached
@@ -1341,7 +1423,6 @@ async def build_ad_report_month(status_msg=None):
     return report
 
 async def build_ad_report_period(date_from: str, date_to: str, period_name: str, status_msg=None):
-    # ВАЖНО: ключ кэша содержит _v3 — старые обрезанные отчёты _v2 больше не подтянутся
     cache_key = f"ad_report_{date_from}_{date_to}_v3"
     cached = await get_from_cache(cache_key)
     if cached is not None: return cached
@@ -1882,6 +1963,21 @@ async def clearcache_command(update, context):
         write_log(f"❌ clearcache: {e}")
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
+async def accrual_types_command(update, context):
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await update.message.reply_text("⛔ Только для администратора.")
+        return
+    types = await fetch_accrual_types()
+    if not types:
+        await update.message.reply_text("❌ Не удалось загрузить справочник начислений.")
+        return
+    lines = ["📚 *Справочник начислений Ozon*", ""]
+    for tid, name in sorted(types.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 0):
+        lines.append(f"  `{tid}` → {name}")
+    text = "\n".join(lines)
+    await send_long_message(update.message, text, parse_mode="Markdown")
+
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat_id = update.effective_chat.id
@@ -2331,9 +2427,11 @@ async def expense_types_cb(update, context):
         await q.edit_message_text("Главное меню:", reply_markup=None)
         await q.message.reply_text("Выберите действие:", reply_markup=main_kb(chat_id))
     elif d == "et_refresh":
-        global _expense_types_cache
+        global _expense_types_cache, _accrual_types_cache
         _expense_types_cache = _load_expense_types_sync()
-        await q.edit_message_text("🔄 Справочник перечитан.")
+        _accrual_types_cache = None
+        await fetch_accrual_types()
+        await q.edit_message_text("🔄 Справочник перечитан и обновлён.")
 
 async def send_help(update, context):
     chat_id = update.effective_chat.id
@@ -2367,7 +2465,8 @@ async def send_help(update, context):
             "• ➖ Удалить менеджера.\n"
             "• 📋 Список менеджеров.\n"
             "• 📚 Справочник расходов.\n"
-            "• /clearcache – сбросить кэш API (принудительное обновление данных).\n\n"
+            "• /accrual_types – справочник начислений Ozon.\n"
+            "• /clearcache – сбросить кэш API.\n\n"
             f"🤖 Версия бота: {VERSION}"
         )
     else:
@@ -3367,6 +3466,7 @@ def main():
     app.add_handler(CommandHandler("help", send_help))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("clearcache", clearcache_command))
+    app.add_handler(CommandHandler("accrual_types", accrual_types_command))
     app.add_handler(MessageHandler(filters.Regex(
         "^(📊 Отчёт по продажам|📦 Отчёт по товарам|📈 Отчёт по рекламе|"
         "🔔 Автоматические рассылки|⚙️ Администрирование|"
