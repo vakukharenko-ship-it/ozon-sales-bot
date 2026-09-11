@@ -29,8 +29,8 @@ from telegram.warnings import PTBUserWarning
 
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
-VERSION = "2.7.1"
-CHANGELOG_MESSAGE = "Исправлено зависание 'Реклама за период' и 'Динамика по рекламе' — убрано дублирование MessageHandler и ConversationHandler."
+VERSION = "2.7.2"
+CHANGELOG_MESSAGE = "Исправлена обрезка длинных сообщений в Telegram: добавлена автоматическая разбивка длинных отчётов на несколько сообщений (лимит 4096 символов у Telegram). Теперь отчёты по продажам, товарам, рекламе, справочник расходов и рассылки приходят полностью, без потери данных."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 60
@@ -49,6 +49,7 @@ EXPENSE_TYPES_FILE = "/app/data/expense_types.json"
 LOG_FILE = "/app/data/ozon_log.txt"
 
 AD_CHUNK_DAYS = 60
+TELEGRAM_MAX_LEN = 4000  # безопасный лимит (у Telegram 4096)
 
 WAITING_DATE_SINGLE = 1
 WAITING_PERIOD_TYPE = 2
@@ -458,6 +459,101 @@ def prev_period(df, dt):
     prev_end = d1 - datetime.timedelta(days=1)
     prev_start = prev_end - datetime.timedelta(days=length - 1)
     return prev_start.isoformat(), prev_end.isoformat()
+
+# ==================== РАЗБИВКА ДЛИННЫХ СООБЩЕНИЙ ====================
+def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> List[str]:
+    """Разбивает длинный текст на части по max_len символов, сохраняя переносы строк.
+    Telegram допускает ~4096 символов на сообщение; берём 4000 для запаса.
+    """
+    if not text:
+        return [""]
+    if len(text) <= max_len:
+        return [text]
+    parts: List[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= max_len:
+            parts.append(remaining)
+            break
+        # Ищем последний перенос строки в пределах max_len
+        split_pos = remaining.rfind('\n', 0, max_len)
+        if split_pos <= 0:
+            # Нет переноса — ищем пробел
+            split_pos = remaining.rfind(' ', 0, max_len)
+        if split_pos <= 0:
+            # Совсем нет разделителей — режем жёстко
+            split_pos = max_len
+        chunk = remaining[:split_pos].rstrip()
+        if not chunk:
+            chunk = remaining[:max_len]
+            split_pos = max_len
+        parts.append(chunk)
+        remaining = remaining[split_pos:].lstrip('\n')
+    return parts
+
+async def _safe_edit(msg, text, parse_mode="Markdown"):
+    """Редактирует сообщение. Если текст длинный — редактирует первой частью,
+    остальные части отправляет отдельными сообщениями."""
+    chunks = split_message(text)
+    first = chunks[0]
+    edited = False
+    try:
+        await msg.edit_text(first, parse_mode=parse_mode)
+        edited = True
+    except Exception as e:
+        write_log(f"⚠️ edit_text: {e}")
+        try:
+            await msg.edit_text(first)
+            edited = True
+        except Exception as e2:
+            write_log(f"⚠️ edit_text без parse_mode: {e2}")
+    if not edited:
+        # Не смогли отредактировать — отправляем всё как новые сообщения
+        for chunk in chunks:
+            try:
+                await msg.reply_text(chunk, parse_mode=parse_mode)
+            except Exception:
+                try:
+                    await msg.reply_text(chunk)
+                except Exception as e3:
+                    write_log(f"⚠️ reply_text fallback: {e3}")
+        return
+    # Отправляем остальные части новыми сообщениями
+    for chunk in chunks[1:]:
+        try:
+            await msg.reply_text(chunk, parse_mode=parse_mode)
+        except Exception as e:
+            try:
+                await msg.reply_text(chunk)
+            except Exception as e2:
+                write_log(f"⚠️ reply_text: {e2}")
+
+async def send_long_message(message, text, parse_mode="Markdown", reply_markup=None):
+    """Отправляет длинный текст от имени Message, разбивая на части."""
+    chunks = split_message(text)
+    for i, chunk in enumerate(chunks):
+        markup = reply_markup if i == len(chunks) - 1 else None
+        try:
+            await message.reply_text(chunk, parse_mode=parse_mode, reply_markup=markup)
+        except Exception as e:
+            write_log(f"⚠️ send_long_message: {e}")
+            try:
+                await message.reply_text(chunk, reply_markup=markup)
+            except Exception as e2:
+                write_log(f"⚠️ send_long_message fallback: {e2}")
+
+async def send_long_to_bot(bot, chat_id, text, parse_mode="Markdown"):
+    """Отправляет длинный текст через bot.send_message, разбивая на части."""
+    chunks = split_message(text)
+    for chunk in chunks:
+        try:
+            await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=parse_mode)
+        except Exception as e:
+            write_log(f"⚠️ send_long_to_bot: {e}")
+            try:
+                await bot.send_message(chat_id=chat_id, text=chunk)
+            except Exception as e2:
+                write_log(f"⚠️ send_long_to_bot fallback: {e2}")
 
 # ==================== RATE LIMITER ====================
 class RateLimiter:
@@ -1181,15 +1277,8 @@ def ad_build_report(cur_total, prev_total, cur_camps, prev_camps,
         lines.append(Lc("CTR, %", "ctr", ad_fmt_pct, True))
         lines.append("")
 
-    text = "\n".join(lines)
-    if len(text) > 4000: text = text[:3950] + "\n\n_…сообщение обрезано_"
-    return text
-
-async def _safe_edit(msg, text, parse_mode="Markdown"):
-    try:
-        await msg.edit_text(text, parse_mode=parse_mode)
-    except Exception as e:
-        write_log(f"⚠️ edit_text: {e}")
+    # Без обрезки: длинный текст будет разбит функцией split_message
+    return "\n".join(lines)
 
 async def _get_all_campaign_data(token, status_msg=None):
     campaigns = await ad_fetch_campaigns(token)
@@ -1804,10 +1893,7 @@ async def ad_report_month_handler(update, context):
     status_msg = await update.message.reply_text("⏳ Загружаю отчёт по рекламе...")
     try:
         rpt = await build_ad_report_month(status_msg=status_msg)
-        try:
-            await status_msg.edit_text(rpt, parse_mode="Markdown")
-        except Exception:
-            await status_msg.edit_text(rpt)
+        await _safe_edit(status_msg, rpt)
         await update.message.reply_text("Выберите действие:", reply_markup=ad_reports_kb())
     except Exception as e:
         write_log(f"❌ Ошибка отчёта по рекламе: {e}")
@@ -2212,11 +2298,9 @@ async def show_expense_types(update, context):
         for tid, name, cnt, sm in unknown[:30]:
             lines.append(f"  `{tid}` → {name}" + (f" ({cnt}× / {sm:,.0f} ₽)" if cnt > 0 else ""))
     text = "\n".join(lines)
-    if len(text) > 4000: text = text[:4000] + "\n\n_…обрезано_"
-    try:
-        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=expense_types_kb())
-    except Exception:
-        await update.message.reply_text(text[:4000], reply_markup=expense_types_kb())
+    # Без обрезки: длинный текст разбивается через send_long_message
+    await send_long_message(update.message, text, parse_mode="Markdown",
+                            reply_markup=expense_types_kb())
 
 async def expense_types_cb(update, context):
     q = update.callback_query; await q.answer(); d = q.data
@@ -2276,7 +2360,7 @@ async def today_report(update, context):
     try:
         r = await build_today_report(include_yesterday=False)
         await msg.delete()
-        await update.message.reply_text(r, parse_mode="Markdown")
+        await send_long_message(update.message, r)
     except Exception as e:
         write_log(f"❌ {e}"); await msg.edit_text(f"❌ Ошибка: {e}")
 
@@ -2507,7 +2591,7 @@ async def top_today(update, context):
         stats = aggregate_products(postings, td, td, tl=now.time(), ad=td)
         txt = format_top_products(stats, f"Топ товаров за {td}", 15) + "\n" + format_products_summary(stats)
         await msg.delete()
-        await update.message.reply_text(txt)
+        await send_long_message(update.message, txt, parse_mode=None)
     except Exception as e:
         write_log(f"❌ {e}"); await msg.edit_text(f"❌ {e}")
 
@@ -2973,7 +3057,7 @@ async def auto_send_now(update, context):
     await update.message.reply_text("⏳ Формирую отчёт...")
     try:
         rpt = await build_today_report(include_yesterday=True)
-        await context.bot.send_message(chat_id=chat_id, text=rpt, parse_mode="Markdown")
+        await send_long_to_bot(context.bot, chat_id, rpt)
         await update.message.reply_text("✅ Отправлено.")
     except Exception as e:
         write_log(f"❌ {e}"); await update.message.reply_text(f"❌ {e}")
@@ -3219,7 +3303,7 @@ async def check_auto_reports(context: ContextTypes.DEFAULT_TYPE):
                 except: pass
             try:
                 rpt = await build_today_report(include_yesterday=True)
-                await context.bot.send_message(chat_id=uid, text=rpt, parse_mode="Markdown")
+                await send_long_to_bot(context.bot, uid, rpt)
                 us["last_sent_yesterday"] = f"{cur_date} {cur_hour}"
                 settings[sid] = us
                 await save_settings(settings)
@@ -3233,7 +3317,7 @@ async def check_auto_reports(context: ContextTypes.DEFAULT_TYPE):
                 except: pass
             try:
                 rpt = await build_today_report(include_yesterday=False)
-                await context.bot.send_message(chat_id=uid, text=rpt, parse_mode="Markdown")
+                await send_long_to_bot(context.bot, uid, rpt)
                 us["last_sent_regular"] = f"{cur_date} {cur_hour}"
                 settings[sid] = us
                 await save_settings(settings)
