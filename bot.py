@@ -16,24 +16,25 @@ from telegram.warnings import PTBUserWarning
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ ====================
-VERSION = "2.3.13"
-CHANGELOG_MESSAGE = "Параллельные запросы: раздельные семафоры для seller и performance API, asyncio.gather для отгрузок/рекламы/финансов, параллельные дни финансов."
+VERSION = "2.3.14"
+CHANGELOG_MESSAGE = "Раздельные семафоры для отгрузок и финансов, SELLER_RATE 0.5/сек. Отгрузки и финансы идут параллельно."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 60
 API_RETRY_ATTEMPTS = 3
 API_RETRY_DELAY = 10
 # Лимиты
-SELLER_RATE = 0.33           # ~1 запрос в 3 сек к api-seller.ozon.ru
-PERFORMANCE_RATE = 1.0       # ~1 запрос в секунду к api-performance.ozon.ru (другой домен)
+SELLER_RATE = 0.5            # ~1 запрос в 2 сек к api-seller.ozon.ru
+PERFORMANCE_RATE = 1.0       # ~1 запрос в сек к api-performance.ozon.ru
 CACHE_TTL_SECONDS = 300
 VERSION_HISTORY_FILE = "version_history.json"
 LOG_FILE = "/app/data/ozon_log.txt"
 
 # ==================== ГЛОБАЛЬНЫЕ ====================
 _http_session = None
-_seller_semaphore = None
-_perf_semaphore = None
+_postings_sem = None
+_finance_sem = None
+_perf_sem = None
 _seller_rate = None
 _perf_rate = None
 _cache_lock = asyncio.Lock()
@@ -188,15 +189,16 @@ class RateLimiter:
 
 # ==================== ИНИЦИАЛИЗАЦИЯ ====================
 async def init_http_session(app):
-    global _http_session, _seller_semaphore, _perf_semaphore, _seller_rate, _perf_rate
-    _seller_semaphore = asyncio.Semaphore(1)
-    _perf_semaphore = asyncio.Semaphore(1)
+    global _http_session, _postings_sem, _finance_sem, _perf_sem, _seller_rate, _perf_rate
+    _postings_sem = asyncio.Semaphore(1)
+    _finance_sem = asyncio.Semaphore(1)
+    _perf_sem = asyncio.Semaphore(1)
     _seller_rate = RateLimiter(SELLER_RATE)
     _perf_rate = RateLimiter(PERFORMANCE_RATE)
     timeout = aiohttp.ClientTimeout(total=API_TIMEOUT)
     connector = aiohttp.TCPConnector(limit=50, limit_per_host=10, ttl_dns_cache=300)
     _http_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
-    write_log(f"✅ HTTP-сессия (v{VERSION})")
+    write_log(f"✅ HTTP-сессия (v{VERSION}, rate {SELLER_RATE}/сек)")
 
 async def close_http_session(app):
     global _http_session
@@ -205,12 +207,24 @@ async def close_http_session(app):
         write_log("🔒 HTTP закрыта.")
 
 # ==================== API ====================
-async def api_request_with_retry(url, headers, payload=None, method='POST'):
-    """Выбирает семафор и rate limiter по домену URL."""
+async def api_request_with_retry(url, headers, payload=None, method='POST', kind='finance'):
+    """
+    kind — тип запроса:
+      - 'postings' → _postings_sem
+      - 'finance'  → _finance_sem
+      - 'perf'     → _perf_sem
+    Rate limiter общий для seller (postings + finance), отдельный для perf.
+    """
     global _http_session
-    is_performance = "api-performance.ozon.ru" in url
-    semaphore = _perf_semaphore if is_performance else _seller_semaphore
-    rate = _perf_rate if is_performance else _seller_rate
+    if kind == 'perf':
+        semaphore = _perf_sem
+        rate = _perf_rate
+    elif kind == 'postings':
+        semaphore = _postings_sem
+        rate = _seller_rate
+    else:
+        semaphore = _finance_sem
+        rate = _seller_rate
 
     async with semaphore:
         for attempt in range(API_RETRY_ATTEMPTS):
@@ -262,7 +276,7 @@ async def get_performance_token():
                "client_secret": OZON_PERFORMANCE_CLIENT_SECRET,
                "grant_type": "client_credentials"}
     try:
-        data = await api_request_with_retry(url, headers, payload, method='POST')
+        data = await api_request_with_retry(url, headers, payload, method='POST', kind='perf')
         return data.get("access_token")
     except Exception as e:
         write_log(f"❌ Ошибка токена: {e}")
@@ -292,7 +306,8 @@ async def fetch_postings(date_from, date_to):
         if cursor:
             payload["cursor"] = cursor
         try:
-            data = await api_request_with_retry(OZON_POSTING_FBO_URL, headers, payload, method='POST')
+            data = await api_request_with_retry(
+                OZON_POSTING_FBO_URL, headers, payload, method='POST', kind='postings')
         except Exception as e:
             write_log(f"❌ Ошибка FBO: {e}")
             break
@@ -326,7 +341,7 @@ async def fetch_advertising_expense(date_from, date_to):
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     params = {"dateFrom": date_from, "dateTo": date_to}
     try:
-        data = await api_request_with_retry(url, headers, params, method='GET')
+        data = await api_request_with_retry(url, headers, params, method='GET', kind='perf')
         total = 0.0
         if isinstance(data, dict) and "rows" in data:
             for item in data["rows"]:
@@ -351,7 +366,8 @@ async def fetch_finance_accruals_by_day(date_str: str) -> List[Dict]:
     all_accruals = []
     while True:
         try:
-            data = await api_request_with_retry(OZON_FINANCE_ACCRUAL_BY_DAY_URL, headers, payload, method='POST')
+            data = await api_request_with_retry(
+                OZON_FINANCE_ACCRUAL_BY_DAY_URL, headers, payload, method='POST', kind='finance')
         except Exception as e:
             write_log(f"❌ Финансы {date_str}: {e}")
             break
@@ -367,7 +383,6 @@ async def fetch_finance_accruals_by_day(date_str: str) -> List[Dict]:
     return all_accruals
 
 async def fetch_finance_transactions(date_from, date_to):
-    """Параллельно запрашивает все дни периода. Rate limiter сериализует старты."""
     cache_key = f"fin_{date_from}_{date_to}"
     cached = await get_from_cache(cache_key)
     if cached is not None:
@@ -380,7 +395,6 @@ async def fetch_finance_transactions(date_from, date_to):
     if end_dt > today:
         end_dt = today
 
-    # Собираем список дней
     days = []
     current = start_dt
     while current <= end_dt:
@@ -389,7 +403,6 @@ async def fetch_finance_transactions(date_from, date_to):
 
     write_log(f"💰 Финансы: {len(days)} дней параллельно ({date_from}–{date_to})")
 
-    # Параллельный запуск
     tasks = [fetch_finance_accruals_by_day(d) for d in days]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -404,7 +417,7 @@ async def fetch_finance_transactions(date_from, date_to):
     await save_to_cache(cache_key, all_accruals)
     return all_accruals
 
-# ==================== АГРЕГАЦИЯ ФИНАНСОВ ====================
+# ==================== АГРЕГАЦИЯ ====================
 def aggregate_finance_expenses(accruals: List[Dict]) -> Dict[str, float]:
     result: Dict[str, float] = {}
 
@@ -533,7 +546,6 @@ def fmt_pct(val):
 
 # ==================== ОТЧЁТ ====================
 async def build_today_report():
-    """Параллельно запускает 6 задач: 2 отгрузки, 2 рекламы, 2 финансовых обхода."""
     t0 = time.time()
     now = get_current_time_msk()
     today_date = now.date()
@@ -549,9 +561,8 @@ async def build_today_report():
     pm_end = pm_start + datetime.timedelta(days=days_passed - 1)
     pm_end_str = pm_end.isoformat()
 
-    write_log("📊 Параллельная загрузка: 2 отгрузки + 2 рекламы + 2 финансовых обхода")
+    write_log("📊 Параллельная загрузка: отгрузки + реклама + финансы одновременно")
 
-    # Запускаем всё сразу
     postings_cur, postings_prev, ad_today, ad_month, fin_today, fin_month = await asyncio.gather(
         fetch_postings(cm_start_str, today_str),
         fetch_postings(pm_start_str, pm_end_str),
