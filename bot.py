@@ -29,8 +29,8 @@ from telegram.warnings import PTBUserWarning
 
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
-VERSION = "2.8.2"
-CHANGELOG_MESSAGE = "Исправлена загрузка справочника начислений Ozon: улучшена обработка ответа, добавлено подробное логирование. Fallback-названия теперь используют категории вместо '(type XX)'. Добавлена возможность ручного заполнения /app/data/accrual_types.json."
+VERSION = "2.9.1"
+CHANGELOG_MESSAGE = "Справка и руководство теперь содержат ASCII-схемы меню (визуальные 'скриншоты' разделов). Кнопка '📚 Руководство' добавлена в главное меню и в раздел '⚙️ Администрирование'."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 60
@@ -263,8 +263,6 @@ def _save_accrual_types_sync(data):
         write_log(f"❌ Запись accrual_types: {e}")
 
 async def fetch_accrual_types():
-    """Загружает справочник начислений из Ozon API. Кэширует на сутки.
-    Если API недоступен, пытается использовать локальный файл."""
     global _accrual_types_cache
     if _accrual_types_cache is not None:
         return _accrual_types_cache
@@ -285,50 +283,40 @@ async def fetch_accrual_types():
         data = await api_request_with_retry(OZON_FINANCE_ACCRUAL_TYPES_URL, headers,
                                             payload, method='POST', kind='finance')
         types_list = []
-        # Поддерживаем несколько возможных структур ответа
         if isinstance(data, dict):
-            if "types" in data:
-                types_list = data["types"]
+            if "types" in data: types_list = data["types"]
             elif "result" in data:
                 res = data["result"]
-                if isinstance(res, dict) and "types" in res:
-                    types_list = res["types"]
-                elif isinstance(res, list):
-                    types_list = res
-            elif "accrual_types" in data:
-                types_list = data["accrual_types"]
-        elif isinstance(data, list):
-            types_list = data
+                if isinstance(res, dict) and "types" in res: types_list = res["types"]
+                elif isinstance(res, list): types_list = res
+            elif "accrual_types" in data: types_list = data["accrual_types"]
+        elif isinstance(data, list): types_list = data
         result = {}
         for item in types_list:
             if isinstance(item, dict):
                 tid = str(item.get("id", item.get("type_id", "")))
                 name = item.get("name", item.get("title", ""))
-                if tid and name:
-                    result[tid] = name
+                if tid and name: result[tid] = name
         if result:
             _accrual_types_cache = result
             _save_accrual_types_sync(result)
             write_log(f"✅ Справочник начислений Ozon загружен ({len(result)} типов)")
         else:
-            write_log(f"⚠️ Ozon вернул пустой справочник начислений. Ответ: {str(data)[:300]}")
+            write_log(f"⚠️ Ozon вернул пустой справочник. Ответ: {str(data)[:300]}")
         return result
     except Exception as e:
         write_log(f"❌ Ошибка загрузки справочника начислений: {e}")
-        # Пробуем использовать локальный файл
         if _accrual_types_cache is None:
             _accrual_types_cache = _load_accrual_types_sync()
         return _accrual_types_cache if _accrual_types_cache is not None else {}
 
 def get_accrual_type_name(type_id):
-    if type_id is None:
-        return None
+    if type_id is None: return None
     tid = str(type_id)
     if _accrual_types_cache and tid in _accrual_types_cache:
         return _accrual_types_cache[tid]
     cached = _load_accrual_types_sync()
-    if cached and tid in cached:
-        return cached[tid]
+    if cached and tid in cached: return cached[tid]
     return None
 
 def type_name(type_id, category_code):
@@ -336,21 +324,17 @@ def type_name(type_id, category_code):
         return CATEGORY_FALLBACK.get(category_code, "Услуги")
     tid = str(type_id)
     official = get_accrual_type_name(tid)
-    if official:
-        return official
+    if official: return official
     data = get_expense_types()
     if tid in data:
         entry = data[tid]
         if isinstance(entry, dict):
             name = entry.get("name", "")
-            # Если в локальном справочнике название вида "(type XX)" или "❓", используем категорийный fallback
             if name and not name.startswith("❓") and "(type " not in name:
                 return name
         elif not str(entry).startswith("❓") and "(type " not in str(entry):
             return str(entry)
-    # Категорийный fallback — человеческое название без "(type XX)"
     fallback = CATEGORY_FALLBACK.get(category_code, "Услуги")
-    # Сохраняем для будущего использования, но уже с чистым названием
     data[tid] = {"name": fallback, "count": 0, "sum": 0.0}
     _save_expense_types_sync(data)
     return fallback
@@ -422,10 +406,8 @@ def clear_all_cache():
         if os.path.isdir(DISK_CACHE_DIR):
             for f in os.listdir(DISK_CACHE_DIR):
                 if f.endswith(".json"):
-                    try:
-                        os.remove(os.path.join(DISK_CACHE_DIR, f))
-                    except Exception as e:
-                        write_log(f"⚠️ Удаление {f}: {e}")
+                    try: os.remove(os.path.join(DISK_CACHE_DIR, f))
+                    except Exception as e: write_log(f"⚠️ Удаление {f}: {e}")
     except Exception as e:
         write_log(f"⚠️ Очистка дискового кэша: {e}")
 
@@ -585,25 +567,19 @@ def prev_period(df, dt):
 
 # ==================== РАЗБИВКА ДЛИННЫХ СООБЩЕНИЙ ====================
 def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> List[str]:
-    if not text:
-        return [""]
-    if len(text) <= max_len:
-        return [text]
+    if not text: return [""]
+    if len(text) <= max_len: return [text]
     parts: List[str] = []
     remaining = text
     while remaining:
         if len(remaining) <= max_len:
-            parts.append(remaining)
-            break
+            parts.append(remaining); break
         split_pos = remaining.rfind('\n', 0, max_len)
-        if split_pos <= 0:
-            split_pos = remaining.rfind(' ', 0, max_len)
-        if split_pos <= 0:
-            split_pos = max_len
+        if split_pos <= 0: split_pos = remaining.rfind(' ', 0, max_len)
+        if split_pos <= 0: split_pos = max_len
         chunk = remaining[:split_pos].rstrip()
         if not chunk:
-            chunk = remaining[:max_len]
-            split_pos = max_len
+            chunk = remaining[:max_len]; split_pos = max_len
         parts.append(chunk)
         remaining = remaining[split_pos:].lstrip('\n')
     return parts
@@ -613,58 +589,44 @@ async def _safe_edit(msg, text, parse_mode="Markdown"):
     first = chunks[0]
     edited = False
     try:
-        await msg.edit_text(first, parse_mode=parse_mode)
-        edited = True
+        await msg.edit_text(first, parse_mode=parse_mode); edited = True
     except Exception as e:
         write_log(f"⚠️ edit_text: {e}")
         try:
-            await msg.edit_text(first)
-            edited = True
+            await msg.edit_text(first); edited = True
         except Exception as e2:
             write_log(f"⚠️ edit_text без parse_mode: {e2}")
     if not edited:
         for chunk in chunks:
-            try:
-                await msg.reply_text(chunk, parse_mode=parse_mode)
+            try: await msg.reply_text(chunk, parse_mode=parse_mode)
             except Exception:
-                try:
-                    await msg.reply_text(chunk)
-                except Exception as e3:
-                    write_log(f"⚠️ reply_text fallback: {e3}")
+                try: await msg.reply_text(chunk)
+                except Exception as e3: write_log(f"⚠️ reply_text fallback: {e3}")
         return
     for chunk in chunks[1:]:
-        try:
-            await msg.reply_text(chunk, parse_mode=parse_mode)
-        except Exception as e:
-            try:
-                await msg.reply_text(chunk)
-            except Exception as e2:
-                write_log(f"⚠️ reply_text: {e2}")
+        try: await msg.reply_text(chunk, parse_mode=parse_mode)
+        except Exception:
+            try: await msg.reply_text(chunk)
+            except Exception as e2: write_log(f"⚠️ reply_text: {e2}")
 
 async def send_long_message(message, text, parse_mode="Markdown", reply_markup=None):
     chunks = split_message(text)
     for i, chunk in enumerate(chunks):
         markup = reply_markup if i == len(chunks) - 1 else None
-        try:
-            await message.reply_text(chunk, parse_mode=parse_mode, reply_markup=markup)
+        try: await message.reply_text(chunk, parse_mode=parse_mode, reply_markup=markup)
         except Exception as e:
             write_log(f"⚠️ send_long_message: {e}")
-            try:
-                await message.reply_text(chunk, reply_markup=markup)
-            except Exception as e2:
-                write_log(f"⚠️ send_long_message fallback: {e2}")
+            try: await message.reply_text(chunk, reply_markup=markup)
+            except Exception as e2: write_log(f"⚠️ send_long_message fallback: {e2}")
 
 async def send_long_to_bot(bot, chat_id, text, parse_mode="Markdown"):
     chunks = split_message(text)
     for chunk in chunks:
-        try:
-            await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=parse_mode)
+        try: await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=parse_mode)
         except Exception as e:
             write_log(f"⚠️ send_long_to_bot: {e}")
-            try:
-                await bot.send_message(chat_id=chat_id, text=chunk)
-            except Exception as e2:
-                write_log(f"⚠️ send_long_to_bot fallback: {e2}")
+            try: await bot.send_message(chat_id=chat_id, text=chunk)
+            except Exception as e2: write_log(f"⚠️ send_long_to_bot fallback: {e2}")
 
 # ==================== RATE LIMITER ====================
 class RateLimiter:
@@ -694,8 +656,7 @@ async def init_http_session(app):
 
 async def close_http_session(app):
     global _http_session
-    if _http_session:
-        await _http_session.close()
+    if _http_session: await _http_session.close()
 
 # ==================== API ====================
 async def api_request_with_retry(url, headers, payload=None, method='POST', kind='finance', silent_404=False):
@@ -715,8 +676,7 @@ async def api_request_with_retry(url, headers, payload=None, method='POST', kind
                             w = API_RETRY_DELAY * (2 ** attempt)
                             await asyncio.sleep(w); continue
                         if resp.status >= 400:
-                            if not silent_404:
-                                write_log(f"❌ API {resp.status} {url}: {body[:300]}")
+                            if not silent_404: write_log(f"❌ API {resp.status} {url}: {body[:300]}")
                             raise aiohttp.ClientResponseError(resp.request_info, resp.history,
                                 status=resp.status, message=body[:200])
                         return json.loads(body)
@@ -728,8 +688,7 @@ async def api_request_with_retry(url, headers, payload=None, method='POST', kind
                             w = API_RETRY_DELAY * (2 ** attempt)
                             await asyncio.sleep(w); continue
                         if resp.status >= 400:
-                            if not silent_404:
-                                write_log(f"❌ API {resp.status} {url}: {body[:300]}")
+                            if not silent_404: write_log(f"❌ API {resp.status} {url}: {body[:300]}")
                             raise aiohttp.ClientResponseError(resp.request_info, resp.history,
                                 status=resp.status, message=body[:200])
                         return json.loads(body)
@@ -757,9 +716,8 @@ async def get_performance_token():
 async def _fetch_postings_raw(date_from, date_to):
     headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY, "Content-Type": "application/json"}
     since = f"{date_from}T00:00:00Z"; to = f"{date_to}T23:59:59Z"
-    all_p = []; cursor = ""; LIMIT = 100; page = 0
+    all_p = []; cursor = ""; LIMIT = 100
     while True:
-        page += 1
         payload = {"dir": "ASC", "filter": {"since": since, "to": to},
                    "limit": LIMIT, "translit": False,
                    "with": {"analytics_data": True, "financial_data": True}}
@@ -787,24 +745,21 @@ async def fetch_postings(date_from, date_to):
         all_p = await _fetch_postings_raw(date_from, date_to)
         await save_to_cache(cache_key, all_p)
         return all_p
-    if date_from > today_iso:
-        return []
+    if date_from > today_iso: return []
     result = []
     if date_from < today_iso:
         yest_iso = (today - datetime.timedelta(days=1)).isoformat()
         cache_key = f"postings_{date_from}_{yest_iso}"
         cached = await get_from_cache(cache_key)
-        if cached is not None:
-            result.extend(cached)
+        if cached is not None: result.extend(cached)
         else:
             hist = await _fetch_postings_raw(date_from, yest_iso)
-            await save_to_cache(cache_key, hist)
-            result.extend(hist)
+            await save_to_cache(cache_key, hist); result.extend(hist)
     today_data = await _fetch_postings_raw(today_iso, today_iso)
     result.extend(today_data)
     return result
 
-# ==================== РЕКЛАМА (общая сумма) ====================
+# ==================== РЕКЛАМА ====================
 async def _fetch_advertising_expense_single(date_from, date_to):
     token = await get_performance_token()
     if not token: return 0.0
@@ -824,21 +779,18 @@ async def _fetch_advertising_expense_single(date_from, date_to):
                         except: pass
         return total
     except Exception as e:
-        write_log(f"❌ Реклама ({date_from}–{date_to}): {e}")
-        return 0.0
+        write_log(f"❌ Реклама ({date_from}–{date_to}): {e}"); return 0.0
 
 async def _fetch_advertising_expense_chunked(date_from, end_dt):
     start_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d").date()
     total_days = (end_dt - start_dt).days + 1
     if total_days <= AD_CHUNK_DAYS:
         return await _fetch_advertising_expense_single(date_from, end_dt.isoformat())
-    total = 0.0
-    cur = start_dt
+    total = 0.0; cur = start_dt
     while cur <= end_dt:
         chunk_end = min(cur + datetime.timedelta(days=AD_CHUNK_DAYS - 1), end_dt)
         part = await _fetch_advertising_expense_single(cur.isoformat(), chunk_end.isoformat())
-        total += part
-        cur = chunk_end + datetime.timedelta(days=1)
+        total += part; cur = chunk_end + datetime.timedelta(days=1)
     return total
 
 async def fetch_advertising_expense(date_from, date_to):
@@ -852,19 +804,16 @@ async def fetch_advertising_expense(date_from, date_to):
         cached = await get_from_cache(cache_key)
         if cached is not None: return cached
         result = await _fetch_advertising_expense_chunked(date_from, end_dt)
-        await save_to_cache(cache_key, result)
-        return result
+        await save_to_cache(cache_key, result); return result
     total = 0.0
     if start_dt < today:
         yest = today - datetime.timedelta(days=1)
         cache_key = f"ad_{date_from}_{yest.isoformat()}"
         cached = await get_from_cache(cache_key)
-        if cached is not None:
-            total += cached
+        if cached is not None: total += cached
         else:
             part = await _fetch_advertising_expense_chunked(date_from, yest)
-            await save_to_cache(cache_key, part)
-            total += part
+            await save_to_cache(cache_key, part); total += part
     today_part = await _fetch_advertising_expense_single(today.isoformat(), today.isoformat())
     total += today_part
     return total
@@ -891,8 +840,7 @@ async def fetch_finance_accruals_by_day(date_str):
         last = data.get("last_id")
         if last: payload["last_id"] = last
         else: break
-    if not is_today:
-        await save_to_cache(cache_key, all_a)
+    if not is_today: await save_to_cache(cache_key, all_a)
     return all_a
 
 async def fetch_finance_transactions(date_from, date_to, status_msg=None):
@@ -913,8 +861,7 @@ async def fetch_finance_transactions(date_from, date_to, status_msg=None):
     all_a = []; missing = []
     for d in days:
         if d == today_iso:
-            missing.append(d)
-            continue
+            missing.append(d); continue
         c = disk_cache_get(f"fin_day_{d}")
         if c is not None: all_a.extend(c)
         else: missing.append(d)
@@ -930,8 +877,7 @@ async def fetch_finance_transactions(date_from, date_to, status_msg=None):
                 except Exception: pass
             day_acc = await fetch_finance_accruals_by_day(d)
             all_a.extend(day_acc)
-    if not includes_today:
-        await save_to_cache(cache_key, all_a)
+    if not includes_today: await save_to_cache(cache_key, all_a)
     return all_a
 
 # ==================== АГРЕГАЦИЯ ФИНАНСОВ ====================
@@ -1046,11 +992,10 @@ def build_sku_offer_map(postings_list):
                 if not isinstance(prod, dict): continue
                 sku = str(prod.get("sku", ""))
                 oid = prod.get("offer_id", "")
-                if sku and oid and sku not in m:
-                    m[sku] = str(oid)
+                if sku and oid and sku not in m: m[sku] = str(oid)
     return m
 
-# ==================== ГРАФИКИ ПРОДАЖ ====================
+# ==================== ГРАФИКИ ====================
 async def get_monthly_delivered_sum(year):
     is_current_year = (year == get_moscow_today().year)
     cache_key = f"monthly_delivered_{year}"
@@ -1075,8 +1020,7 @@ async def get_monthly_delivered_sum(year):
             if not isinstance(prod, dict): continue
             q = int(prod.get("quantity", 0))
             monthly[idx] += parse_price(prod) * q
-    if not is_current_year:
-        await save_to_cache(cache_key, monthly)
+    if not is_current_year: await save_to_cache(cache_key, monthly)
     return monthly
 
 async def generate_sales_chart(years):
@@ -1154,10 +1098,7 @@ async def generate_product_chart(sku, metric, years):
     buf = io.BytesIO(); plt.savefig(buf, format='png', dpi=100); buf.seek(0); plt.close(fig)
     return buf
 
-# ============================================================
-# ОТЧЁТ ПО РЕКЛАМЕ
-# ============================================================
-
+# ==================== ОТЧЁТ ПО РЕКЛАМЕ ====================
 def ad_to_float(val, default=0.0):
     if val is None: return default
     if isinstance(val, (int, float)): return float(val)
@@ -1185,8 +1126,7 @@ async def ad_fetch_campaigns(token) -> List[Dict]:
         if isinstance(data, list): campaigns = data
         elif isinstance(data, dict): campaigns = data.get("list", data.get("campaigns", []))
         else: campaigns = []
-        await save_to_cache(cache_key, campaigns)
-        return campaigns
+        await save_to_cache(cache_key, campaigns); return campaigns
     except Exception as e:
         write_log(f"❌ Кампании: {e}")
     return []
@@ -1204,13 +1144,11 @@ async def ad_fetch_campaign_objects(token, campaign_id: str) -> List[str]:
             for item in data.get("list", []):
                 if isinstance(item, dict) and item.get("id"):
                     result.append(str(item["id"]))
-        await save_to_cache(cache_key, result)
-        return result
+        await save_to_cache(cache_key, result); return result
     except Exception:
-        await save_to_cache(cache_key, [])
-        return []
+        await save_to_cache(cache_key, []); return []
 
-async def ad_fetch_stats_chunk(token, campaign_ids: List[str], date_from: str, date_to: str) -> List[Dict]:
+async def ad_fetch_stats_chunk(token, campaign_ids, date_from, date_to):
     if not campaign_ids: return []
     includes_today = _range_includes_today(date_from, date_to)
     cache_key = f"perf_stats_{date_from}_{date_to}_{'_'.join(sorted(campaign_ids))[:80]}"
@@ -1220,21 +1158,17 @@ async def ad_fetch_stats_chunk(token, campaign_ids: List[str], date_from: str, d
     headers = {"Authorization": f"Bearer {token}"}
     base = "https://api-performance.ozon.ru/api/client/statistics/campaign/product/json"
     parts = [f"dateFrom={date_from}", f"dateTo={date_to}"]
-    for cid in campaign_ids:
-        parts.append(f"campaignIds={cid}")
+    for cid in campaign_ids: parts.append(f"campaignIds={cid}")
     url = base + "?" + "&".join(parts)
     try:
         data = await api_request_with_retry(url, headers, method='GET', kind='perf')
         rows = data.get("rows", []) if isinstance(data, dict) else []
-        if not includes_today:
-            await save_to_cache(cache_key, rows)
+        if not includes_today: await save_to_cache(cache_key, rows)
         return rows
     except Exception as e:
-        write_log(f"❌ Статистика рекламы ({date_from}–{date_to}): {e}")
-        return []
+        write_log(f"❌ Статистика рекламы ({date_from}–{date_to}): {e}"); return []
 
-async def ad_fetch_stats(token, campaign_ids: List[str], date_from: str, date_to: str,
-                        status_msg=None) -> List[Dict]:
+async def ad_fetch_stats(token, campaign_ids, date_from, date_to, status_msg=None):
     start_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d").date()
     end_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d").date()
     today = get_moscow_today()
@@ -1244,8 +1178,7 @@ async def ad_fetch_stats(token, campaign_ids: List[str], date_from: str, date_to
     if total_days <= AD_CHUNK_DAYS:
         return await ad_fetch_stats_chunk(token, campaign_ids, date_from, end_dt.isoformat())
     all_rows: Dict[str, Dict] = {}
-    chunks = []
-    cur = start_dt
+    chunks = []; cur = start_dt
     while cur <= end_dt:
         chunk_end = min(cur + datetime.timedelta(days=AD_CHUNK_DAYS - 1), end_dt)
         chunks.append((cur.isoformat(), chunk_end.isoformat()))
@@ -1253,8 +1186,7 @@ async def ad_fetch_stats(token, campaign_ids: List[str], date_from: str, date_to
     for i, (c_from, c_to) in enumerate(chunks):
         if status_msg:
             try:
-                await status_msg.edit_text(
-                    f"⏳ Статистика рекламы: часть {i+1}/{len(chunks)} ({c_from}–{c_to})")
+                await status_msg.edit_text(f"⏳ Статистика рекламы: часть {i+1}/{len(chunks)} ({c_from}–{c_to})")
             except Exception: pass
         rows = await ad_fetch_stats_chunk(token, campaign_ids, c_from, c_to)
         for r in rows:
@@ -1275,7 +1207,7 @@ async def ad_fetch_stats(token, campaign_ids: List[str], date_from: str, date_to
         dst["clickPrice"] = str(ad_to_float(dst["moneySpent"]) / c) if c > 0 else "0"
     return list(all_rows.values())
 
-def ad_sum_sales_by_sku_set(postings: List[Dict], skus: set) -> float:
+def ad_sum_sales_by_sku_set(postings, skus):
     if not skus: return 0.0
     total = 0.0
     for p in postings:
@@ -1313,10 +1245,8 @@ def ad_aggregate_total(rows, skus_by_campaign, postings):
     total["expense"] = total_expense
     total["drr_ad"] = (total_expense / total_ad_sales * 100) if total_ad_sales > 0 else None
     total["drr_total"] = (total_expense / total_sales_all * 100) if total_sales_all > 0 else None
-    total["impressions"] = total_views
-    total["clicks"] = total_clicks
-    total["carts"] = total_carts
-    total["orders"] = total_orders
+    total["impressions"] = total_views; total["clicks"] = total_clicks
+    total["carts"] = total_carts; total["orders"] = total_orders
     total["ctr"] = (total_clicks / total_views * 100) if total_views > 0 else 0.0
     return total
 
@@ -1327,17 +1257,14 @@ def ad_aggregate_by_campaign(rows, skus_by_campaign, postings, sku_offer_map=Non
         cid = str(r.get("id", ""))
         expense = ad_to_float(r.get("moneySpent"))
         ad_sales = ad_to_float(r.get("ordersMoney"))
-        views = ad_to_int(r.get("views"))
-        clicks = ad_to_int(r.get("clicks"))
-        carts = ad_to_int(r.get("toCart"))
-        orders = ad_to_int(r.get("orders"))
+        views = ad_to_int(r.get("views")); clicks = ad_to_int(r.get("clicks"))
+        carts = ad_to_int(r.get("toCart")); orders = ad_to_int(r.get("orders"))
         click_price = ad_to_float(r.get("clickPrice"))
         skus = skus_by_campaign.get(cid, [])
         total_sales = ad_sum_sales_by_sku_set(postings, set(skus))
         result.append({
             "campaign_id": cid, "campaign_name": r.get("title", cid), "skus": skus,
-            "avg_bid": click_price,
-            "avg_cpc": expense / clicks if clicks > 0 else 0.0,
+            "avg_bid": click_price, "avg_cpc": expense / clicks if clicks > 0 else 0.0,
             "ad_sales": ad_sales, "total_sales": total_sales, "expense": expense,
             "drr_ad": (expense / ad_sales * 100) if ad_sales > 0 else None,
             "drr_total": (expense / total_sales * 100) if total_sales > 0 else None,
@@ -1369,16 +1296,14 @@ def ad_fmt_pct(val):
 
 def ad_line(label, cur, prev, fmt_func, better_is_higher=True, no_indicator=False, has_prev=True):
     cur_str = fmt_func(cur)
-    if not has_prev:
-        return f"   {label}: {cur_str} vs — (нет данных)"
+    if not has_prev: return f"   {label}: {cur_str} vs — (нет данных)"
     prev_str = fmt_func(prev)
-    if no_indicator:
-        return f"   {label}: {cur_str} vs {prev_str}"
+    if no_indicator: return f"   {label}: {cur_str} vs {prev_str}"
     ind = ad_indicator(cur, prev, better_is_higher)
     prefix = f"{ind} " if ind else "   "
     return f"{prefix}{label}: {cur_str} vs {prev_str}"
 
-def ad_format_sku_list(skus: List[str], sku_offer_map: dict, max_items: int = 5) -> str:
+def ad_format_sku_list(skus, sku_offer_map, max_items=5):
     if not skus: return "—"
     parts = []
     for sku in skus[:max_items]:
@@ -1389,22 +1314,15 @@ def ad_format_sku_list(skus: List[str], sku_offer_map: dict, max_items: int = 5)
     if len(skus) > max_items: s += f" … (+{len(skus) - max_items})"
     return s
 
-def ad_build_report(cur_total, prev_total, cur_camps, prev_camps,
-                    period_label, has_prev, sku_offer_map=None,
-                    header="📊 *Статистика за текущий месяц"):
+def ad_build_report(cur_total, prev_total, cur_camps, prev_camps, period_label, has_prev, sku_offer_map=None, header="📊 *Статистика за текущий месяц"):
     if sku_offer_map is None: sku_offer_map = {}
     lines = []
-    if period_label:
-        lines.append(f"{header} на {period_label}*")
-    else:
-        lines.append(f"{header}*")
+    if period_label: lines.append(f"{header} на {period_label}*")
+    else: lines.append(f"{header}*")
     lines.append("Суммарные данные по всем рекламным кампаниям")
     lines.append("")
-
     def L(label, key, fmt_func, better_high=True, no_ind=False):
-        return ad_line(label, cur_total.get(key), prev_total.get(key),
-                       fmt_func, better_high, no_ind, has_prev)
-
+        return ad_line(label, cur_total.get(key), prev_total.get(key), fmt_func, better_high, no_ind, has_prev)
     lines.append(L("Ваша ставка, руб.", "avg_bid", ad_fmt_f, False, no_ind=True))
     lines.append(L("Средняя стоимость клика, руб.", "avg_cpc", ad_fmt_f, False))
     lines.append(L("Продано товаров в рекламной компании, руб.", "ad_sales", ad_fmt_f, True))
@@ -1416,29 +1334,20 @@ def ad_build_report(cur_total, prev_total, cur_camps, prev_camps,
     lines.append(L("Клики, кол-во.", "clicks", ad_fmt_i, True))
     lines.append(L("Добавления в корзину, кол-во.", "carts", ad_fmt_i, True))
     lines.append(L("CTR, %", "ctr", ad_fmt_pct, True))
-    lines.append("")
-    lines.append("*ПО КОМПАНИЯМ*")
-    lines.append("")
-
+    lines.append(""); lines.append("*ПО КОМПАНИЯМ*"); lines.append("")
     prev_map = {c["campaign_id"]: c for c in prev_camps}
     active = [c for c in cur_camps if c["impressions"] > 0 or c["expense"] > 0]
     active.sort(key=lambda c: c["expense"], reverse=True)
-
     if not active:
         lines.append("Нет активных кампаний в этом периоде.")
         return "\n".join(lines)
-
     for c in active:
         p = prev_map.get(c["campaign_id"], {})
         lines.append(f"*Название рекламной компании: {c['campaign_name']}*")
         sku_str = ad_format_sku_list(c["skus"], sku_offer_map)
-        lines.append(f"СКЮ/АРТИКУЛ: {sku_str}")
-        lines.append("")
-
+        lines.append(f"СКЮ/АРТИКУЛ: {sku_str}"); lines.append("")
         def Lc(label, key, fmt_func, better_high=True, no_ind=False):
-            return ad_line(label, c.get(key), p.get(key), fmt_func,
-                           better_high, no_ind, has_prev)
-
+            return ad_line(label, c.get(key), p.get(key), fmt_func, better_high, no_ind, has_prev)
         lines.append(Lc("Ваша ставка, руб.", "avg_bid", ad_fmt_f, False, no_ind=True))
         lines.append(Lc("Средняя стоимость клика, руб.", "avg_cpc", ad_fmt_f, False))
         lines.append(Lc("Продано товаров в рекламной компании, руб.", "ad_sales", ad_fmt_f, True))
@@ -1449,16 +1358,13 @@ def ad_build_report(cur_total, prev_total, cur_camps, prev_camps,
         lines.append(Lc("Показы, кол-во.", "impressions", ad_fmt_i, True))
         lines.append(Lc("Клики, кол-во.", "clicks", ad_fmt_i, True))
         lines.append(Lc("Добавления в корзину, кол-во.", "carts", ad_fmt_i, True))
-        lines.append(Lc("CTR, %", "ctr", ad_fmt_pct, True))
-        lines.append("")
-
+        lines.append(Lc("CTR, %", "ctr", ad_fmt_pct, True)); lines.append("")
     return "\n".join(lines)
 
 async def _get_all_campaign_data(token, status_msg=None):
     campaigns = await ad_fetch_campaigns(token)
     if not campaigns: return [], {}
-    if status_msg:
-        await _safe_edit(status_msg, f"⏳ Собираю SKU кампаний ({len(campaigns)})...")
+    if status_msg: await _safe_edit(status_msg, f"⏳ Собираю SKU кампаний ({len(campaigns)})...")
     skus_by_campaign = {}
     for i, c in enumerate(campaigns):
         cid = str(c.get("id", ""))
@@ -1506,7 +1412,7 @@ async def build_ad_report_month(status_msg=None):
     await save_to_cache(cache_key, report)
     return report
 
-async def build_ad_report_period(date_from: str, date_to: str, period_name: str, status_msg=None):
+async def build_ad_report_period(date_from, date_to, period_name, status_msg=None):
     includes_today = _range_includes_today(date_from, date_to)
     cache_key = f"ad_report_{date_from}_{date_to}_v3"
     if not includes_today:
@@ -1535,48 +1441,35 @@ async def build_ad_report_period(date_from: str, date_to: str, period_name: str,
     prev_camps = ad_aggregate_by_campaign(prev_rows, skus_by_campaign, prev_postings, sku_offer_map)
     report = ad_build_report(cur_total, prev_total, cur_camps, prev_camps, period_name, has_prev,
                             sku_offer_map, header="📊 *Реклама за период")
-    if not includes_today:
-        await save_to_cache(cache_key, report)
+    if not includes_today: await save_to_cache(cache_key, report)
     return report
 
-# ========== Динамика по рекламе ==========
-
-async def ad_dynamics_get_monthly(token, campaign_ids, year, skus_by_campaign, postings_by_month,
-                                   metric_key, status_msg=None):
+async def ad_dynamics_get_monthly(token, campaign_ids, year, skus_by_campaign, postings_by_month, metric_key, status_msg=None):
     data = [0.0] * 12
-    year_start = datetime.date(year, 1, 1)
-    year_end = datetime.date(year, 12, 31)
+    year_start = datetime.date(year, 1, 1); year_end = datetime.date(year, 12, 31)
     today = get_moscow_today()
     if year_start > today: return data
     if year_end > today: year_end = today
-    chunks = []
-    cur = year_start
+    chunks = []; cur = year_start
     while cur <= year_end:
         chunk_end = min(cur + datetime.timedelta(days=AD_CHUNK_DAYS - 1), year_end)
-        chunks.append((cur, chunk_end))
-        cur = chunk_end + datetime.timedelta(days=1)
+        chunks.append((cur, chunk_end)); cur = chunk_end + datetime.timedelta(days=1)
     monthly_total = {m: {"expense": 0.0, "ad_sales": 0.0, "impressions": 0,
                           "clicks": 0, "carts": 0, "bid_sum": 0.0, "bid_count": 0,
                           "total_sales": 0.0} for m in range(12)}
     for i, (c_from, c_to) in enumerate(chunks):
         if status_msg:
             try:
-                await status_msg.edit_text(
-                    f"⏳ Динамика рекламы: {c_from.strftime('%d.%m')}–{c_to.strftime('%d.%m')} "
-                    f"({i+1}/{len(chunks)})")
+                await status_msg.edit_text(f"⏳ Динамика рекламы: {c_from.strftime('%d.%m')}–{c_to.strftime('%d.%m')} ({i+1}/{len(chunks)})")
             except: pass
         cur_m = c_from
         while cur_m <= c_to:
             month_first = cur_m.replace(day=1)
-            if month_first.month == 12:
-                month_last = datetime.date(month_first.year, 12, 31)
-            else:
-                month_last = datetime.date(month_first.year, month_first.month + 1, 1) - datetime.timedelta(days=1)
-            sub_from = max(cur_m, c_from)
-            sub_to = min(month_last, c_to)
+            if month_first.month == 12: month_last = datetime.date(month_first.year, 12, 31)
+            else: month_last = datetime.date(month_first.year, month_first.month + 1, 1) - datetime.timedelta(days=1)
+            sub_from = max(cur_m, c_from); sub_to = min(month_last, c_to)
             if sub_from <= sub_to:
-                sub_rows = await ad_fetch_stats_chunk(token, campaign_ids,
-                                                       sub_from.isoformat(), sub_to.isoformat())
+                sub_rows = await ad_fetch_stats_chunk(token, campaign_ids, sub_from.isoformat(), sub_to.isoformat())
                 mi = month_first.month - 1
                 sub_postings = postings_by_month.get(mi, [])
                 sub_skus = set()
@@ -1590,8 +1483,7 @@ async def ad_dynamics_get_monthly(token, campaign_ids, year, skus_by_campaign, p
                     monthly_total[mi]["impressions"] += ad_to_int(r.get("views"))
                     monthly_total[mi]["clicks"] += ad_to_int(r.get("clicks"))
                     monthly_total[mi]["carts"] += ad_to_int(r.get("toCart"))
-                    b = ad_to_float(r.get("clickPrice"))
-                    cl = ad_to_int(r.get("clicks"))
+                    b = ad_to_float(r.get("clickPrice")); cl = ad_to_int(r.get("clicks"))
                     if b > 0 and cl > 0:
                         monthly_total[mi]["bid_sum"] += b * cl
                         monthly_total[mi]["bid_count"] += cl
@@ -1599,32 +1491,20 @@ async def ad_dynamics_get_monthly(token, campaign_ids, year, skus_by_campaign, p
             cur_m = month_last + datetime.timedelta(days=1)
     for m in range(12):
         d = monthly_total[m]
-        if metric_key == "avg_bid":
-            data[m] = d["bid_sum"] / d["bid_count"] if d["bid_count"] > 0 else 0.0
-        elif metric_key == "avg_cpc":
-            data[m] = d["expense"] / d["clicks"] if d["clicks"] > 0 else 0.0
-        elif metric_key == "ad_sales":
-            data[m] = d["ad_sales"]
-        elif metric_key == "total_sales":
-            data[m] = d["total_sales"]
-        elif metric_key == "expense":
-            data[m] = d["expense"]
-        elif metric_key == "drr_ad":
-            data[m] = (d["expense"] / d["ad_sales"] * 100) if d["ad_sales"] > 0 else 0.0
-        elif metric_key == "drr_total":
-            data[m] = (d["expense"] / d["total_sales"] * 100) if d["total_sales"] > 0 else 0.0
-        elif metric_key == "impressions":
-            data[m] = d["impressions"]
-        elif metric_key == "clicks":
-            data[m] = d["clicks"]
-        elif metric_key == "carts":
-            data[m] = d["carts"]
-        elif metric_key == "ctr":
-            data[m] = (d["clicks"] / d["impressions"] * 100) if d["impressions"] > 0 else 0.0
+        if metric_key == "avg_bid": data[m] = d["bid_sum"] / d["bid_count"] if d["bid_count"] > 0 else 0.0
+        elif metric_key == "avg_cpc": data[m] = d["expense"] / d["clicks"] if d["clicks"] > 0 else 0.0
+        elif metric_key == "ad_sales": data[m] = d["ad_sales"]
+        elif metric_key == "total_sales": data[m] = d["total_sales"]
+        elif metric_key == "expense": data[m] = d["expense"]
+        elif metric_key == "drr_ad": data[m] = (d["expense"] / d["ad_sales"] * 100) if d["ad_sales"] > 0 else 0.0
+        elif metric_key == "drr_total": data[m] = (d["expense"] / d["total_sales"] * 100) if d["total_sales"] > 0 else 0.0
+        elif metric_key == "impressions": data[m] = d["impressions"]
+        elif metric_key == "clicks": data[m] = d["clicks"]
+        elif metric_key == "carts": data[m] = d["carts"]
+        elif metric_key == "ctr": data[m] = (d["clicks"] / d["impressions"] * 100) if d["impressions"] > 0 else 0.0
     return data
 
-async def generate_ad_dynamics_chart(token, campaign_ids, skus_by_campaign, years,
-                                      metric_key, metric_label, postings_by_month_cache):
+async def generate_ad_dynamics_chart(token, campaign_ids, skus_by_campaign, years, metric_key, metric_label, postings_by_month_cache):
     postings_by_month_all = {}
     for y in years:
         p = await fetch_postings(f"{y}-01-01", f"{y}-12-31")
@@ -1640,8 +1520,7 @@ async def generate_ad_dynamics_chart(token, campaign_ids, skus_by_campaign, year
             except: continue
             if dtx.year != y: continue
             monthly_postings[dtx.month - 1].append(p)
-        data[y] = await ad_dynamics_get_monthly(token, campaign_ids, y, skus_by_campaign,
-                                                 monthly_postings, metric_key)
+        data[y] = await ad_dynamics_get_monthly(token, campaign_ids, y, skus_by_campaign, monthly_postings, metric_key)
     fig, ax = plt.subplots(figsize=(10, 6))
     months = [datetime.date(2000, m, 1) for m in range(1, 13)]
     for y, vals in data.items():
@@ -1657,7 +1536,7 @@ async def generate_ad_dynamics_chart(token, campaign_ids, skus_by_campaign, year
     buf = io.BytesIO(); plt.savefig(buf, format='png', dpi=100); buf.seek(0); plt.close(fig)
     return buf
 
-# ==================== ФОРМАТИРОВАНИЕ ПРОДАЖ ====================
+# ==================== ФОРМАТИРОВАНИЕ ====================
 def format_expense_block(exp, title, limit=25):
     if not exp: return f"🔹 *{title}*\nНет данных о расходах.\n"
     total = sum(exp.values())
@@ -1768,18 +1647,15 @@ async def build_today_report(include_yesterday=False):
     pm = (cm - datetime.timedelta(days=1)).replace(day=1); pm_s = pm.isoformat()
     dp = (td - cm).days + 1
     pm_e = pm + datetime.timedelta(days=dp - 1); pm_e_s = pm_e.isoformat()
-
     postings_cur, postings_prev, ad_t, ad_y, ad_m, ad_pm, fin_t, fin_m = await asyncio.gather(
         fetch_postings(cm_s, today), fetch_postings(pm_s, pm_e_s),
         fetch_advertising_expense(today, today), fetch_advertising_expense(yest, yest),
         fetch_advertising_expense(cm_s, today), fetch_advertising_expense(pm_s, pm_e_s),
         fetch_finance_transactions(today, today), fetch_finance_transactions(cm_s, today))
-
     t_m = aggregate_postings_range(postings_cur, today, today)
     y_m = aggregate_postings_range(postings_cur, yest, yest)
     m_m = aggregate_postings_range(postings_cur, cm_s, today)
     p_m = aggregate_postings_range(postings_prev, pm_s, pm_e_s)
-
     exp_t = aggregate_finance_expenses(fin_t)
     exp_m = aggregate_finance_expenses(fin_m)
     if ad_t > 0: exp_t["Оплата за клик"] = exp_t.get("Оплата за клик", 0) + ad_t
@@ -1795,14 +1671,12 @@ async def build_today_report(include_yesterday=False):
         du_ = t_m["delivered_units"]
         cr = (cu_ / du_ * 100) if du_ > 0 else None
         cr_txt = f"{cr:.2f}%" if cr is not None else "∞"
-        return (
-            f"🔹 *Сегодня (на {now.strftime('%H:%M')} МСК)*\n"
-            f"  🛒 Заказано: \n  {fmt_num(os_)} ₽ / {fmt_int(ou_)} шт.\n"
-            f"    vs Вчера: \n  {d_os} ₽ / {d_ou} шт.\n\n"
-            f"  ❌ Отменено: \n  {fmt_num(cs_)} ₽ / {fmt_int(cu_)} шт.\n"
-            f"    vs Вчера: \n  {d_cs} ₽ / {d_cu} шт.\n"
-            f"  Доля отмен: {cr_txt}\n"
-        )
+        return (f"🔹 *Сегодня (на {now.strftime('%H:%M')} МСК)*\n"
+                f"  🛒 Заказано: \n  {fmt_num(os_)} ₽ / {fmt_int(ou_)} шт.\n"
+                f"    vs Вчера: \n  {d_os} ₽ / {d_ou} шт.\n\n"
+                f"  ❌ Отменено: \n  {fmt_num(cs_)} ₽ / {fmt_int(cu_)} шт.\n"
+                f"    vs Вчера: \n  {d_cs} ₽ / {d_cu} шт.\n"
+                f"  Доля отмен: {cr_txt}\n")
 
     def blk_yesterday():
         os_ = y_m["ordered_sum"]; ou_ = y_m["ordered_units"]
@@ -1816,15 +1690,13 @@ async def build_today_report(include_yesterday=False):
         edrr_txt = f"{edrr:.2f}%" if edrr is not None else "∞"
         yest_dt = datetime.datetime.strptime(yest, "%Y-%m-%d").date()
         yest_fmt = yest_dt.strftime("%d.%m.%Y")
-        return (
-            f"🔹 *Вчера ({yest_fmt}, полный день)*\n"
-            f"  🛒 Заказано: \n  {fmt_num(os_)} ₽ / {fmt_int(ou_)} шт.\n\n"
-            f"  📦 Доставлено: \n  {fmt_num(ds_)} ₽ / {fmt_int(du_)} шт.\n\n"
-            f"  ❌ Отменено: \n  {fmt_num(cs_)} ₽ / {fmt_int(cu_)} шт.\n"
-            f"  Доля отмен: {cr_txt}\n\n"
-            f"  📢 Реклама: {fmt_num(ad_y)} ₽\n"
-            f"  ДРР (общий): {drr_txt} | ДРР (по доставленным): {edrr_txt}"
-        )
+        return (f"🔹 *Вчера ({yest_fmt}, полный день)*\n"
+                f"  🛒 Заказано: \n  {fmt_num(os_)} ₽ / {fmt_int(ou_)} шт.\n\n"
+                f"  📦 Доставлено: \n  {fmt_num(ds_)} ₽ / {fmt_int(du_)} шт.\n\n"
+                f"  ❌ Отменено: \n  {fmt_num(cs_)} ₽ / {fmt_int(cu_)} шт.\n"
+                f"  Доля отмен: {cr_txt}\n\n"
+                f"  📢 Реклама: {fmt_num(ad_y)} ₽\n"
+                f"  ДРР (общий): {drr_txt} | ДРР (по доставленным): {edrr_txt}")
 
     def blk_month():
         os_ = m_m["ordered_sum"]; ou_ = m_m["ordered_units"]
@@ -1849,19 +1721,17 @@ async def build_today_report(include_yesterday=False):
         edrr_txt = f"{edrr:.2f}%" if edrr is not None else "∞"
         p_drr_txt = f"{p_drr:.2f}%" if p_drr is not None else "∞"
         p_edrr_txt = f"{p_edrr:.2f}%" if p_edrr is not None else "∞"
-        return (
-            f"🔹 *Текущий месяц*\n"
-            f"  🛒 Заказано: \n  {fmt_num(os_)} ₽ / {fmt_int(ou_)} шт.\n"
-            f"    vs предыдущий месяц: \n  {d_os} ₽ / {d_ou} шт.\n\n"
-            f"  📦 Доставлено: \n  {fmt_num(ds_)} ₽ / {fmt_int(du_)} шт.\n"
-            f"    vs предыдущий месяц: \n  {d_ds} ₽ / {d_du} шт.\n\n"
-            f"  ❌ Отменено: \n  {fmt_num(cs_)} ₽ / {fmt_int(cu_)} шт.\n"
-            f"    vs предыдущий месяц: \n  {d_cs} ₽ / {d_cu} шт.\n"
-            f"  Доля отмен: {cr_txt} | vs предыдущий месяц: {p_cr_txt} ({d_cr})\n\n"
-            f"  📢 Реклама: \n  {fmt_num(ad_m)} ₽ | vs предыдущий месяц: {fmt_num(ad_pm)} ₽\n"
-            f"  ДРР (общий): {drr_txt} | vs предыдущий месяц: {p_drr_txt}\n"
-            f"  ДРР (по доставленным): {edrr_txt} | vs предыдущий месяц: {p_edrr_txt}"
-        )
+        return (f"🔹 *Текущий месяц*\n"
+                f"  🛒 Заказано: \n  {fmt_num(os_)} ₽ / {fmt_int(ou_)} шт.\n"
+                f"    vs предыдущий месяц: \n  {d_os} ₽ / {d_ou} шт.\n\n"
+                f"  📦 Доставлено: \n  {fmt_num(ds_)} ₽ / {fmt_int(du_)} шт.\n"
+                f"    vs предыдущий месяц: \n  {d_ds} ₽ / {d_du} шт.\n\n"
+                f"  ❌ Отменено: \n  {fmt_num(cs_)} ₽ / {fmt_int(cu_)} шт.\n"
+                f"    vs предыдущий месяц: \n  {d_cs} ₽ / {d_cu} шт.\n"
+                f"  Доля отмен: {cr_txt} | vs предыдущий месяц: {p_cr_txt} ({d_cr})\n\n"
+                f"  📢 Реклама: \n  {fmt_num(ad_m)} ₽ | vs предыдущий месяц: {fmt_num(ad_pm)} ₽\n"
+                f"  ДРР (общий): {drr_txt} | vs предыдущий месяц: {p_drr_txt}\n"
+                f"  ДРР (по доставленным): {edrr_txt} | vs предыдущий месяц: {p_edrr_txt}")
 
     parts = []
     if include_yesterday:
@@ -1890,9 +1760,7 @@ async def build_period_report(df, dt, name, status_msg=None):
     if missing_days and status_msg:
         est_low = len(missing_days) * 2 // 60
         est_high = len(missing_days) * 3 // 60
-        await _safe_edit(status_msg,
-            f"⏳ Загрузка финансов: {len(missing_days)} дней\n"
-            f"_Ориентировочно {est_low}–{est_high} мин._")
+        await _safe_edit(status_msg, f"⏳ Загрузка финансов: {len(missing_days)} дней\n_Ориентировочно {est_low}–{est_high} мин._")
     cur, prev = await asyncio.gather(
         get_period_metrics(df, dt, status_msg=status_msg),
         get_period_metrics(pf, pt, status_msg=status_msg))
@@ -1930,7 +1798,7 @@ def main_kb(chat_id):
     if is_admin(chat_id):
         buttons.append([KeyboardButton("⚙️ Администрирование")])
         buttons.append([KeyboardButton("📚 Справочник расходов")])
-    buttons.append([KeyboardButton("📖 Справка")])
+    buttons.append([KeyboardButton("📖 Справка"), KeyboardButton("📚 Руководство")])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 def access_check_kb():
@@ -1961,6 +1829,7 @@ def admin_kb():
     return ReplyKeyboardMarkup([
         [KeyboardButton("➕ Добавить менеджера"), KeyboardButton("➖ Удалить менеджера")],
         [KeyboardButton("📋 Список менеджеров")],
+        [KeyboardButton("📚 Руководство")],
         [KeyboardButton("🔙 Назад")]], resize_keyboard=True)
 
 def auto_kb():
@@ -2002,6 +1871,334 @@ def hours_kb_silence(prefix):
     kb.append([InlineKeyboardButton("🔙 Назад", callback_data=f"{prefix}back")])
     return InlineKeyboardMarkup(kb)
 
+# ==================== ASCII-СХЕМЫ МЕНЮ (визуальные "скриншоты") ====================
+def _scheme_main_menu() -> str:
+    return (
+        "```\n"
+        "┌───────────────────────────────┐\n"
+        "│        ГЛАВНОЕ МЕНЮ           │\n"
+        "├───────────────────────────────┤\n"
+        "│ 📊  Отчёт по продажам         │\n"
+        "│ 📦  Отчёт по товарам          │\n"
+        "│ 📈  Отчёт по рекламе          │\n"
+        "│ 🔔  Автоматические рассылки   │\n"
+        "│ 📖  Справка  │ 📚 Руководство │\n"
+        "└───────────────────────────────┘\n"
+        "```"
+    )
+
+def _scheme_sales_menu() -> str:
+    return (
+        "```\n"
+        "┌───────────────────────────────┐\n"
+        "│     ОТЧЁТ ПО ПРОДАЖАМ         │\n"
+        "├───────────────────────────────┤\n"
+        "│ 📅 Продажи за сегодня         │\n"
+        "│ 📆 Выбрать дату               │\n"
+        "│ 📊 Выбрать период             │\n"
+        "│ 📈 Динамика продаж            │\n"
+        "│ 🔙 Назад                      │\n"
+        "└───────────────────────────────┘\n"
+        "```"
+    )
+
+def _scheme_period_menu() -> str:
+    return (
+        "```\n"
+        "┌───────────────────────────────┐\n"
+        "│       ВЫБОР ПЕРИОДА           │\n"
+        "├───────────────────────────────┤\n"
+        "│ 🗓️  По месяцам                │\n"
+        "│ 📅 По кварталам               │\n"
+        "│ 📆 По годам                   │\n"
+        "│ ✏️  Произвольный              │\n"
+        "│ 🔙 Назад                      │\n"
+        "└───────────────────────────────┘\n"
+        "```"
+    )
+
+def _scheme_products_menu() -> str:
+    return (
+        "```\n"
+        "┌───────────────────────────────┐\n"
+        "│      ОТЧЁТ ПО ТОВАРАМ         │\n"
+        "├───────────────────────────────┤\n"
+        "│ 📅 Топ товаров за сегодня     │\n"
+        "│ 🏆 Товары за период           │\n"
+        "│ 📈 Динамика по товару         │\n"
+        "│ 🔙 Назад                      │\n"
+        "└───────────────────────────────┘\n"
+        "```"
+    )
+
+def _scheme_ad_menu() -> str:
+    return (
+        "```\n"
+        "┌───────────────────────────────┐\n"
+        "│      ОТЧЁТ ПО РЕКЛАМЕ         │\n"
+        "├───────────────────────────────┤\n"
+        "│ 📅 Реклама за текущий месяц   │\n"
+        "│ 📅 Реклама за период          │\n"
+        "│ 📈 Динамика по рекламе        │\n"
+        "│ 🔙 Назад                      │\n"
+        "└───────────────────────────────┘\n"
+        "```"
+    )
+
+def _scheme_auto_menu() -> str:
+    return (
+        "```\n"
+        "┌───────────────────────────────┐\n"
+        "│   АВТОМАТИЧЕСКИЕ РАССЫЛКИ     │\n"
+        "├───────────────────────────────┤\n"
+        "│ 🕒 Выбор времени рассылок     │\n"
+        "│ 📅 Отчёт за Вчера             │\n"
+        "│ 🔕 Режим тишины               │\n"
+        "│ 📤 Отправить сейчас           │\n"
+        "│ 🔙 Назад                      │\n"
+        "└───────────────────────────────┘\n"
+        "```"
+    )
+
+def _scheme_admin_menu() -> str:
+    return (
+        "```\n"
+        "┌───────────────────────────────┐\n"
+        "│    ⚙️ АДМИНИСТРИРОВАНИЕ       │\n"
+        "├───────────────────────────────┤\n"
+        "│ ➕ Добавить менеджера         │\n"
+        "│ ➖ Удалить менеджера          │\n"
+        "│ 📋 Список менеджеров          │\n"
+        "│ 📚 Руководство                │\n"
+        "│ 🔙 Назад                      │\n"
+        "└───────────────────────────────┘\n"
+        "```"
+    )
+
+# ==================== СПРАВКА ====================
+def _help_text_common() -> str:
+    return (
+        "📖 *Справка по боту*\n\n"
+        "Бот показывает аналитику вашего магазина Ozon: продажи, товары, "
+        "рекламу и автоматические отчёты. Все данные — в реальном времени "
+        "через официальное API Ozon.\n\n"
+
+        "🔹 *Главное меню*\n"
+        f"{_scheme_main_menu()}\n\n"
+
+        "🔹 *Как читать цифры*\n"
+        "• 🟢 рост • 🔴 снижение — относительно прошлого периода.\n"
+        "• *ДРР* — доля рекламных расходов в выручке.\n"
+        "• *CTR* — процент кликов от показов.\n"
+        "• Все расчёты по МСК (UTC+3).\n\n"
+
+        "💡 Подробное руководство: /guide или кнопка «📚 Руководство».\n\n"
+    )
+
+def _help_text_manager_extended() -> str:
+    return (
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔹 *Возможности менеджера*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        "*📊 Отчёт по продажам*\n"
+        f"{_scheme_sales_menu()}\n\n"
+        "• *Продажи за сегодня* — заказы, отмены и реклама на текущий момент "
+        "сравниваются с вчера.\n"
+        "• *Выбрать дату* — отчёт за один конкретный день (календарь).\n"
+        "• *Выбрать период* — по месяцам / кварталам / годам или произвольно.\n"
+        f"{_scheme_period_menu()}\n"
+        "• *Динамика продаж* — график доставленных заказов по месяцам, "
+        "можно сравнить до 10 лет.\n\n"
+
+        "*📦 Отчёт по товарам*\n"
+        f"{_scheme_products_menu()}\n\n"
+
+        "*📈 Отчёт по рекламе*\n"
+        f"{_scheme_ad_menu()}\n\n"
+
+        "*🔔 Автоматические рассылки*\n"
+        f"{_scheme_auto_menu()}\n\n"
+
+        "⚠️ Если рассылки не настроены, бот напомнит в 12:00 МСК.\n\n"
+    )
+
+def _help_text_admin_extended() -> str:
+    return (
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔹 *Возможности администратора*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        "*⚙️ Управление менеджерами*\n"
+        f"{_scheme_admin_menu()}\n\n"
+
+        "*📚 Справочник расходов*\n"
+        "Показывает типы услуг Ozon: распознанные и требующие уточнения. "
+        "Используется в отчётах для расшифровки блока «Расходы».\n\n"
+
+        "*🔧 Технические команды*\n"
+        "• /accrual_types — справочник начислений Ozon.\n"
+        "• /clearcache — очистить кэш API (принудительное обновление данных).\n"
+        "• /guide — подробное руководство пользователя.\n"
+        "• /version — версия бота.\n\n"
+
+        "*📂 Файлы данных (в контейнере)*\n"
+        "• /app/data/expense_types.json — локальный справочник расходов.\n"
+        "• /app/data/accrual_types.json — справочник начислений Ozon.\n"
+        "• /app/data/managers.json — список менеджеров.\n"
+        "• /app/data/settings.json — расписания рассылок.\n"
+        "• /app/data/ozon_log.txt — лог работы бота.\n\n"
+    )
+
+async def send_help(update, context):
+    chat_id = update.effective_chat.id
+    common = _help_text_common()
+    if is_admin(chat_id):
+        full = (common + _help_text_admin_extended() + _help_text_manager_extended() +
+                f"🤖 *Версия бота:* {VERSION}")
+    elif is_manager(chat_id):
+        full = (common + _help_text_manager_extended() +
+                f"🤖 *Версия бота:* {VERSION}\n\n"
+                "ℹ️ Для дополнительных возможностей обратитесь к администратору.")
+    else:
+        full = "❌ У вас нет доступа. Обратитесь к администратору."
+    await send_long_message(update.message, full, parse_mode="Markdown")
+
+
+async def send_guide(update, context):
+    chat_id = update.effective_chat.id
+    if not has_access(chat_id):
+        await update.message.reply_text("❌ Нет доступа."); return
+    guide = (
+        "📚 *Подробное руководство пользователя*\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔹 *1. ГЛАВНОЕ МЕНЮ*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{_scheme_main_menu()}\n\n"
+        "Четыре основных раздела плюс справка и руководство. Для админа "
+        "дополнительно появляются разделы «⚙️ Администрирование» и "
+        "«📚 Справочник расходов».\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔹 *2. ОТЧЁТ ПО ПРОДАЖАМ*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{_scheme_sales_menu()}\n\n"
+
+        "*📅 Продажи за сегодня*\n"
+        "Сводка текущего дня (с начала суток по МСК) на момент запроса:\n"
+        "  • 🛒 Заказано — общая сумма и количество.\n"
+        "  • ❌ Отменено — сумма, количество и доля отмен.\n"
+        "  • Сравнение с вчера (в %).\n"
+        "  • Блок «Текущий месяц» с итогами и рекламой.\n"
+        "  • Раздел «Расходы сегодня» и «Расходы за месяц».\n\n"
+
+        "*📆 Выбрать дату*\n"
+        "Отчёт за один календарный день. Удобно для проверки конкретных акций.\n\n"
+
+        "*📊 Выбрать период*\n"
+        f"{_scheme_period_menu()}\n"
+        "Каждый отчёт содержит блок сравнения с предыдущим аналогичным периодом.\n\n"
+
+        "*📈 Динамика продаж*\n"
+        "График доставленных заказов по месяцам. Можно сравнить до 10 лет.\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔹 *3. ОТЧЁТ ПО ТОВАРАМ*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{_scheme_products_menu()}\n\n"
+        "• *Топ товаров за сегодня* — самые продаваемые товары текущего дня.\n"
+        "• *Товары за период* — топ-20 по любому диапазону.\n"
+        "• *Динамика по товару* — выберите товар и метрику, получите график:\n"
+        "  • Заказано (₽ / шт.)\n"
+        "  • Доставлено (₽ / шт.)\n"
+        "  • Отменено (₽ / шт.)\n"
+        "  • Средний чек\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔹 *4. ОТЧЁТ ПО РЕКЛАМЕ*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{_scheme_ad_menu()}\n\n"
+        "• *Реклама за текущий месяц* — общая сводка по всем кампаниям:\n"
+        "  • Средняя ставка и стоимость клика.\n"
+        "  • Продажи в рекламе и общие продажи.\n"
+        "  • Расход, ДРР, показы, клики, корзины, CTR.\n"
+        "  • Раздел «ПО КОМПАНИЯМ» с разбивкой по каждой кампании.\n"
+        "• *Реклама за период* — то же самое, но за выбранный период.\n"
+        "• *Динамика по рекламе* — график по метрике (ДРР, CPC, расход, клики и т.д.).\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔹 *5. АВТОМАТИЧЕСКИЕ РАССЫЛКИ*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{_scheme_auto_menu()}\n\n"
+        "• *🕒 Выбор времени рассылок* — отметьте часы (МСК), в которые бот "
+        "будет отправлять обычный отчёт.\n"
+        "• *📅 Добавление отчёта за Вчера* — дополнительные часы для "
+        "расширенного отчёта с блоком «Вчера».\n"
+        "• *🔕 Режим тишины* — время, когда бот не отправляет сообщения "
+        "(например, ночью).\n"
+        "• *📤 Отправить отчёт за Вчера сейчас* — мгновенная отправка "
+        "расширенного отчёта.\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔹 *6. КАК ЧИТАТЬ ЦИФРЫ*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🟢 — рост показателя по сравнению с предыдущим периодом.\n"
+        "🔴 — снижение показателя.\n\n"
+        "• *ДРР* — доля рекламных расходов в выручке. Чем ниже, тем эффективнее.\n"
+        "• *ДРР общий* — от всей выручки магазина.\n"
+        "• *ДРР по доставленным* — только от фактически доставленных заказов.\n"
+        "• *Средний чек* — средняя стоимость заказа.\n"
+        "• *Доля отмен* — процент отменённых заказов от доставленных.\n"
+        "• *CTR* — процент кликов от показов.\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔹 *7. ЧАСТЫЕ ВОПРОСЫ*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        "*❓ Цифры отличаются от личного кабинета Ozon*\n"
+        "Данные приходят через официальное API. Расхождения обычно связаны "
+        "с разными статусами заказов (создан / отгружен / доставлен / отменён). "
+        "Бот учитывает заказ в момент его создания.\n\n"
+
+        "*❓ Первый отчёт по длинному периоду грузится долго*\n"
+        "При первом обращении бот скачивает данные из Ozon с нуля. "
+        "Это может занять до 15 минут. Последующие запросы быстрые.\n\n"
+
+        "*❓ Отчёт за сегодня не обновляется*\n"
+        "Данные за сегодня всегда запрашиваются заново. Если новых заказов "
+        "не появилось — просто обновите отчёт через минуту.\n\n"
+
+        "*❓ Бот не присылает рассылки*\n"
+        "Проверьте:\n"
+        "  1. Включены ли часы в «🕒 Выбор времени рассылок».\n"
+        "  2. Не активен ли «🔕 Режим тишины» в это время.\n"
+        "  3. Запущен ли сам бот на сервере.\n\n"
+
+        "*❓ Хочу изменить список доступных разделов*\n"
+        "Обратитесь к администратору — он управляет доступом через "
+        "раздел «⚙️ Администрирование».\n\n"
+    )
+    if is_admin(chat_id):
+        guide += (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🔹 *8. ДЛЯ АДМИНИСТРАТОРА*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{_scheme_admin_menu()}\n\n"
+            "• *⚙️ Администрирование* — управление менеджерами.\n"
+            "• *📚 Справочник расходов* — типы услуг Ozon: распознанные и требующие уточнения.\n"
+            "• */accrual_types* — справочник начислений Ozon.\n"
+            "• */clearcache* — сброс кэша API.\n\n"
+            "📂 *Файлы данных контейнера:*\n"
+            "  • /app/data/expense_types.json — справочник расходов.\n"
+            "  • /app/data/accrual_types.json — справочник начислений Ozon.\n"
+            "  • /app/data/managers.json — список менеджеров.\n"
+            "  • /app/data/settings.json — расписания рассылок.\n"
+            "  • /app/data/ozon_log.txt — лог работы бота.\n\n"
+        )
+    guide += f"🤖 *Версия бота:* {VERSION}"
+    await send_long_message(update.message, guide, parse_mode="Markdown")
+
 # ==================== ГЛАВНОЕ МЕНЮ ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -2031,8 +2228,7 @@ async def check_access_cmd(update, context):
     chat_id = update.effective_chat.id
     if not has_access(chat_id):
         await update.message.reply_text("❌ Доступа пока нет. Попробуйте позже.",
-                                        reply_markup=access_check_kb())
-        return
+                                        reply_markup=access_check_kb()); return
     await update.message.reply_text("✅ Доступ получен!", reply_markup=main_kb(chat_id))
 
 async def version_command(update, context):
@@ -2041,8 +2237,7 @@ async def version_command(update, context):
 async def clearcache_command(update, context):
     chat_id = update.effective_chat.id
     if not is_admin(chat_id):
-        await update.message.reply_text("⛔ Только для администратора.")
-        return
+        await update.message.reply_text("⛔ Только для администратора."); return
     try:
         clear_all_cache()
         await update.message.reply_text("✅ Кэш очищен. Следующие отчёты будут построены заново.")
@@ -2053,17 +2248,15 @@ async def clearcache_command(update, context):
 async def accrual_types_command(update, context):
     chat_id = update.effective_chat.id
     if not is_admin(chat_id):
-        await update.message.reply_text("⛔ Только для администратора.")
-        return
+        await update.message.reply_text("⛔ Только для администратора."); return
     types = await fetch_accrual_types()
     if not types:
         await update.message.reply_text(
             "❌ Не удалось загрузить справочник начислений.\n\n"
-            "Проверьте лог `/app/data/ozon_log.txt` — там указана точная причина.\n\n"
+            "Проверьте лог `/app/data/ozon_log.txt` — там указана причина.\n\n"
             "Вы также можете заполнить файл `/app/data/accrual_types.json` вручную:\n"
             '```json\n{"41": "Реклама", "59": "Услуги отправления"}\n```',
-            parse_mode="Markdown")
-        return
+            parse_mode="Markdown"); return
     lines = ["📚 *Справочник начислений Ozon*", ""]
     for tid, name in sorted(types.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 0):
         lines.append(f"  `{tid}` → {name}")
@@ -2076,9 +2269,11 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not has_access(chat_id):
         await update.message.reply_text("❌ Нет доступа.", reply_markup=access_check_kb()); return
     if text == "📊 Отчёт по продажам":
-        await update.message.reply_text("Отчёты по продажам:", reply_markup=sales_reports_kb())
+        await update.message.reply_text("📊 *Отчёт по продажам*\n\nВыберите действие:",
+                                        reply_markup=sales_reports_kb(), parse_mode="Markdown")
     elif text == "📦 Отчёт по товарам":
-        await update.message.reply_text("Отчёты по товарам:", reply_markup=products_reports_kb())
+        await update.message.reply_text("📦 *Отчёт по товарам*\n\nВыберите действие:",
+                                        reply_markup=products_reports_kb(), parse_mode="Markdown")
     elif text == "📈 Отчёт по рекламе":
         await update.message.reply_text("📈 *Отчёт по рекламе*\n\nВыберите действие:",
                                         reply_markup=ad_reports_kb(), parse_mode="Markdown")
@@ -2088,13 +2283,22 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "⚙️ Администрирование":
         if not is_admin(chat_id):
             await update.message.reply_text("⛔ Только для администратора."); return
-        await update.message.reply_text("Управление менеджерами:", reply_markup=admin_kb())
+        await update.message.reply_text("⚙️ *Администрирование*\n\nУправление менеджерами:",
+                                        reply_markup=admin_kb(), parse_mode="Markdown")
     elif text == "📚 Справочник расходов":
         if not is_admin(chat_id):
             await update.message.reply_text("⛔ Только для администратора."); return
         await show_expense_types(update, context)
     elif text == "📖 Справка":
         await send_help(update, context)
+    elif text == "📚 Руководство":
+        await send_guide(update, context)
+
+async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопки «📚 Руководство» из раздела администрирования."""
+    text = update.message.text
+    if text == "📚 Руководство":
+        await send_guide(update, context)
 
 # ==================== ОТЧЁТ ПО РЕКЛАМЕ — текущий месяц ====================
 async def ad_report_month_handler(update, context):
@@ -2363,17 +2567,13 @@ async def ad_dynamics_range_end(update, context):
 async def ad_dynamics_show_campaigns(q_or_msg, context, years):
     token = await get_performance_token()
     if not token:
-        try:
-            await q_or_msg.edit_message_text("❌ Не удалось получить токен.")
-        except Exception:
-            await q_or_msg.edit_text("❌ Не удалось получить токен.")
+        try: await q_or_msg.edit_message_text("❌ Не удалось получить токен.")
+        except Exception: await q_or_msg.edit_text("❌ Не удалось получить токен.")
         return ConversationHandler.END
     campaigns = await ad_fetch_campaigns(token)
     if not campaigns:
-        try:
-            await q_or_msg.edit_message_text("❌ Кампании не найдены.")
-        except Exception:
-            await q_or_msg.edit_text("❌ Кампании не найдены.")
+        try: await q_or_msg.edit_message_text("❌ Кампании не найдены.")
+        except Exception: await q_or_msg.edit_text("❌ Кампании не найдены.")
         return ConversationHandler.END
     context.user_data['ad_dyn_campaigns'] = [(str(c.get("id", "")), c.get("title", str(c.get("id"))))
                                               for c in campaigns if c.get("id")]
@@ -2382,21 +2582,17 @@ async def ad_dynamics_show_campaigns(q_or_msg, context, years):
         kb.append([InlineKeyboardButton(title[:40], callback_data=f"adcamp_{cid}")])
     kb.append([InlineKeyboardButton("🔙 Назад", callback_data="adcamp_cancel")])
     text = "Выберите кампанию:"
-    try:
-        await q_or_msg.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
-    except Exception:
-        await q_or_msg.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    try: await q_or_msg.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    except Exception: await q_or_msg.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
     return WAITING_AD_DYN_CAMPAIGN_SELECT
 
 async def ad_dynamics_show_campaigns_msg(msg, context, years):
     token = await get_performance_token()
     if not token:
-        await msg.edit_text("❌ Не удалось получить токен.")
-        return ConversationHandler.END
+        await msg.edit_text("❌ Не удалось получить токен."); return ConversationHandler.END
     campaigns = await ad_fetch_campaigns(token)
     if not campaigns:
-        await msg.edit_text("❌ Кампании не найдены.")
-        return ConversationHandler.END
+        await msg.edit_text("❌ Кампании не найдены."); return ConversationHandler.END
     context.user_data['ad_dyn_campaigns'] = [(str(c.get("id", "")), c.get("title", str(c.get("id"))))
                                               for c in campaigns if c.get("id")]
     kb = [[InlineKeyboardButton("🌐 Все кампании", callback_data="adcamp_all")]]
@@ -2446,14 +2642,12 @@ async def ad_dynamics_metric_cb(update, context):
         campaign_ids_sel = context.user_data.get('ad_dyn_campaign_ids', None)
         camp_title = context.user_data.get('ad_dyn_campaign_title', 'Все кампании')
         if not years:
-            await q.edit_message_text("❌ Потерян период.")
-            return ConversationHandler.END
+            await q.edit_message_text("❌ Потерян период."); return ConversationHandler.END
         await q.edit_message_text(f"⏳ Строю график: {metric_label}\nКампания: {camp_title}")
         try:
             token = await get_performance_token()
             if not token:
-                await q.edit_message_text("❌ Токен не получен.")
-                return ConversationHandler.END
+                await q.edit_message_text("❌ Токен не получен."); return ConversationHandler.END
             campaigns, skus_by_campaign = await _get_all_campaign_data(token, q.message)
             if campaign_ids_sel is None:
                 campaign_ids = [str(c.get("id")) for c in campaigns if c.get("id")]
@@ -2479,8 +2673,7 @@ async def ad_dynamics_metric_cb(update, context):
 async def show_expense_types(update, context):
     data = get_expense_types()
     if not data:
-        await update.message.reply_text("Справочник пуст.")
-        return
+        await update.message.reply_text("Справочник пуст."); return
     items = []
     for tid, entry in data.items():
         if isinstance(entry, dict):
@@ -2524,46 +2717,6 @@ async def expense_types_cb(update, context):
         _accrual_types_cache = None
         await fetch_accrual_types()
         await q.edit_message_text("🔄 Справочник перечитан и обновлён.")
-
-async def send_help(update, context):
-    chat_id = update.effective_chat.id
-    common = (
-        "📖 *Справка*\n\n"
-        "🔹 *Основные функции*\n"
-        "• 📊 Отчёт по продажам – сводка за сегодня и текущий месяц.\n"
-        "• 📦 Отчёт по товарам – топ товаров по выручке.\n"
-        "• 📈 Отчёт по рекламе – статистика рекламных кампаний.\n"
-        "• 📆 Выбрать дату – данные за конкретный день.\n"
-        "• 📊 Выбрать период – месяц/квартал/год/произвольный.\n"
-        "• 📈 Динамика продаж – график доставленных заказов.\n"
-        "• 📈 Динамика по товару – график продаж товара.\n"
-        "• 🔔 Автоматические рассылки – персональная настройка.\n\n"
-        "🔹 *Отчёт по рекламе*\n"
-        "• 📅 Реклама за текущий месяц – сводка с VS.\n"
-        "• 📅 Реклама за период – месяц/квартал/год/произвольный.\n"
-        "• 📈 Динамика по рекламе – график по метрике.\n\n"
-        "🔹 *Автоматические отчёты*\n"
-        "• 🕒 Выбор времени рассылок – обычный отчёт.\n"
-        "• 📅 Добавление отчёта за Вчера – с блоком «Вчера».\n"
-        "• 🔕 Режим тишины.\n"
-        "• 📤 Отправить сейчас.\n\n"
-        "🔹 *Часовой пояс*\n"
-        "• Все расчёты – по МСК (UTC+3).\n\n"
-    )
-    if is_admin(chat_id):
-        help_text = common + (
-            "🔹 *Администрирование (только админ)*\n"
-            "• ➕ Добавить менеджера.\n"
-            "• ➖ Удалить менеджера.\n"
-            "• 📋 Список менеджеров.\n"
-            "• 📚 Справочник расходов.\n"
-            "• /accrual_types – справочник начислений Ozon.\n"
-            "• /clearcache – сбросить кэш API.\n\n"
-            f"🤖 Версия бота: {VERSION}"
-        )
-    else:
-        help_text = common + f"🤖 Версия бота: {VERSION}"
-    await update.message.reply_text(help_text, parse_mode="Markdown")
 
 # ==================== ПРОДАЖИ ====================
 async def today_report(update, context):
@@ -3442,7 +3595,7 @@ async def admin_add_phone(update, context):
     else:
         await update.message.reply_text(f"⚠️ Менеджер {d['id']} уже есть.")
     context.user_data.pop('new_m', None)
-    await update.message.reply_text("Управление:", reply_markup=admin_kb())
+    await update.message.reply_text("⚙️ Администрирование:", reply_markup=admin_kb())
     return ConversationHandler.END
 
 async def admin_remove_start(update, context):
@@ -3459,14 +3612,14 @@ async def admin_remove_input(update, context):
         await update.message.reply_text("❌ Админа нельзя удалить."); return WAITING_REMOVE_MANAGER
     if remove_manager(uid): await update.message.reply_text(f"✅ Удалён {uid}.")
     else: await update.message.reply_text(f"❌ Не найден {uid}.")
-    await update.message.reply_text("Управление:", reply_markup=admin_kb())
+    await update.message.reply_text("⚙️ Администрирование:", reply_markup=admin_kb())
     return ConversationHandler.END
 
 async def admin_list(update, context):
     if not is_admin(update.effective_chat.id): return
     ms = load_managers()
     if not ms: await update.message.reply_text("Список пуст."); return
-    lines = ["📋 Список:"]
+    lines = ["📋 Список менеджеров:"]
     for m in ms:
         info = f"ID: {m.get('id')}"
         if m.get('username'): info += f", @{m['username']}"
@@ -3553,25 +3706,40 @@ def main():
            .token(TELEGRAM_BOT_TOKEN)
            .connect_timeout(30.0).read_timeout(30.0).write_timeout(30.0)
            .post_init(init_http_session).post_shutdown(close_http_session).build())
+
+    # ===== Команды =====
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("version", version_command))
     app.add_handler(CommandHandler("help", send_help))
+    app.add_handler(CommandHandler("guide", send_guide))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("clearcache", clearcache_command))
     app.add_handler(CommandHandler("accrual_types", accrual_types_command))
+
+    # ===== Главное меню =====
     app.add_handler(MessageHandler(filters.Regex(
         "^(📊 Отчёт по продажам|📦 Отчёт по товарам|📈 Отчёт по рекламе|"
         "🔔 Автоматические рассылки|⚙️ Администрирование|"
-        "📚 Справочник расходов|📖 Справка)$"), handle_main_menu))
+        "📚 Справочник расходов|📖 Справка|📚 Руководство)$"), handle_main_menu))
+
+    # ===== Проверка доступа =====
     app.add_handler(MessageHandler(filters.Text(["🔄 Проверить доступ"]), check_access_cmd))
+
+    # ===== Кнопки-одиночки =====
     app.add_handler(MessageHandler(filters.Text(["📅 Продажи за сегодня"]), today_report))
     app.add_handler(MessageHandler(filters.Text(["📅 Топ товаров за сегодня"]), top_today))
     app.add_handler(MessageHandler(filters.Text(["📋 Список менеджеров"]), admin_list))
     app.add_handler(MessageHandler(filters.Text(["📅 Реклама за текущий месяц"]), ad_report_month_handler))
+
+    # ===== Меню автоматических рассылок =====
     app.add_handler(MessageHandler(filters.Regex(
         "^(🕒 Выбор времени рассылок|📅 Добавление отчета за Вчера|"
-        "🔕 Режим тишины|📤 Отправить отчет за Вчера сейчас|🔙 Назад)$"), auto_menu_router))
+        "🔕 Режим тишины|📤 Отправить отчет за Вчера сейчас)$"), auto_menu_router))
+
+    # ===== Callback справочника расходов =====
     app.add_handler(CallbackQueryHandler(expense_types_cb, pattern="^et_"))
+
+    # ===== ConversationHandler-ы =====
     conv_date = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📆 Выбрать дату"), date_menu)],
         states={WAITING_DATE_SINGLE: [CallbackQueryHandler(date_cb)]},
@@ -3624,8 +3792,7 @@ def main():
             WAITING_AD_REPORT_PERIOD_MONTH: [CallbackQueryHandler(ad_period_month_cb)],
             WAITING_AD_REPORT_PERIOD_QUARTER: [CallbackQueryHandler(ad_period_quarter_cb)],
             WAITING_AD_REPORT_PERIOD_START: [CallbackQueryHandler(ad_period_custom_start_cb)],
-            WAITING_AD_REPORT_PERIOD_END: [CallbackQueryHandler(ad_period_custom_end_cb)],
-        },
+            WAITING_AD_REPORT_PERIOD_END: [CallbackQueryHandler(ad_period_custom_end_cb)]},
         fallbacks=[CommandHandler("cancel", cancel)])
     conv_ad_dyn = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📈 Динамика по рекламе"), ad_dynamics_menu)],
@@ -3635,8 +3802,7 @@ def main():
             WAITING_AD_DYN_RANGE_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, ad_dynamics_range_start)],
             WAITING_AD_DYN_RANGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, ad_dynamics_range_end)],
             WAITING_AD_DYN_CAMPAIGN_SELECT: [CallbackQueryHandler(ad_dynamics_campaign_cb)],
-            WAITING_AD_DYN_METRIC: [CallbackQueryHandler(ad_dynamics_metric_cb)],
-        },
+            WAITING_AD_DYN_METRIC: [CallbackQueryHandler(ad_dynamics_metric_cb)]},
         fallbacks=[CommandHandler("cancel", cancel)])
     conv_sch = ConversationHandler(
         entry_points=[CallbackQueryHandler(schedule_cb, pattern="^sch_")],
@@ -3662,11 +3828,13 @@ def main():
         entry_points=[MessageHandler(filters.Text("➖ Удалить менеджера"), admin_remove_start)],
         states={WAITING_REMOVE_MANAGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_remove_input)]},
         fallbacks=[CommandHandler("cancel", cancel)])
+
     app.add_handler(conv_date); app.add_handler(conv_period); app.add_handler(conv_prod)
     app.add_handler(conv_dyn); app.add_handler(conv_pchart)
     app.add_handler(conv_ad_period); app.add_handler(conv_ad_dyn)
     app.add_handler(conv_sch); app.add_handler(conv_yest); app.add_handler(conv_sil)
     app.add_handler(conv_add); app.add_handler(conv_rm)
+
     if app.job_queue:
         app.job_queue.run_repeating(check_auto_reports, interval=900, first=10)
     write_log("🚀 Бот готов.")
