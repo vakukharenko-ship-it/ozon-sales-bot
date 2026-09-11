@@ -15,9 +15,9 @@ from telegram.warnings import PTBUserWarning
 
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
-# ==================== ВЕРСИЯ И ИСТОРИЯ ====================
-VERSION = "2.3.7"
-CHANGELOG_MESSAGE = "Отладочная версия: только 'Продажи за сегодня'. Исправлен limit=100 для /v3/posting/fbo/list."
+# ==================== ВЕРСИЯ ====================
+VERSION = "2.3.8"
+CHANGELOG_MESSAGE = "Детальное логирование отгрузок, попытка FBS если FBO пусто, логирование финансов."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 60
@@ -46,6 +46,7 @@ ADMIN_CHAT_ID_STR = os.getenv("ADMIN_CHAT_ID")
 ADMIN_CHAT_ID = int(ADMIN_CHAT_ID_STR) if ADMIN_CHAT_ID_STR and ADMIN_CHAT_ID_STR.isdigit() else 0
 
 OZON_POSTING_FBO_URL = "https://api-seller.ozon.ru/v3/posting/fbo/list"
+OZON_POSTING_FBS_URL = "https://api-seller.ozon.ru/v3/posting/fbs/list"
 OZON_FINANCE_ACCRUAL_BY_DAY_URL = "https://api-seller.ozon.ru/v1/finance/accrual/by-day"
 
 MOSCOW_TZ = datetime.timezone(datetime.timedelta(hours=3))
@@ -234,31 +235,36 @@ async def get_performance_token():
         return None
 
 # ---------- ОТГРУЗКИ ----------
-async def fetch_postings(date_from, date_to):
-    cache_key = f"postings_{date_from}_{date_to}"
-    cached = await get_from_cache(cache_key)
-    if cached is not None:
-        return cached
+async def fetch_postings_from_endpoint(url, date_from, date_to, endpoint_name):
+    """Запрашивает отгрузки с одного эндпоинта. Логирует структуру ответа."""
     headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY, "Content-Type": "application/json"}
-    since_iso = f"{date_from}T00:00:00.000Z"
-    to_iso = f"{date_to}T23:59:59.999Z"
+    since_iso = f"{date_from}T00:00:00Z"
+    to_iso = f"{date_to}T23:59:59Z"
     all_postings = []
     offset = 0
-    LIMIT = 100  # v3 требует limit в (0, 100]
+    LIMIT = 100
+    first_page = True
     while True:
         payload = {
             "dir": "ASC",
-            "filter": {"since": since_iso, "to": to_iso, "status": ""},
+            "filter": {"since": since_iso, "to": to_iso},
             "limit": LIMIT,
             "offset": offset,
             "translit": False,
             "with": {"analytics_data": True, "financial_data": True}
         }
         try:
-            data = await api_request_with_retry(OZON_POSTING_FBO_URL, headers, payload, method='POST')
+            data = await api_request_with_retry(url, headers, payload, method='POST')
         except Exception as e:
-            write_log(f"❌ Ошибка получения отгрузок: {e}")
+            write_log(f"❌ [{endpoint_name}] ошибка: {e}")
             break
+        if first_page:
+            keys = list(data.keys()) if isinstance(data, dict) else type(data).__name__
+            write_log(f"🔍 [{endpoint_name}] ключи ответа: {keys}")
+            # Логируем первые 500 символов тела
+            snippet = json.dumps(data, ensure_ascii=False)[:500]
+            write_log(f"🔍 [{endpoint_name}] тело: {snippet}")
+            first_page = False
         postings = data.get("result", [])
         if not postings:
             break
@@ -266,9 +272,24 @@ async def fetch_postings(date_from, date_to):
         if len(postings) < LIMIT:
             break
         offset += LIMIT
-    write_log(f"📦 Загружено отгрузок: {len(all_postings)} за {date_from}–{date_to}")
-    await save_to_cache(cache_key, all_postings)
+    write_log(f"📦 [{endpoint_name}] загружено: {len(all_postings)} за {date_from}–{date_to}")
     return all_postings
+
+async def fetch_postings(date_from, date_to):
+    cache_key = f"postings_{date_from}_{date_to}"
+    cached = await get_from_cache(cache_key)
+    if cached is not None:
+        return cached
+
+    # Сначала FBO
+    postings = await fetch_postings_from_endpoint(OZON_POSTING_FBO_URL, date_from, date_to, "FBO")
+    # Если FBO пусто — пробуем FBS
+    if not postings:
+        write_log(f"ℹ️ FBO пусто, пробую FBS...")
+        postings = await fetch_postings_from_endpoint(OZON_POSTING_FBS_URL, date_from, date_to, "FBS")
+
+    await save_to_cache(cache_key, postings)
+    return postings
 
 # ---------- РЕКЛАМА ----------
 async def fetch_advertising_expense(date_from, date_to):
@@ -306,12 +327,19 @@ async def fetch_finance_accruals_by_day(date_str: str) -> List[Dict]:
     headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY, "Content-Type": "application/json"}
     payload = {"date": date_str}
     all_accruals = []
+    first_page = True
     while True:
         try:
             data = await api_request_with_retry(OZON_FINANCE_ACCRUAL_BY_DAY_URL, headers, payload, method='POST')
         except Exception as e:
-            write_log(f"❌ Ошибка финансов за {date_str}: {e}")
+            write_log(f"❌ Финансы {date_str}: {e}")
             break
+        if first_page:
+            keys = list(data.keys()) if isinstance(data, dict) else type(data).__name__
+            write_log(f"🔍 [FIN] {date_str} ключи: {keys}")
+            snippet = json.dumps(data, ensure_ascii=False)[:400]
+            write_log(f"🔍 [FIN] {date_str} тело: {snippet}")
+            first_page = False
         accruals = data.get("accruals", [])
         if not accruals:
             break
@@ -337,11 +365,15 @@ async def fetch_finance_transactions(date_from, date_to):
         end_dt = today
     all_accruals = []
     current = start_dt
+    total_days = (end_dt - start_dt).days + 1
+    day_idx = 0
     while current <= end_dt:
+        day_idx += 1
+        write_log(f"💰 Финансы {date_from}–{date_to}: день {day_idx}/{total_days} ({current.isoformat()})")
         day_accruals = await fetch_finance_accruals_by_day(current.isoformat())
         all_accruals.extend(day_accruals)
         current += datetime.timedelta(days=1)
-    write_log(f"💰 Загружено начислений: {len(all_accruals)} за {date_from}–{date_to}")
+    write_log(f"💰 Всего начислений: {len(all_accruals)} за {date_from}–{date_to}")
     await save_to_cache(cache_key, all_accruals)
     return all_accruals
 
@@ -363,49 +395,6 @@ def aggregate_finance_expenses(accruals: List[Dict]) -> Dict[str, float]:
             ["комиссия", "доставка", "логистика", "эквайринг", "хранение", "возврат", "упаковка", "страхование", "утилизация", "потеря", "кросс-докинг"]):
             result[category] = result.get(category, 0) + abs(amount)
     return result
-
-def aggregate_postings(postings, date_from=None, date_to=None, time_limit=None, apply_limit_on_day=None):
-    agg = {}
-    for posting in postings:
-        created_at = posting.get("created_at", "")
-        if not created_at:
-            continue
-        try:
-            dt = datetime.datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-            dt_msk = dt.astimezone(MOSCOW_TZ)
-        except:
-            continue
-        date_str = dt_msk.date().isoformat()
-        if date_from and date_str < date_from:
-            continue
-        if date_to and date_str > date_to:
-            continue
-        if time_limit is not None and apply_limit_on_day is not None and date_str == apply_limit_on_day:
-            if dt_msk.time() > time_limit:
-                continue
-        total_units = 0
-        total_sum = 0.0
-        for product in posting.get("products", []):
-            qty = int(product.get("quantity", 0))
-            try:
-                price = float(product.get("price", "0"))
-            except:
-                price = 0.0
-            total_units += qty
-            total_sum += price * qty
-        status = posting.get("status", "")
-        if date_str not in agg:
-            agg[date_str] = {"ordered_units": 0, "ordered_sum": 0.0, "delivered_units": 0,
-                             "delivered_sum": 0.0, "canceled_units": 0, "canceled_sum": 0.0}
-        agg[date_str]["ordered_units"] += total_units
-        agg[date_str]["ordered_sum"] += total_sum
-        if status in ("cancelled", "canceled"):
-            agg[date_str]["canceled_units"] += total_units
-            agg[date_str]["canceled_sum"] += total_sum
-        elif status in ("delivered", "completed"):
-            agg[date_str]["delivered_units"] += total_units
-            agg[date_str]["delivered_sum"] += total_sum
-    return agg
 
 def aggregate_postings_multi(postings, ranges):
     results = {label: {"ordered_units": 0, "ordered_sum": 0.0, "delivered_units": 0,
@@ -453,33 +442,9 @@ def format_expense_block(expenses_by_type, title):
     if not expenses_by_type:
         return f"🔹 *{title}*\nНет данных о расходах.\n"
     total = sum(expenses_by_type.values())
-    lines = [f"🔹 *{title}*", f"  *Итого расходов:* {total:,.2f} ₽"]
-    name_map = {
-        "Комиссия Ozon": "Комиссия",
-        "Оплата эквайринга": "Эквайринг",
-        "Доставка покупателю": "Доставка покупателю",
-        "Доставка и обработка возврата, отмены, невыкупа": "Доставка/возвраты",
-        "Кросс-докинг": "Кросс-докинг",
-        "Страхование товара от массовых повреждений": "Страхование",
-        "Обеспечение материалами для упаковки товара": "Обеспечение упаковкой",
-        "Упаковка товара партнёрами": "Упаковка",
-        "Подписка Управление отзывами": "Подписка",
-        "Оплата за клик": "Оплата за клик",
-        "MarketplaceServiceItemDirectFlowLogistic": "Логистика прямая",
-        "MarketplaceServiceItemReturnFlowLogistic": "Логистика возврат",
-        "MarketplaceRedistributionOfAcquiringOperation": "Эквайринг",
-        "MarketplaceServiceItemRedistributionReturnsPVZ": "Обработка возвратов (ПВЗ)",
-        "MarketplaceServiceItemPackageRedistribution": "Переупаковка",
-        "MarketplaceServiceItemRedistributionLastMilePVZ": "Логистика последняя миля",
-        "MarketplaceServiceItemDisposalDetailed": "Утилизация",
-        "Вознаграждение за продажу": "Вознаграждение",
-        "Программы партнёров": "Программы партнёров",
-        "Баллы за скидки": "Баллы за скидки",
-        "Выручка": "Выручка",
-        "Возврат выручки": "Возврат выручки",
-    }
+    lines = [f"🔹 *{title}*", f"  *Итого:* {total:,.2f} ₽"]
     for category, amount in sorted(expenses_by_type.items(), key=lambda x: x[1], reverse=True):
-        lines.append(f"    {name_map.get(category, category[:40])}: {amount:,.2f} ₽")
+        lines.append(f"    {str(category)[:40]}: {amount:,.2f} ₽")
     return "\n".join(lines)
 
 def calc_delta(current, previous):
@@ -495,7 +460,7 @@ def fmt_pct(val):
         return "∞"
     return f"+{val:.1f}%" if val > 0 else f"{val:.1f}%"
 
-# ---------- ОТЧЁТ «ПРОДАЖИ ЗА СЕГОДНЯ» ----------
+# ---------- ОТЧЁТ ----------
 async def build_today_report():
     now = get_current_time_msk()
     today_date = now.date()
@@ -513,8 +478,10 @@ async def build_today_report():
 
     write_log("📊 Начинаю формирование отчёта...")
 
-    # 1. Отгрузки за текущий месяц и предыдущий период
+    write_log("📦 Шаг 1/4: отгрузки за текущий месяц")
     postings_cur = await fetch_postings(cm_start_str, today_str)
+
+    write_log("📦 Шаг 2/4: отгрузки за прошлый период")
     postings_prev = await fetch_postings(pm_start_str, pm_end_str)
 
     ranges_cur = [
@@ -532,9 +499,13 @@ async def build_today_report():
     month_m = agg_cur.get("month", {})
     prev_m = agg_prev.get("prev", {})
 
-    # 2. Реклама и финансы
+    write_log(f"📊 Сегодня: {today_m.get('ordered_units', 0)} шт, месяц: {month_m.get('ordered_units', 0)} шт")
+
+    write_log("📢 Шаг 3/4: реклама")
     ad_today = await fetch_advertising_expense(today_str, today_str)
     ad_month = await fetch_advertising_expense(cm_start_str, today_str)
+
+    write_log("💰 Шаг 4/4: финансы")
     fin_today = await fetch_finance_transactions(today_str, today_str)
     fin_month = await fetch_finance_transactions(cm_start_str, today_str)
 
@@ -545,7 +516,6 @@ async def build_today_report():
     if ad_month > 0:
         exp_month["Оплата за клик"] = ad_month
 
-    # 3. Формирование
     def block_today():
         os_ = today_m.get("ordered_sum", 0)
         ou_ = today_m.get("ordered_units", 0)
@@ -598,9 +568,11 @@ async def build_today_report():
     parts = [block_today(), block_month()]
     parts.append(format_expense_block(exp_today, "Расходы сегодня"))
     parts.append(format_expense_block(exp_month, "Расходы за текущий месяц"))
-    return "📊 *Продажи за сегодня*\n\n\n" + "\n\n".join(parts)
+    report = "📊 *Продажи за сегодня*\n\n\n" + "\n\n".join(parts)
+    write_log(f"✅ Отчёт сформирован, длина: {len(report)}")
+    return report
 
-# ==================== ТЕЛЕГРАМ-ХЕНДЛЕРЫ ====================
+# ==================== ТЕЛЕГРАМ ====================
 def main_keyboard():
     return ReplyKeyboardMarkup(
         [[KeyboardButton("📊 Продажи за сегодня")], [KeyboardButton("🔄 Обновить")]],
@@ -610,8 +582,7 @@ def main_keyboard():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not is_admin(chat_id):
-        await update.message.reply_text("❌ Нет доступа. Обратитесь к администратору.",
-                                        reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("❌ Нет доступа.", reply_markup=ReplyKeyboardRemove())
         return
     await update.message.reply_text(
         f"🤖 Версия бота: {VERSION}\n\nНажмите кнопку ниже, чтобы получить отчёт.",
