@@ -16,22 +16,26 @@ from telegram.warnings import PTBUserWarning
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ ====================
-VERSION = "2.3.12"
-CHANGELOG_MESSAGE = "Новая агрегация расходов: разбор POSTING (комиссия+логистика), ITEM и NON_ITEM с человекочитаемыми названиями."
+VERSION = "2.3.13"
+CHANGELOG_MESSAGE = "Параллельные запросы: раздельные семафоры для seller и performance API, asyncio.gather для отгрузок/рекламы/финансов, параллельные дни финансов."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 60
 API_RETRY_ATTEMPTS = 3
 API_RETRY_DELAY = 10
-RATE_LIMIT_REQUESTS_PER_SECOND = 0.33
+# Лимиты
+SELLER_RATE = 0.33           # ~1 запрос в 3 сек к api-seller.ozon.ru
+PERFORMANCE_RATE = 1.0       # ~1 запрос в секунду к api-performance.ozon.ru (другой домен)
 CACHE_TTL_SECONDS = 300
 VERSION_HISTORY_FILE = "version_history.json"
 LOG_FILE = "/app/data/ozon_log.txt"
 
 # ==================== ГЛОБАЛЬНЫЕ ====================
 _http_session = None
-_rate_limiter = None
-_api_semaphore = None
+_seller_semaphore = None
+_perf_semaphore = None
+_seller_rate = None
+_perf_rate = None
 _cache_lock = asyncio.Lock()
 _api_cache = {}
 _cache_timestamps = {}
@@ -51,21 +55,14 @@ OZON_FINANCE_ACCRUAL_BY_DAY_URL = "https://api-seller.ozon.ru/v1/finance/accrual
 MOSCOW_TZ = datetime.timezone(datetime.timedelta(hours=3))
 
 # ==================== СПРАВОЧНИКИ ====================
-# Названия услуг Ozon по type_id (лучшие известные + пометка для неизвестных)
-# В комментариях — как встречается в новых логах.
 TYPE_ID_NAMES = {
-    # === ITEM (по товарам) ===
-    1: "Обработка товара",                       # ITEM: -19 ₽/шт — приёмка/обработка
-    # === POSTING (по отправлениям) ===
-    29: "Последняя миля",                        # POSTING.delivery: -7..10 ₽
-    32: "Логистика",                             # POSTING.delivery: -75..146 ₽
-    98: "Доп. услуги отправления",               # POSTING.delivery: -25 ₽ (редко)
-    # === NON_ITEM (внешние услуги) ===
-    12: "Прочие услуги Ozon",                    # NON_ITEM: -340..667 ₽ (разово)
-    76: "Внешние услуги Ozon",                   # NON_ITEM: -170..190 ₽/день
+    1: "Обработка товара",
+    29: "Последняя миля",
+    32: "Логистика",
+    98: "Доп. услуги отправления",
+    12: "Прочие услуги Ozon",
+    76: "Внешние услуги Ozon",
 }
-
-# Fallback-названия по категории
 CATEGORY_FALLBACK = {
     "ITEM": "Услуги по товарам",
     "NON_ITEM": "Внешние услуги Ozon",
@@ -140,7 +137,6 @@ def fmt_int(val):
     return str(val) if val else "0"
 
 def parse_money(obj) -> float:
-    """Универсальный парсер: {'amount': '-19.09'} | '-19.09' | -19.09 → float"""
     if obj is None:
         return 0.0
     if isinstance(obj, dict):
@@ -156,7 +152,6 @@ def parse_price(product) -> float:
     return parse_money(product.get("price"))
 
 def type_name(type_id, category_code):
-    """Возвращает человекочитаемое имя type_id. Fallback: 'Категория (type N)'."""
     if type_id in TYPE_ID_NAMES:
         return TYPE_ID_NAMES[type_id]
     fallback = CATEGORY_FALLBACK.get(category_code, "Услуги")
@@ -178,7 +173,7 @@ async def save_to_cache(key, value):
 
 # ==================== RATE LIMITER ====================
 class RateLimiter:
-    def __init__(self, rate=RATE_LIMIT_REQUESTS_PER_SECOND):
+    def __init__(self, rate):
         self.rate = rate
         self.lock = asyncio.Lock()
         self.last_request_time = 0
@@ -193,9 +188,11 @@ class RateLimiter:
 
 # ==================== ИНИЦИАЛИЗАЦИЯ ====================
 async def init_http_session(app):
-    global _http_session, _rate_limiter, _api_semaphore
-    _rate_limiter = RateLimiter()
-    _api_semaphore = asyncio.Semaphore(1)
+    global _http_session, _seller_semaphore, _perf_semaphore, _seller_rate, _perf_rate
+    _seller_semaphore = asyncio.Semaphore(1)
+    _perf_semaphore = asyncio.Semaphore(1)
+    _seller_rate = RateLimiter(SELLER_RATE)
+    _perf_rate = RateLimiter(PERFORMANCE_RATE)
     timeout = aiohttp.ClientTimeout(total=API_TIMEOUT)
     connector = aiohttp.TCPConnector(limit=50, limit_per_host=10, ttl_dns_cache=300)
     _http_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
@@ -209,11 +206,16 @@ async def close_http_session(app):
 
 # ==================== API ====================
 async def api_request_with_retry(url, headers, payload=None, method='POST'):
-    global _http_session, _rate_limiter, _api_semaphore
-    async with _api_semaphore:
+    """Выбирает семафор и rate limiter по домену URL."""
+    global _http_session
+    is_performance = "api-performance.ozon.ru" in url
+    semaphore = _perf_semaphore if is_performance else _seller_semaphore
+    rate = _perf_rate if is_performance else _seller_rate
+
+    async with semaphore:
         for attempt in range(API_RETRY_ATTEMPTS):
             try:
-                await _rate_limiter.acquire()
+                await rate.acquire()
                 if method == 'POST':
                     async with _http_session.post(url, headers=headers, json=payload) as resp:
                         body = await resp.text()
@@ -261,8 +263,7 @@ async def get_performance_token():
                "grant_type": "client_credentials"}
     try:
         data = await api_request_with_retry(url, headers, payload, method='POST')
-        token = data.get("access_token")
-        return token
+        return data.get("access_token")
     except Exception as e:
         write_log(f"❌ Ошибка токена: {e}")
         return None
@@ -366,6 +367,7 @@ async def fetch_finance_accruals_by_day(date_str: str) -> List[Dict]:
     return all_accruals
 
 async def fetch_finance_transactions(date_from, date_to):
+    """Параллельно запрашивает все дни периода. Rate limiter сериализует старты."""
     cache_key = f"fin_{date_from}_{date_to}"
     cached = await get_from_cache(cache_key)
     if cached is not None:
@@ -377,32 +379,33 @@ async def fetch_finance_transactions(date_from, date_to):
         return []
     if end_dt > today:
         end_dt = today
-    all_accruals = []
+
+    # Собираем список дней
+    days = []
     current = start_dt
-    total_days = (end_dt - start_dt).days + 1
-    day_idx = 0
     while current <= end_dt:
-        day_idx += 1
-        write_log(f"💰 Финансы: день {day_idx}/{total_days} ({current.isoformat()})")
-        day_accruals = await fetch_finance_accruals_by_day(current.isoformat())
-        all_accruals.extend(day_accruals)
+        days.append(current.isoformat())
         current += datetime.timedelta(days=1)
+
+    write_log(f"💰 Финансы: {len(days)} дней параллельно ({date_from}–{date_to})")
+
+    # Параллельный запуск
+    tasks = [fetch_finance_accruals_by_day(d) for d in days]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_accruals = []
+    for i, res in enumerate(results):
+        if isinstance(res, list):
+            all_accruals.extend(res)
+        elif isinstance(res, Exception):
+            write_log(f"⚠️ Ошибка в дне {days[i]}: {res}")
+
     write_log(f"💰 Всего начислений: {len(all_accruals)}")
     await save_to_cache(cache_key, all_accruals)
     return all_accruals
 
-# ==================== АГРЕГАЦИЯ ФИНАНСОВ (новая) ====================
+# ==================== АГРЕГАЦИЯ ФИНАНСОВ ====================
 def aggregate_finance_expenses(accruals: List[Dict]) -> Dict[str, float]:
-    """
-    Разбирает начисления по компонентам и возвращает {человекочитаемое_имя: сумма_расхода}.
-    
-    Структура accrual:
-      - POSTING: содержит posting.products[].commission (комиссия Ozon) 
-                 и posting.products[].delivery.services[] (логистика и пр.)
-      - ITEM: содержит item_fees.fees[].fees[].{type_id, accrued}
-      - NON_ITEM: содержит non_item_fee.{type_id, accrued}
-      - CONTAINER: содержит container_fees
-    """
     result: Dict[str, float] = {}
 
     def add(name: str, amount: float):
@@ -414,26 +417,21 @@ def aggregate_finance_expenses(accruals: List[Dict]) -> Dict[str, float]:
             continue
         cat = item.get("accrued_category", "")
 
-        # ---------- POSTING: комиссия + услуги доставки ----------
         if cat == "POSTING":
             posting = item.get("posting") or {}
             for product in posting.get("products", []) or []:
-                # 1. Комиссия Ozon
                 comm = product.get("commission") or {}
                 sc = parse_money(comm.get("sale_commission"))
                 if sc < 0:
                     add("Комиссия Ozon", abs(sc))
-                # 2. Услуги доставки (логистика, последняя миля, доп.)
                 delivery = product.get("delivery") or {}
                 for svc in delivery.get("services", []) or []:
                     tid = svc.get("type_id")
                     amt = parse_money(svc.get("accrued"))
                     if amt < 0:
-                        name = type_name(tid, cat)
-                        add(name, abs(amt))
+                        add(type_name(tid, cat), abs(amt))
             continue
 
-        # ---------- ITEM: услуги по товарам ----------
         if cat == "ITEM":
             item_fees = item.get("item_fees") or {}
             for fee_group in item_fees.get("fees", []) or []:
@@ -441,21 +439,17 @@ def aggregate_finance_expenses(accruals: List[Dict]) -> Dict[str, float]:
                     tid = fee.get("type_id")
                     amt = parse_money(fee.get("accrued"))
                     if amt < 0:
-                        name = type_name(tid, cat)
-                        add(name, abs(amt))
+                        add(type_name(tid, cat), abs(amt))
             continue
 
-        # ---------- NON_ITEM: внешние услуги ----------
         if cat == "NON_ITEM":
             non = item.get("non_item_fee") or {}
             tid = non.get("type_id")
             amt = parse_money(non.get("accrued"))
             if amt < 0:
-                name = type_name(tid, cat)
-                add(name, abs(amt))
+                add(type_name(tid, cat), abs(amt))
             continue
 
-        # ---------- CONTAINER ----------
         if cat == "CONTAINER":
             cont = item.get("container_fees") or {}
             amt = parse_money(cont.get("accrued", cont))
@@ -463,7 +457,6 @@ def aggregate_finance_expenses(accruals: List[Dict]) -> Dict[str, float]:
                 add("Контейнеры", abs(amt))
             continue
 
-        # ---------- Fallback (неизвестная категория) ----------
         total = parse_money(item.get("total_amount"))
         if total < 0:
             add(cat or "Прочее", abs(total))
@@ -540,6 +533,8 @@ def fmt_pct(val):
 
 # ==================== ОТЧЁТ ====================
 async def build_today_report():
+    """Параллельно запускает 6 задач: 2 отгрузки, 2 рекламы, 2 финансовых обхода."""
+    t0 = time.time()
     now = get_current_time_msk()
     today_date = now.date()
     today_str = today_date.isoformat()
@@ -554,11 +549,19 @@ async def build_today_report():
     pm_end = pm_start + datetime.timedelta(days=days_passed - 1)
     pm_end_str = pm_end.isoformat()
 
-    write_log("📊 Шаг 1/4: отгрузки текущий месяц")
-    postings_cur = await fetch_postings(cm_start_str, today_str)
+    write_log("📊 Параллельная загрузка: 2 отгрузки + 2 рекламы + 2 финансовых обхода")
 
-    write_log("📊 Шаг 2/4: отгрузки прошлый период")
-    postings_prev = await fetch_postings(pm_start_str, pm_end_str)
+    # Запускаем всё сразу
+    postings_cur, postings_prev, ad_today, ad_month, fin_today, fin_month = await asyncio.gather(
+        fetch_postings(cm_start_str, today_str),
+        fetch_postings(pm_start_str, pm_end_str),
+        fetch_advertising_expense(today_str, today_str),
+        fetch_advertising_expense(cm_start_str, today_str),
+        fetch_finance_transactions(today_str, today_str),
+        fetch_finance_transactions(cm_start_str, today_str),
+    )
+    t1 = time.time()
+    write_log(f"⏱️ Все данные загружены за {t1-t0:.1f} сек")
 
     ranges_cur = [
         ("today", today_str, today_str, current_time, today_str),
@@ -574,14 +577,6 @@ async def build_today_report():
     yest_m = agg_cur.get("yesterday", {})
     month_m = agg_cur.get("month", {})
     prev_m = agg_prev.get("prev", {})
-
-    write_log("📊 Шаг 3/4: реклама")
-    ad_today = await fetch_advertising_expense(today_str, today_str)
-    ad_month = await fetch_advertising_expense(cm_start_str, today_str)
-
-    write_log("📊 Шаг 4/4: финансы")
-    fin_today = await fetch_finance_transactions(today_str, today_str)
-    fin_month = await fetch_finance_transactions(cm_start_str, today_str)
 
     exp_today = aggregate_finance_expenses(fin_today)
     exp_month = aggregate_finance_expenses(fin_month)
@@ -643,7 +638,7 @@ async def build_today_report():
     parts.append(format_expense_block(exp_today, "Расходы сегодня"))
     parts.append(format_expense_block(exp_month, "Расходы за текущий месяц"))
     report = "📊 *Продажи за сегодня*\n\n\n" + "\n\n".join(parts)
-    write_log(f"✅ Отчёт готов")
+    write_log(f"✅ Отчёт готов за {time.time()-t0:.1f} сек")
     return report
 
 # ==================== ТЕЛЕГРАМ ====================
@@ -670,7 +665,7 @@ async def today_report_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if not is_admin(chat_id):
         await update.message.reply_text("❌ Нет доступа.")
         return
-    progress_msg = await update.message.reply_text("⏳ Загружаю данные (может занять 1-2 мин)...")
+    progress_msg = await update.message.reply_text("⏳ Загружаю данные (параллельно)...")
     try:
         report = await build_today_report()
         await progress_msg.delete()
