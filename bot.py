@@ -16,15 +16,16 @@ from telegram.warnings import PTBUserWarning
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ ====================
-VERSION = "2.3.14"
-CHANGELOG_MESSAGE = "Раздельные семафоры для отгрузок и финансов, SELLER_RATE 0.5/сек. Отгрузки и финансы идут параллельно."
+VERSION = "2.3.15"
+CHANGELOG_MESSAGE = "Раздельные rate limiters для отгрузок и финансов — параллельная работа без общей очереди."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 60
 API_RETRY_ATTEMPTS = 3
 API_RETRY_DELAY = 10
 # Лимиты
-SELLER_RATE = 0.5            # ~1 запрос в 2 сек к api-seller.ozon.ru
+POSTINGS_RATE = 0.5          # ~1 запрос в 2 сек к /v3/posting/fbo/list
+FINANCE_RATE = 0.5           # ~1 запрос в 2 сек к /v1/finance/accrual/by-day
 PERFORMANCE_RATE = 1.0       # ~1 запрос в сек к api-performance.ozon.ru
 CACHE_TTL_SECONDS = 300
 VERSION_HISTORY_FILE = "version_history.json"
@@ -35,7 +36,8 @@ _http_session = None
 _postings_sem = None
 _finance_sem = None
 _perf_sem = None
-_seller_rate = None
+_postings_rate = None
+_finance_rate = None
 _perf_rate = None
 _cache_lock = asyncio.Lock()
 _api_cache = {}
@@ -189,16 +191,18 @@ class RateLimiter:
 
 # ==================== ИНИЦИАЛИЗАЦИЯ ====================
 async def init_http_session(app):
-    global _http_session, _postings_sem, _finance_sem, _perf_sem, _seller_rate, _perf_rate
+    global _http_session, _postings_sem, _finance_sem, _perf_sem
+    global _postings_rate, _finance_rate, _perf_rate
     _postings_sem = asyncio.Semaphore(1)
     _finance_sem = asyncio.Semaphore(1)
     _perf_sem = asyncio.Semaphore(1)
-    _seller_rate = RateLimiter(SELLER_RATE)
+    _postings_rate = RateLimiter(POSTINGS_RATE)
+    _finance_rate = RateLimiter(FINANCE_RATE)
     _perf_rate = RateLimiter(PERFORMANCE_RATE)
     timeout = aiohttp.ClientTimeout(total=API_TIMEOUT)
     connector = aiohttp.TCPConnector(limit=50, limit_per_host=10, ttl_dns_cache=300)
     _http_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
-    write_log(f"✅ HTTP-сессия (v{VERSION}, rate {SELLER_RATE}/сек)")
+    write_log(f"✅ HTTP-сессия (v{VERSION}: postings {POSTINGS_RATE}/сек, finance {FINANCE_RATE}/сек)")
 
 async def close_http_session(app):
     global _http_session
@@ -208,25 +212,16 @@ async def close_http_session(app):
 
 # ==================== API ====================
 async def api_request_with_retry(url, headers, payload=None, method='POST', kind='finance'):
-    """
-    kind — тип запроса:
-      - 'postings' → _postings_sem
-      - 'finance'  → _finance_sem
-      - 'perf'     → _perf_sem
-    Rate limiter общий для seller (postings + finance), отдельный для perf.
-    """
+    """kind: 'postings' | 'finance' | 'perf' — каждый со своим семафором и rate limiter."""
     global _http_session
     if kind == 'perf':
-        semaphore = _perf_sem
-        rate = _perf_rate
+        sem, rate = _perf_sem, _perf_rate
     elif kind == 'postings':
-        semaphore = _postings_sem
-        rate = _seller_rate
+        sem, rate = _postings_sem, _postings_rate
     else:
-        semaphore = _finance_sem
-        rate = _seller_rate
+        sem, rate = _finance_sem, _finance_rate
 
-    async with semaphore:
+    async with sem:
         for attempt in range(API_RETRY_ATTEMPTS):
             try:
                 await rate.acquire()
@@ -561,7 +556,7 @@ async def build_today_report():
     pm_end = pm_start + datetime.timedelta(days=days_passed - 1)
     pm_end_str = pm_end.isoformat()
 
-    write_log("📊 Параллельная загрузка: отгрузки + реклама + финансы одновременно")
+    write_log("📊 Параллельная загрузка: 2 потока (postings + finance)")
 
     postings_cur, postings_prev, ad_today, ad_month, fin_today, fin_month = await asyncio.gather(
         fetch_postings(cm_start_str, today_str),
