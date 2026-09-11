@@ -29,8 +29,8 @@ from telegram.warnings import PTBUserWarning
 
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
-VERSION = "2.7.0"
-CHANGELOG_MESSAGE = "Отчёт по рекламе: 'Реклама за период' + 'Динамика по рекламе'. Кэш рекламы. SKU/артикул через слэш."
+VERSION = "2.7.1"
+CHANGELOG_MESSAGE = "Исправлено зависание 'Реклама за период' и 'Динамика по рекламе' — убрано дублирование MessageHandler и ConversationHandler."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 60
@@ -569,11 +569,10 @@ async def fetch_postings(date_from, date_to):
         if not data.get("has_next"): break
         cursor = data.get("cursor", "")
         if not cursor or len(postings) < LIMIT: break
-    write_log(f"📦 Отгрузок: {len(all_p)} за {date_from}–{date_to}")
     await save_to_cache(cache_key, all_p)
     return all_p
 
-# ==================== РЕКЛАМА (общая сумма расходов) ====================
+# ==================== РЕКЛАМА (общая сумма) ====================
 async def _fetch_advertising_expense_single(date_from, date_to):
     token = await get_performance_token()
     if not token: return 0.0
@@ -965,7 +964,6 @@ async def ad_fetch_stats_chunk(token, campaign_ids: List[str], date_from: str, d
 
 async def ad_fetch_stats(token, campaign_ids: List[str], date_from: str, date_to: str,
                         status_msg=None) -> List[Dict]:
-    """Собирает статистику за период, разбивая на части по 60 дней и суммируя по кампаниям."""
     start_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d").date()
     end_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d").date()
     today = get_moscow_today()
@@ -974,8 +972,7 @@ async def ad_fetch_stats(token, campaign_ids: List[str], date_from: str, date_to
     total_days = (end_dt - start_dt).days + 1
     if total_days <= AD_CHUNK_DAYS:
         return await ad_fetch_stats_chunk(token, campaign_ids, date_from, end_dt.isoformat())
-    # Разбиваем
-    all_rows: Dict[str, Dict] = {}  # by campaign_id
+    all_rows: Dict[str, Dict] = {}
     chunks = []
     cur = start_dt
     while cur <= end_dt:
@@ -1002,7 +999,6 @@ async def ad_fetch_stats(token, campaign_ids: List[str], date_from: str, date_to
             dst["clicks"] = str(ad_to_int(dst["clicks"]) + ad_to_int(r.get("clicks")))
             dst["toCart"] = str(ad_to_int(dst["toCart"]) + ad_to_int(r.get("toCart")))
             dst["orders"] = str(ad_to_int(dst["orders"]) + ad_to_int(r.get("orders")))
-    # Пересчитываем clickPrice = moneySpent / clicks
     for cid, dst in all_rows.items():
         c = ad_to_int(dst["clicks"])
         dst["clickPrice"] = str(ad_to_float(dst["moneySpent"]) / c) if c > 0 else "0"
@@ -1196,7 +1192,6 @@ async def _safe_edit(msg, text, parse_mode="Markdown"):
         write_log(f"⚠️ edit_text: {e}")
 
 async def _get_all_campaign_data(token, status_msg=None):
-    """Возвращает (campaigns, skus_by_campaign). С кэшем."""
     campaigns = await ad_fetch_campaigns(token)
     if not campaigns: return [], {}
     if status_msg:
@@ -1257,7 +1252,6 @@ async def build_ad_report_period(date_from: str, date_to: str, period_name: str,
     if not token: return "❌ Не удалось получить токен Performance API"
     campaigns, skus_by_campaign = await _get_all_campaign_data(token, status_msg)
     campaign_ids = [str(c.get("id")) for c in campaigns if c.get("id")]
-    # Предыдущий период
     prev_from, prev_to = prev_period(date_from, date_to)
     if status_msg:
         await _safe_edit(status_msg, f"⏳ Текущий: {date_from}–{date_to}\nПредыдущий: {prev_from}–{prev_to}")
@@ -1283,9 +1277,7 @@ async def build_ad_report_period(date_from: str, date_to: str, period_name: str,
 
 async def ad_dynamics_get_monthly(token, campaign_ids, year, skus_by_campaign, postings_by_month,
                                    metric_key, status_msg=None):
-    """Возвращает [12 значений] метрики по месяцам за год."""
     data = [0.0] * 12
-    # Разбиваем год на части по 60 дней
     year_start = datetime.date(year, 1, 1)
     year_end = datetime.date(year, 12, 31)
     today = get_moscow_today()
@@ -1297,7 +1289,6 @@ async def ad_dynamics_get_monthly(token, campaign_ids, year, skus_by_campaign, p
         chunk_end = min(cur + datetime.timedelta(days=AD_CHUNK_DAYS - 1), year_end)
         chunks.append((cur, chunk_end))
         cur = chunk_end + datetime.timedelta(days=1)
-    # Собираем статистику по каждому chunk
     monthly_total = {m: {"expense": 0.0, "ad_sales": 0.0, "impressions": 0,
                           "clicks": 0, "carts": 0, "bid_sum": 0.0, "bid_count": 0,
                           "total_sales": 0.0} for m in range(12)}
@@ -1308,13 +1299,6 @@ async def ad_dynamics_get_monthly(token, campaign_ids, year, skus_by_campaign, p
                     f"⏳ Динамика рекламы: {c_from.strftime('%d.%m')}–{c_to.strftime('%d.%m')} "
                     f"({i+1}/{len(chunks)})")
             except: pass
-        rows = await ad_fetch_stats_chunk(token, campaign_ids, c_from.isoformat(), c_to.isoformat())
-        # Распределяем по месяцам внутри chunk — но API даёт агрегат по chunk, не по месяцам
-        # Будем использовать только целые месяцы, а частичные примыкают к ближайшему
-        # Проще: относим весь chunk к месяцу его начала
-        # Не идеально, но достаточное приближение
-        # Лучше: разрезать chunk по границам месяцев
-        # Разобьём по месяцам:
         cur_m = c_from
         while cur_m <= c_to:
             month_first = cur_m.replace(day=1)
@@ -1325,11 +1309,9 @@ async def ad_dynamics_get_monthly(token, campaign_ids, year, skus_by_campaign, p
             sub_from = max(cur_m, c_from)
             sub_to = min(month_last, c_to)
             if sub_from <= sub_to:
-                # запрашиваем только этот отрезок
                 sub_rows = await ad_fetch_stats_chunk(token, campaign_ids,
                                                        sub_from.isoformat(), sub_to.isoformat())
                 mi = month_first.month - 1
-                # вычислим total_sales по postings за sub_from..sub_to
                 sub_postings = postings_by_month.get(mi, [])
                 sub_skus = set()
                 for r in sub_rows:
@@ -1349,7 +1331,6 @@ async def ad_dynamics_get_monthly(token, campaign_ids, year, skus_by_campaign, p
                         monthly_total[mi]["bid_count"] += cl
                 monthly_total[mi]["total_sales"] += ts
             cur_m = month_last + datetime.timedelta(days=1)
-    # Извлекаем метрику
     for m in range(12):
         d = monthly_total[m]
         if metric_key == "avg_bid":
@@ -1378,14 +1359,12 @@ async def ad_dynamics_get_monthly(token, campaign_ids, year, skus_by_campaign, p
 
 async def generate_ad_dynamics_chart(token, campaign_ids, skus_by_campaign, years,
                                       metric_key, metric_label, postings_by_month_cache):
-    # Загружаем postings за все годы
     postings_by_month_all = {}
     for y in years:
         p = await fetch_postings(f"{y}-01-01", f"{y}-12-31")
         postings_by_month_all[y] = p
     data = {}
     for y in years:
-        # Собираем postings по месяцам
         monthly_postings = {m: [] for m in range(12)}
         for p in postings_by_month_all[y]:
             ca = p.get("created_at", "")
@@ -1397,7 +1376,6 @@ async def generate_ad_dynamics_chart(token, campaign_ids, skus_by_campaign, year
             monthly_postings[dtx.month - 1].append(p)
         data[y] = await ad_dynamics_get_monthly(token, campaign_ids, y, skus_by_campaign,
                                                  monthly_postings, metric_key)
-    # График
     fig, ax = plt.subplots(figsize=(10, 6))
     months = [datetime.date(2000, m, 1) for m in range(1, 13)]
     for y, vals in data.items():
@@ -2038,7 +2016,6 @@ async def ad_dynamics_period_cb(update, context):
         return ConversationHandler.END
     if d == "adc":
         context.user_data['ad_dyn_years'] = [cy]
-        # Переходим к выбору кампании
         return await ad_dynamics_show_campaigns(q, context, [cy])
     if d == "ads":
         btns = [[InlineKeyboardButton(str(y), callback_data=f"ady_{y}")] for y in ys]
@@ -2085,24 +2062,23 @@ async def ad_dynamics_range_end(update, context):
     if len(years) > 10:
         await update.message.reply_text("⚠️ Максимум 10 лет."); return ConversationHandler.END
     context.user_data['ad_dyn_years'] = years
-    # Показываем список кампаний через fake msg
     msg = await update.message.reply_text("⏳ Загружаю список кампаний...")
     return await ad_dynamics_show_campaigns_msg(msg, context, years)
 
 async def ad_dynamics_show_campaigns(q_or_msg, context, years):
-    """q_or_msg — либо callback_query, либо message."""
-    chat_id = q_or_msg.message.chat_id if hasattr(q_or_msg, 'message') else q_or_msg.chat_id
-    # Загружаем кампании
     token = await get_performance_token()
     if not token:
-        if hasattr(q_or_msg, 'edit_message_text'):
+        try:
             await q_or_msg.edit_message_text("❌ Не удалось получить токен.")
-        else:
+        except Exception:
             await q_or_msg.edit_text("❌ Не удалось получить токен.")
         return ConversationHandler.END
     campaigns = await ad_fetch_campaigns(token)
     if not campaigns:
-        await q_or_msg.edit_message_text("❌ Кампании не найдены.")
+        try:
+            await q_or_msg.edit_message_text("❌ Кампании не найдены.")
+        except Exception:
+            await q_or_msg.edit_text("❌ Кампании не найдены.")
         return ConversationHandler.END
     context.user_data['ad_dyn_campaigns'] = [(str(c.get("id", "")), c.get("title", str(c.get("id"))))
                                               for c in campaigns if c.get("id")]
@@ -2111,9 +2087,9 @@ async def ad_dynamics_show_campaigns(q_or_msg, context, years):
         kb.append([InlineKeyboardButton(title[:40], callback_data=f"adcamp_{cid}")])
     kb.append([InlineKeyboardButton("🔙 Назад", callback_data="adcamp_cancel")])
     text = "Выберите кампанию:"
-    if hasattr(q_or_msg, 'edit_message_text'):
+    try:
         await q_or_msg.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
-    else:
+    except Exception:
         await q_or_msg.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
     return WAITING_AD_DYN_CAMPAIGN_SELECT
 
@@ -2142,7 +2118,7 @@ async def ad_dynamics_campaign_cb(update, context):
         await q.message.reply_text("Выберите действие:", reply_markup=ad_reports_kb())
         return ConversationHandler.END
     if d == "adcamp_all":
-        context.user_data['ad_dyn_campaign_ids'] = None  # все
+        context.user_data['ad_dyn_campaign_ids'] = None
         context.user_data['ad_dyn_campaign_title'] = "Все кампании"
     elif d.startswith("adcamp_"):
         cid = d[7:]
@@ -2153,7 +2129,6 @@ async def ad_dynamics_campaign_cb(update, context):
         context.user_data['ad_dyn_campaign_title'] = title
     else:
         return WAITING_AD_DYN_CAMPAIGN_SELECT
-    # Показываем выбор метрики
     kb = []
     for key, label, _ in AD_DYN_METRICS:
         kb.append([InlineKeyboardButton(label, callback_data=f"admet_{key}")])
@@ -3295,13 +3270,11 @@ def main():
     app.add_handler(MessageHandler(filters.Text(["📅 Топ товаров за сегодня"]), top_today))
     app.add_handler(MessageHandler(filters.Text(["📋 Список менеджеров"]), admin_list))
     app.add_handler(MessageHandler(filters.Text(["📅 Реклама за текущий месяц"]), ad_report_month_handler))
-    app.add_handler(MessageHandler(filters.Text(["📅 Реклама за период"]), ad_period_menu))
-    app.add_handler(MessageHandler(filters.Text(["📈 Динамика по рекламе"]), ad_dynamics_menu))
+    # ВАЖНО: НЕ добавляем тут MessageHandler для "📅 Реклама за период" и "📈 Динамика по рекламе" — они в ConversationHandler
     app.add_handler(MessageHandler(filters.Regex(
         "^(🕒 Выбор времени рассылок|📅 Добавление отчета за Вчера|"
         "🔕 Режим тишины|📤 Отправить отчет за Вчера сейчас|🔙 Назад)$"), auto_menu_router))
     app.add_handler(CallbackQueryHandler(expense_types_cb, pattern="^et_"))
-    # Conversation handlers
     conv_date = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📆 Выбрать дату"), date_menu)],
         states={WAITING_DATE_SINGLE: [CallbackQueryHandler(date_cb)]},
@@ -3346,7 +3319,6 @@ def main():
             WAITING_PC_RANGE_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_chart_range_start)],
             WAITING_PC_RANGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_chart_range_end)]},
         fallbacks=[CommandHandler("cancel", cancel)])
-    # Ad report period
     conv_ad_period = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📅 Реклама за период"), ad_period_menu)],
         states={
@@ -3358,7 +3330,6 @@ def main():
             WAITING_AD_REPORT_PERIOD_END: [CallbackQueryHandler(ad_period_custom_end_cb)],
         },
         fallbacks=[CommandHandler("cancel", cancel)])
-    # Ad dynamics
     conv_ad_dyn = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📈 Динамика по рекламе"), ad_dynamics_menu)],
         states={
