@@ -29,8 +29,8 @@ from telegram.warnings import PTBUserWarning
 
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
-VERSION = "2.4.6"
-CHANGELOG_MESSAGE = "Полное восстановление формата отчётов 2.3.1 (индикаторы, сравнения, все блоки). Кнопка «Проверить доступ» для неавторизованных."
+VERSION = "2.4.7"
+CHANGELOG_MESSAGE = "Справочник расходов в /app/data/expense_types.json с авто-дополнением. Исправлены опечатки du/du_ в блоках 'Текущий месяц' и 'Вчера'."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 60
@@ -45,6 +45,7 @@ DISK_CACHE_DIR = "/app/data/cache"
 VERSION_HISTORY_FILE = "/app/data/version_history.json"
 SETTINGS_FILE = "/app/data/settings.json"
 MANAGERS_FILE = "/app/data/managers.json"
+EXPENSE_TYPES_FILE = "/app/data/expense_types.json"
 LOG_FILE = "/app/data/ozon_log.txt"
 
 WAITING_DATE_SINGLE = 1
@@ -97,6 +98,8 @@ _cache_lock = asyncio.Lock()
 _api_cache = {}
 _cache_timestamps = {}
 _settings_lock = asyncio.Lock()
+_expense_types_cache = None
+_expense_types_lock = asyncio.Lock()
 
 OZON_CLIENT_ID = os.getenv("OZON_CLIENT_ID")
 OZON_API_KEY = os.getenv("OZON_API_KEY")
@@ -111,9 +114,15 @@ OZON_FINANCE_ACCRUAL_BY_DAY_URL = "https://api-seller.ozon.ru/v1/finance/accrual
 
 MOSCOW_TZ = datetime.timezone(datetime.timedelta(hours=3))
 
-TYPE_ID_NAMES = {1: "Обработка товара", 29: "Последняя миля", 32: "Логистика",
-                 98: "Доп. услуги отправления", 12: "Прочие услуги Ozon",
-                 76: "Внешние услуги Ozon"}
+DEFAULT_EXPENSE_TYPES = {
+    "1": "Обработка товара",
+    "12": "Прочие услуги Ozon",
+    "29": "Последняя миля",
+    "32": "Логистика",
+    "76": "Внешние услуги Ozon",
+    "98": "Доп. услуги отправления",
+}
+
 CATEGORY_FALLBACK = {"ITEM": "Услуги по товарам", "NON_ITEM": "Внешние услуги Ozon",
                      "POSTING": "Услуги отправления", "CONTAINER": "Контейнеры"}
 METRIC_LABELS = {
@@ -173,6 +182,75 @@ def update_version_history(version, message):
     except Exception as e:
         write_log(f"❌ Запись истории: {e}")
 
+# ==================== СПРАВОЧНИК РАСХОДОВ ====================
+def _init_expense_types_file():
+    if os.path.exists(EXPENSE_TYPES_FILE): return
+    try:
+        os.makedirs(os.path.dirname(EXPENSE_TYPES_FILE), exist_ok=True)
+        data = {tid: {"name": name, "count": 0, "sum": 0.0}
+                for tid, name in DEFAULT_EXPENSE_TYPES.items()}
+        with open(EXPENSE_TYPES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        write_log(f"✅ Создан справочник расходов: {EXPENSE_TYPES_FILE}")
+    except Exception as e:
+        write_log(f"❌ Ошибка создания справочника: {e}")
+
+def _load_expense_types_sync():
+    if not os.path.exists(EXPENSE_TYPES_FILE): return {}
+    try:
+        with open(EXPENSE_TYPES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        write_log(f"⚠️ Чтение справочника: {e}"); return {}
+
+def _save_expense_types_sync(data):
+    try:
+        os.makedirs(os.path.dirname(EXPENSE_TYPES_FILE), exist_ok=True)
+        with open(EXPENSE_TYPES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        write_log(f"❌ Запись справочника: {e}")
+
+def get_expense_types():
+    global _expense_types_cache
+    if _expense_types_cache is None:
+        _expense_types_cache = _load_expense_types_sync()
+    return _expense_types_cache
+
+def type_name(type_id, category_code):
+    if type_id is None:
+        return CATEGORY_FALLBACK.get(category_code, "Услуги")
+    tid = str(type_id)
+    data = get_expense_types()
+    if tid in data:
+        entry = data[tid]
+        if isinstance(entry, dict):
+            return entry.get("name", f"❓ Неизвестно (type {tid})")
+        return entry
+    fallback = CATEGORY_FALLBACK.get(category_code, "Услуги")
+    placeholder = f"{fallback} (type {tid})"
+    data[tid] = {"name": placeholder, "count": 0, "sum": 0.0}
+    _save_expense_types_sync(data)
+    write_log(f"🆕 Новый type_id: {tid} → {placeholder}")
+    return placeholder
+
+def register_expense_hit(type_id, amount):
+    if type_id is None: return
+    tid = str(type_id)
+    data = get_expense_types()
+    if tid not in data: return
+    entry = data[tid]
+    if not isinstance(entry, dict):
+        entry = {"name": entry, "count": 0, "sum": 0.0}
+        data[tid] = entry
+    entry["count"] = entry.get("count", 0) + 1
+    entry["sum"] = round(entry.get("sum", 0.0) + amount, 2)
+
+def flush_expense_types():
+    global _expense_types_cache
+    if _expense_types_cache is not None:
+        _save_expense_types_sync(_expense_types_cache)
+
 # ==================== DISK CACHE ====================
 def _disk_path(key):
     h = hashlib.md5(key.encode()).hexdigest()[:16]
@@ -212,7 +290,7 @@ async def save_to_cache(key, value):
         _api_cache[key] = value; _cache_timestamps[key] = time.time()
     disk_cache_set(key, value)
 
-# ==================== НАСТРОЙКИ/МЕНЕДЖЕРЫ ====================
+# ==================== НАСТРОЙКИ / МЕНЕДЖЕРЫ ====================
 def _ensure_data_dir():
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -305,11 +383,6 @@ def parse_money(obj) -> float:
 
 def parse_price(product) -> float: return parse_money(product.get("price"))
 
-def type_name(type_id, cat):
-    if type_id in TYPE_ID_NAMES: return TYPE_ID_NAMES[type_id]
-    fb = CATEGORY_FALLBACK.get(cat, "Услуги")
-    return f"{fb} (type {type_id})" if type_id else fb
-
 def calc_delta(cur, prev):
     if prev == 0: return None
     try: return ((cur - prev) / abs(prev)) * 100
@@ -320,7 +393,6 @@ def fmt_pct(val):
     return f"+{val:.1f}%" if val > 0 else f"{val:.1f}%"
 
 def indicator(value_current, value_prev, better_is_higher):
-    """🟢/🔴 индикатор улучшения/ухудшения как в 2.3.1."""
     if value_prev is None or value_current is None: return ""
     if value_prev == 0:
         return "🟢" if value_current > 0 else ""
@@ -536,6 +608,7 @@ def aggregate_finance_expenses(accruals):
     result = {}
     def add(name, amount):
         if amount > 0: result[name] = result.get(name, 0) + amount
+
     for item in accruals:
         if not isinstance(item, dict): continue
         cat = item.get("accrued_category", "")
@@ -548,19 +621,28 @@ def aggregate_finance_expenses(accruals):
                 delivery = product.get("delivery") or {}
                 for svc in delivery.get("services", []) or []:
                     tid = svc.get("type_id"); amt = parse_money(svc.get("accrued"))
-                    if amt < 0: add(type_name(tid, cat), abs(amt))
+                    if amt < 0:
+                        name = type_name(tid, cat)
+                        add(name, abs(amt))
+                        register_expense_hit(tid, abs(amt))
             continue
         if cat == "ITEM":
             i_fees = item.get("item_fees") or {}
             for grp in i_fees.get("fees", []) or []:
                 for fee in grp.get("fees", []) or []:
                     tid = fee.get("type_id"); amt = parse_money(fee.get("accrued"))
-                    if amt < 0: add(type_name(tid, cat), abs(amt))
+                    if amt < 0:
+                        name = type_name(tid, cat)
+                        add(name, abs(amt))
+                        register_expense_hit(tid, abs(amt))
             continue
         if cat == "NON_ITEM":
             non = item.get("non_item_fee") or {}
             tid = non.get("type_id"); amt = parse_money(non.get("accrued"))
-            if amt < 0: add(type_name(tid, cat), abs(amt))
+            if amt < 0:
+                name = type_name(tid, cat)
+                add(name, abs(amt))
+                register_expense_hit(tid, abs(amt))
             continue
         if cat == "CONTAINER":
             cont = item.get("container_fees") or {}
@@ -569,6 +651,8 @@ def aggregate_finance_expenses(accruals):
             continue
         total = parse_money(item.get("total_amount"))
         if total < 0: add(cat or "Прочее", abs(total))
+
+    flush_expense_types()
     return result
 
 def aggregate_postings_range(postings, df, dt):
@@ -730,7 +814,6 @@ async def generate_product_chart(sku, metric, years):
 
 # ==================== ФОРМАТИРОВАНИЕ ====================
 def format_expense_block(exp, title, limit=25):
-    """Формат блока расходов как в 2.3.1."""
     if not exp: return f"🔹 *{title}*\nНет данных о расходах.\n"
     total = sum(exp.values())
     lines = [f"🔹 *{title}*", f"  *Итого расходов:* {total:,.2f} ₽"]
@@ -739,7 +822,6 @@ def format_expense_block(exp, title, limit=25):
     return "\n".join(lines)
 
 def format_top_products(products, title, limit=15):
-    """Формат топа товаров как в 2.3.1."""
     if not products: return f"📦 *{title}*\n\n❌ Нет данных за указанный период."
     sorted_items = sorted(products.items(), key=lambda x: x[1]["ordered_sum"], reverse=True)[:limit]
     lines = [f"📦 *{title}*", ""]
@@ -757,7 +839,6 @@ def format_top_products(products, title, limit=15):
     return "\n".join(lines)
 
 def format_products_summary(products):
-    """Формат сводки как в 2.3.1."""
     if not products: return "Нет данных"
     rev = sum(p["ordered_sum"] for p in products.values())
     units = sum(p["ordered_units"] for p in products.values())
@@ -767,9 +848,7 @@ def format_products_summary(products):
             f"  Всего единиц: {units}\n  Всего заказов: {orders}\n  Средний чек: {avg:,.2f} ₽")
 
 def format_period_comparison(cur, prev, name):
-    """Формат отчёта за период как в 2.3.1 — с индикаторами."""
     lines = [f"📊 *Продажи за {name}*", ""]
-    # Заказано
     cur_os = cur.get("ordered_sum", 0); prev_os = prev.get("ordered_sum", 0)
     cur_ou = cur.get("ordered_units", 0); prev_ou = prev.get("ordered_units", 0)
     lines.append("🛒 *Заказано*")
@@ -779,7 +858,6 @@ def format_period_comparison(cur, prev, name):
     lines.append(f"  На сумму: {fmt_num(prev_os)} ₽")
     lines.append(f"  Штук: {fmt_int(prev_ou)}")
     lines.append("")
-    # Доставлено
     cur_ds = cur.get("delivered_sum", 0); prev_ds = prev.get("delivered_sum", 0)
     cur_du = cur.get("delivered_units", 0); prev_du = prev.get("delivered_units", 0)
     lines.append("📦 *Доставлено*")
@@ -789,7 +867,6 @@ def format_period_comparison(cur, prev, name):
     lines.append(f"  На сумму: {fmt_num(prev_ds)} ₽")
     lines.append(f"  Штук: {fmt_int(prev_du)}")
     lines.append("")
-    # Отменено
     cur_cs = cur.get("canceled_sum", 0); prev_cs = prev.get("canceled_sum", 0)
     cur_cu = cur.get("canceled_units", 0); prev_cu = prev.get("canceled_units", 0)
     cur_cr = (cur_cu / cur_du * 100) if cur_du > 0 else None
@@ -805,7 +882,6 @@ def format_period_comparison(cur, prev, name):
     lines.append(f"  Штук: {fmt_int(prev_cu)}")
     lines.append(f"  Доля отмен: {prev_cr_txt}")
     lines.append("")
-    # Реклама
     cur_ad = cur.get("ad_expense", 0); prev_ad = prev.get("ad_expense", 0)
     cur_drr = cur.get("drr"); prev_drr = prev.get("drr")
     cur_edrr = cur.get("effective_drr"); prev_edrr = prev.get("effective_drr")
@@ -838,37 +914,32 @@ async def get_period_metrics(df, dt):
             "effective_drr": (ad / dsum * 100) if dsum > 0 else None,
             "expenses": exp}
 
-# ==================== ОТЧЁТ «ПРОДАЖИ ЗА СЕГОДНЯ» (полный формат 2.3.1) ====================
+# ==================== ОТЧЁТ «ПРОДАЖИ ЗА СЕГОДНЯ» ====================
 async def build_today_report(include_yesterday=False):
     now = get_current_time_msk()
     td = now.date(); today = td.isoformat()
     yest = (td - datetime.timedelta(days=1)).isoformat()
-    cur_time = now.time()
     cm = td.replace(day=1); cm_s = cm.isoformat()
     pm = (cm - datetime.timedelta(days=1)).replace(day=1); pm_s = pm.isoformat()
     dp = (td - cm).days + 1
     pm_e = pm + datetime.timedelta(days=dp - 1); pm_e_s = pm_e.isoformat()
 
-    # 8 параллельных запросов
     postings_cur, postings_prev, ad_t, ad_y, ad_m, ad_pm, fin_t, fin_m = await asyncio.gather(
         fetch_postings(cm_s, today), fetch_postings(pm_s, pm_e_s),
         fetch_advertising_expense(today, today), fetch_advertising_expense(yest, yest),
         fetch_advertising_expense(cm_s, today), fetch_advertising_expense(pm_s, pm_e_s),
         fetch_finance_transactions(today, today), fetch_finance_transactions(cm_s, today))
 
-    # Агрегация отгрузок
     t_m = aggregate_postings_range(postings_cur, today, today)
     y_m = aggregate_postings_range(postings_cur, yest, yest)
     m_m = aggregate_postings_range(postings_cur, cm_s, today)
     p_m = aggregate_postings_range(postings_prev, pm_s, pm_e_s)
 
-    # Расходы
     exp_t = aggregate_finance_expenses(fin_t)
     exp_m = aggregate_finance_expenses(fin_m)
     if ad_t > 0: exp_t["Оплата за клик"] = exp_t.get("Оплата за клик", 0) + ad_t
     if ad_m > 0: exp_m["Оплата за клик"] = exp_m.get("Оплата за клик", 0) + ad_m
 
-    # --- Блок Сегодня (на XX:XX МСК) ---
     def blk_today():
         os_ = t_m["ordered_sum"]; ou_ = t_m["ordered_units"]
         cs_ = t_m["canceled_sum"]; cu_ = t_m["canceled_units"]
@@ -876,8 +947,8 @@ async def build_today_report(include_yesterday=False):
         ycs_ = y_m["canceled_sum"]; ycu_ = y_m["canceled_units"]
         d_os = fmt_pct(calc_delta(os_, ys_)); d_ou = fmt_pct(calc_delta(ou_, yu_))
         d_cs = fmt_pct(calc_delta(cs_, ycs_)); d_cu = fmt_pct(calc_delta(cu_, ycu_))
-        du = t_m["delivered_units"]
-        cr = (cu_ / du * 100) if du > 0 else None
+        du_ = t_m["delivered_units"]
+        cr = (cu_ / du_ * 100) if du_ > 0 else None
         cr_txt = f"{cr:.2f}%" if cr is not None else "∞"
         return (
             f"🔹 *Сегодня (на {now.strftime('%H:%M')} МСК)*\n"
@@ -888,7 +959,6 @@ async def build_today_report(include_yesterday=False):
             f"  Доля отмен: {cr_txt}\n"
         )
 
-    # --- Блок Текущий месяц ---
     def blk_month():
         os_ = m_m["ordered_sum"]; ou_ = m_m["ordered_units"]
         ds_ = m_m["delivered_sum"]; du_ = m_m["delivered_units"]
@@ -899,7 +969,7 @@ async def build_today_report(include_yesterday=False):
         d_os = fmt_pct(calc_delta(os_, p_os)); d_ou = fmt_pct(calc_delta(ou_, p_ou))
         d_ds = fmt_pct(calc_delta(ds_, p_ds)); d_du = fmt_pct(calc_delta(du_, p_du))
         d_cs = fmt_pct(calc_delta(cs_, p_cs)); d_cu = fmt_pct(calc_delta(cu_, p_cu))
-        cr = (cu_ / du * 100) if du > 0 else None
+        cr = (cu_ / du_ * 100) if du_ > 0 else None
         p_cr = (p_cu / p_du * 100) if p_du > 0 else None
         cr_txt = f"{cr:.2f}%" if cr is not None else "∞"
         p_cr_txt = f"{p_cr:.2f}%" if p_cr is not None else "∞"
@@ -926,12 +996,11 @@ async def build_today_report(include_yesterday=False):
             f"  ДРР (по доставленным): {edrr_txt} | vs предыдущий месяц: {p_edrr_txt}"
         )
 
-    # --- Блок Вчера (полный день) ---
     def blk_yesterday():
         os_ = y_m["ordered_sum"]; ou_ = y_m["ordered_units"]
         ds_ = y_m["delivered_sum"]; du_ = y_m["delivered_units"]
         cs_ = y_m["canceled_sum"]; cu_ = y_m["canceled_units"]
-        cr = (cu_ / du * 100) if du > 0 else None
+        cr = (cu_ / du_ * 100) if du_ > 0 else None
         cr_txt = f"{cr:.2f}%" if cr is not None else "∞"
         drr = (ad_y / os_ * 100) if os_ > 0 else None
         edrr = (ad_y / ds_ * 100) if ds_ > 0 else None
@@ -988,6 +1057,7 @@ def main_kb(chat_id):
     ]
     if is_admin(chat_id):
         buttons.append([KeyboardButton("⚙️ Администрирование")])
+        buttons.append([KeyboardButton("📚 Справочник расходов")])
     buttons.append([KeyboardButton("📖 Справка")])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
@@ -1029,6 +1099,11 @@ def products_period_kb():
         [InlineKeyboardButton("📆 По годам", callback_data="tpy")],
         [InlineKeyboardButton("✏️ Произвольный период", callback_data="tpc")],
         [InlineKeyboardButton("🔙 Назад", callback_data="tpcancel")]])
+
+def expense_types_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Обновить", callback_data="et_refresh")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="et_back")]])
 
 def hours_kb(selected, prefix, available=None):
     kb = []
@@ -1102,44 +1177,136 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(chat_id):
             await update.message.reply_text("⛔ Только для администратора."); return
         await update.message.reply_text("Управление менеджерами:", reply_markup=admin_kb())
+    elif text == "📚 Справочник расходов":
+        if not is_admin(chat_id):
+            await update.message.reply_text("⛔ Только для администратора."); return
+        await show_expense_types(update, context)
     elif text == "📖 Справка":
         await send_help(update, context)
+
+# ==================== СПРАВОЧНИК РАСХОДОВ (UI) ====================
+async def show_expense_types(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = get_expense_types()
+    if not data:
+        await update.message.reply_text("Справочник пуст. Он заполнится после первого отчёта.")
+        return
+    items = []
+    for tid, entry in data.items():
+        if isinstance(entry, dict):
+            name = entry.get("name", "?"); cnt = entry.get("count", 0); sm = entry.get("sum", 0.0)
+        else:
+            name = str(entry); cnt = 0; sm = 0.0
+        items.append((tid, name, cnt, sm))
+    def sort_key(x):
+        is_unknown = x[1].startswith("❓") or "(type " in x[1]
+        return (is_unknown, -x[3])
+    items.sort(key=sort_key)
+    known = [i for i in items if not (i[1].startswith("❓") or "(type " in i[1] and "Услуги" in i[1])]
+    unknown = [i for i in items if i not in known]
+    lines = ["📚 *Справочник расходов*", "_Файл: /app/data/expense_types.json_", ""]
+    lines.append(f"*Распознано услуг:* {len(known)}")
+    lines.append(f"*Требуют уточнения:* {len(unknown)}")
+    lines.append("")
+    if known:
+        lines.append("✅ *Известные услуги:*")
+        for tid, name, cnt, sm in known[:30]:
+            if cnt > 0:
+                lines.append(f"  `{tid}` → {name} ({cnt}× / {sm:,.0f} ₽)")
+            else:
+                lines.append(f"  `{tid}` → {name}")
+        lines.append("")
+    if unknown:
+        lines.append("❓ *Требуют уточнения (правьте файл вручную):*")
+        for tid, name, cnt, sm in unknown[:30]:
+            if cnt > 0:
+                lines.append(f"  `{tid}` → {name} ({cnt}× / {sm:,.0f} ₽)")
+            else:
+                lines.append(f"  `{tid}` → {name}")
+    text = "\n".join(lines)
+    if len(text) > 4000: text = text[:4000] + "\n\n_…список обрезан, смотрите файл_"
+    try:
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=expense_types_kb())
+    except Exception:
+        await update.message.reply_text(text[:4000], reply_markup=expense_types_kb())
+
+async def expense_types_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer(); d = q.data
+    chat_id = q.message.chat_id
+    if not is_admin(chat_id):
+        await q.edit_message_text("⛔ Только для админа."); return
+    if d == "et_back":
+        await q.edit_message_text("Главное меню:", reply_markup=None)
+        await q.message.reply_text("Выберите действие:", reply_markup=main_kb(chat_id))
+    elif d == "et_refresh":
+        global _expense_types_cache
+        _expense_types_cache = _load_expense_types_sync()
+        await q.edit_message_text("🔄 Справочник перечитан.")
+        data = get_expense_types()
+        items = []
+        for tid, entry in data.items():
+            if isinstance(entry, dict):
+                name = entry.get("name", "?"); cnt = entry.get("count", 0); sm = entry.get("sum", 0.0)
+            else:
+                name = str(entry); cnt = 0; sm = 0.0
+            items.append((tid, name, cnt, sm))
+        def sort_key(x):
+            is_unknown = x[1].startswith("❓") or "(type " in x[1]
+            return (is_unknown, -x[3])
+        items.sort(key=sort_key)
+        known = [i for i in items if not (i[1].startswith("❓") or "(type " in i[1] and "Услуги" in i[1])]
+        unknown = [i for i in items if i not in known]
+        lines = ["📚 *Справочник расходов*", f"_Всего записей: {len(items)}_", ""]
+        if known:
+            lines.append("✅ *Известные:*")
+            for tid, name, cnt, sm in known[:30]:
+                if cnt > 0: lines.append(f"  `{tid}` → {name} ({cnt}× / {sm:,.0f} ₽)")
+                else: lines.append(f"  `{tid}` → {name}")
+        if unknown:
+            lines.append(""); lines.append("❓ *Требуют уточнения:*")
+            for tid, name, cnt, sm in unknown[:30]:
+                if cnt > 0: lines.append(f"  `{tid}` → {name} ({cnt}× / {sm:,.0f} ₽)")
+                else: lines.append(f"  `{tid}` → {name}")
+        text = "\n".join(lines)
+        if len(text) > 4000: text = text[:4000] + "\n\n_…обрезано_"
+        try:
+            await q.message.reply_text(text, parse_mode="Markdown", reply_markup=expense_types_kb())
+        except Exception:
+            await q.message.reply_text(text[:4000], reply_markup=expense_types_kb())
 
 async def send_help(update, context):
     chat_id = update.effective_chat.id
     common = (
         "📖 *Справка*\n\n"
         "🔹 *Основные функции*\n"
-        "• 📊 Отчёт по продажам – актуальная сводка по продажам за сегодня и текущий месяц.\n"
-        "• 📦 Отчёт по товарам – топ товаров по выручке за сегодня и текущий месяц.\n"
-        "• 📆 Выбрать дату – просмотр данных за конкретный день (продажи или товары).\n"
-        "• 📊 Выбрать период – гибкий выбор отчётного периода (месяц, квартал, год, произвольный).\n"
+        "• 📊 Отчёт по продажам – актуальная сводка за сегодня и текущий месяц.\n"
+        "• 📦 Отчёт по товарам – топ товаров по выручке.\n"
+        "• 📆 Выбрать дату – данные за конкретный день.\n"
+        "• 📊 Выбрать период – месяц/квартал/год/произвольный.\n"
         "• 📈 Динамика продаж – график доставленных заказов по месяцам.\n"
-        "• 📈 Динамика по товару – график продаж конкретного товара по месяцам.\n"
+        "• 📈 Динамика по товару – график продаж конкретного товара.\n"
         "• 🔔 Автоматические рассылки – персональная настройка.\n\n"
         "🔹 *Автоматические отчёты (персональные)*\n"
         "• Настройка времени рассылок – задаются часы (01:00..24:00).\n"
-        "• Добавление отчёта за Вчера – из разрешённых часов выбираются те, в которые будет отправляться отчёт с блоком «Вчера».\n"
+        "• Добавление отчёта за Вчера – из разрешённых часов.\n"
         "• Режим тишины – интервал, когда рассылки не отправляются.\n"
         "• Отправить сейчас – принудительная отправка отчёта за вчера.\n\n"
         "🔹 *Метрики*\n"
-        "• 🛒 Заказано – сумма и количество всех заказов.\n"
-        "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
-        "• ❌ Отменено – сумма и количество отменённых заказов.\n"
-        "• 📢 Реклама – расходы на рекламу, ДРР (общий) и ДРР (по доставленным).\n"
-        "• 💰 Расходы (финансовые) – детальная разбивка: комиссии, логистика, эквайринг, кросс-докинг и др.\n\n"
-        "🔹 *Сравнение динамики*\n"
-        "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
-        "• Для «Текущий месяц» – сравнение с аналогичным периодом предыдущего месяца.\n\n"
+        "• 🛒 Заказано / 📦 Доставлено / ❌ Отменено – суммы и шт.\n"
+        "• 📢 Реклама – расходы, ДРР (общий) и ДРР (по доставленным).\n"
+        "• 💰 Расходы (финансовые) – разбивка по услугам.\n\n"
+        "🔹 *Сравнение*\n"
+        "• «Сегодня» – с аналогичным временем вчера.\n"
+        "• «Текущий месяц» – с аналогичным периодом предыдущего.\n\n"
         "🔹 *Часовой пояс*\n"
-        "• Все расчёты ведутся по московскому времени (МСК, UTC+3).\n\n"
+        "• Все расчёты – по московскому времени (МСК, UTC+3).\n\n"
     )
     if is_admin(chat_id):
         help_text = common + (
             "🔹 *Администрирование (только админ)*\n"
-            "• ➕ Добавить менеджера – введите ID или @username + телефон (или '-' пропустить).\n"
+            "• ➕ Добавить менеджера – ID или @username + телефон.\n"
             "• ➖ Удалить менеджера – по ID.\n"
-            "• 📋 Список менеджеров – просмотр всех.\n\n"
+            "• 📋 Список менеджеров.\n"
+            "• 📚 Справочник расходов – просмотр type_id и их названий (файл /app/data/expense_types.json).\n\n"
             "⚠️ Каждый менеджер настраивает свои рассылки самостоятельно.\n"
             f"🤖 Версия бота: {VERSION}"
         )
@@ -1824,7 +1991,7 @@ async def product_chart_range_end(update, context):
     context.user_data.pop('pc_rs', None)
     return ConversationHandler.END
 
-# ==================== РАССЫЛКИ (персональные) ====================
+# ==================== РАССЫЛКИ ====================
 async def auto_schedule_start(update, context):
     chat_id = update.effective_chat.id
     if not has_access(chat_id): return
@@ -2097,11 +2264,9 @@ async def admin_list(update, context):
 # ==================== ПЛАНИРОВЩИК ====================
 async def check_auto_reports(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.datetime.now(MOSCOW_TZ)
-    cur_hour = now.hour
-    cur_date = now.strftime("%Y-%m-%d")
+    cur_hour = now.hour; cur_date = now.strftime("%Y-%m-%d")
     settings = await load_settings()
 
-    # 1. Напоминание в 12:00 для пользователей без настроенных рассылок
     if cur_hour == 12:
         recipients = [ADMIN_CHAT_ID] + [m["id"] for m in load_managers()]
         for uid in set(recipients):
@@ -2123,7 +2288,6 @@ async def check_auto_reports(context: ContextTypes.DEFAULT_TYPE):
                 write_log(f"⚠️ Не отправлено {uid}: {e}")
         await save_settings(settings)
 
-    # 2. Рассылки отчётов по расписанию
     for sid, us in settings.items():
         try: uid = int(sid)
         except: continue
@@ -2160,6 +2324,7 @@ async def cancel(update, context):
 def main():
     if not validate_env_vars(): sys.exit(1)
     _ensure_data_dir()
+    _init_expense_types_file()
 
     write_log(f"🚀 Запуск (v{VERSION})")
     write_log(f"✅ OZON_CLIENT_ID: {mask_secret(OZON_CLIENT_ID)}")
@@ -2167,6 +2332,7 @@ def main():
     write_log(f"✅ TELEGRAM_BOT_TOKEN: {mask_secret(TELEGRAM_BOT_TOKEN)}")
     write_log(f"✅ ADMIN_CHAT_ID: {ADMIN_CHAT_ID}")
     write_log(f"✅ Data dir: {DATA_DIR}")
+    write_log(f"✅ Справочник расходов: {EXPENSE_TYPES_FILE}")
     update_version_history(VERSION, CHANGELOG_MESSAGE)
 
     app = (Application.builder()
@@ -2179,25 +2345,21 @@ def main():
     app.add_handler(CommandHandler("help", send_help))
     app.add_handler(CommandHandler("cancel", cancel))
 
-    # Главное меню
     app.add_handler(MessageHandler(filters.Regex(
         "^(📊 Отчёт по продажам|📦 Отчёт по товарам|🔔 Автоматические рассылки|"
-        "⚙️ Администрирование|📖 Справка)$"), handle_main_menu))
+        "⚙️ Администрирование|📚 Справочник расходов|📖 Справка)$"), handle_main_menu))
 
-    # Кнопка проверки доступа
     app.add_handler(MessageHandler(filters.Text(["🔄 Проверить доступ"]), check_access_cmd))
-
-    # Продажи
     app.add_handler(MessageHandler(filters.Text(["📅 Продажи за сегодня"]), today_report))
     app.add_handler(MessageHandler(filters.Text(["📅 Топ товаров за сегодня"]), top_today))
     app.add_handler(MessageHandler(filters.Text(["📋 Список менеджеров"]), admin_list))
 
-    # Автоматические рассылки
     app.add_handler(MessageHandler(filters.Regex(
         "^(🕒 Выбор времени рассылок|📅 Добавление отчета за Вчера|"
         "🔕 Режим тишины|📤 Отправить отчет за Вчера сейчас|🔙 Назад)$"), auto_menu_router))
 
-    # Диалоги
+    app.add_handler(CallbackQueryHandler(expense_types_cb, pattern="^et_"))
+
     conv_date = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📆 Выбрать дату"), date_menu)],
         states={WAITING_DATE_SINGLE: [CallbackQueryHandler(date_cb)]},
