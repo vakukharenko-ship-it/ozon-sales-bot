@@ -16,8 +16,8 @@ from telegram.warnings import PTBUserWarning
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ ====================
-VERSION = "2.3.8"
-CHANGELOG_MESSAGE = "Детальное логирование отгрузок, попытка FBS если FBO пусто, логирование финансов."
+VERSION = "2.3.9"
+CHANGELOG_MESSAGE = "Исправлена структура ответа v3/posting/fbo/list: cursor+has_next, парсинг price.amount."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 60
@@ -28,7 +28,7 @@ CACHE_TTL_SECONDS = 300
 VERSION_HISTORY_FILE = "version_history.json"
 LOG_FILE = "/app/data/ozon_log.txt"
 
-# ==================== ГЛОБАЛЬНЫЕ ОБЪЕКТЫ ====================
+# ==================== ГЛОБАЛЬНЫЕ ====================
 _http_session = None
 _rate_limiter = None
 _api_semaphore = None
@@ -36,7 +36,7 @@ _cache_lock = asyncio.Lock()
 _api_cache = {}
 _cache_timestamps = {}
 
-# ==================== КОНФИГУРАЦИЯ ====================
+# ==================== КОНФИГ ====================
 OZON_CLIENT_ID = os.getenv("OZON_CLIENT_ID")
 OZON_API_KEY = os.getenv("OZON_API_KEY")
 OZON_PERFORMANCE_CLIENT_ID = os.getenv("OZON_PERFORMANCE_CLIENT_ID")
@@ -46,47 +46,40 @@ ADMIN_CHAT_ID_STR = os.getenv("ADMIN_CHAT_ID")
 ADMIN_CHAT_ID = int(ADMIN_CHAT_ID_STR) if ADMIN_CHAT_ID_STR and ADMIN_CHAT_ID_STR.isdigit() else 0
 
 OZON_POSTING_FBO_URL = "https://api-seller.ozon.ru/v3/posting/fbo/list"
-OZON_POSTING_FBS_URL = "https://api-seller.ozon.ru/v3/posting/fbs/list"
 OZON_FINANCE_ACCRUAL_BY_DAY_URL = "https://api-seller.ozon.ru/v1/finance/accrual/by-day"
 
 MOSCOW_TZ = datetime.timezone(datetime.timedelta(hours=3))
 
-# ---------- ЛОГИ ----------
+# ==================== ЛОГИ ====================
 def write_log(message):
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    full_msg = f"[{timestamp}] {message}"
-    print(full_msg, flush=True)
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    msg = f"[{ts}] {message}"
+    print(msg, flush=True)
     try:
         os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
         with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(full_msg + "\n")
+            f.write(msg + "\n")
     except Exception as e:
-        print(f"⚠️ Не удалось записать лог: {e}")
+        print(f"⚠️ Ошибка лога: {e}")
 
-def mask_secret(value: Optional[str], visible_chars: int = 4) -> str:
-    if not value:
+def mask_secret(value, visible=4):
+    if not value or len(value) <= visible:
         return "***"
-    if len(value) <= visible_chars:
-        return "***"
-    return f"{value[:visible_chars]}***"
+    return f"{value[:visible]}***"
 
 def validate_env_vars() -> bool:
-    required = {
-        "OZON_CLIENT_ID": OZON_CLIENT_ID,
-        "OZON_API_KEY": OZON_API_KEY,
-        "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
-        "ADMIN_CHAT_ID": ADMIN_CHAT_ID_STR,
-    }
-    missing = [k for k, v in required.items() if not v]
+    req = {"OZON_CLIENT_ID": OZON_CLIENT_ID, "OZON_API_KEY": OZON_API_KEY,
+           "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN, "ADMIN_CHAT_ID": ADMIN_CHAT_ID_STR}
+    missing = [k for k, v in req.items() if not v]
     if missing:
-        write_log(f"❌ Missing required env vars: {', '.join(missing)}")
+        write_log(f"❌ Missing env vars: {', '.join(missing)}")
         return False
     if not ADMIN_CHAT_ID_STR.isdigit():
-        write_log("❌ ADMIN_CHAT_ID must be a numeric Telegram user ID")
+        write_log("❌ ADMIN_CHAT_ID должен быть числом")
         return False
     return True
 
-def update_version_history(version: str, message: str) -> None:
+def update_version_history(version, message):
     history = []
     if os.path.exists(VERSION_HISTORY_FILE):
         try:
@@ -94,20 +87,20 @@ def update_version_history(version: str, message: str) -> None:
                 history = json.load(f)
         except:
             history = []
-    for entry in history:
-        if entry.get("version") == version:
-            write_log(f"ℹ️ Версия {version} уже зарегистрирована.")
+    for e in history:
+        if e.get("version") == version:
+            write_log(f"ℹ️ Версия {version} уже в истории.")
             return
     now = datetime.datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M:%S")
     history.append({"version": version, "date": now, "message": message})
     try:
         with open(VERSION_HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
-        write_log(f"✅ Добавлена запись в историю: {version}")
+        write_log(f"✅ История: {version}")
     except Exception as e:
-        write_log(f"❌ Ошибка записи истории: {e}")
+        write_log(f"❌ Ошибка истории: {e}")
 
-# ---------- УТИЛИТЫ ----------
+# ==================== УТИЛИТЫ ====================
 def get_moscow_today():
     return datetime.datetime.now(MOSCOW_TZ).date()
 
@@ -122,6 +115,19 @@ def fmt_num(val):
 
 def fmt_int(val):
     return str(val) if val else "0"
+
+def parse_price(product):
+    """Извлекает цену из нового формата: price = {'amount': '1496', 'currency': 'RUB'}"""
+    price_raw = product.get("price", 0)
+    if isinstance(price_raw, dict):
+        try:
+            return float(price_raw.get("amount", 0))
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        return float(price_raw)
+    except (TypeError, ValueError):
+        return 0.0
 
 # ==================== КЭШ ====================
 async def get_from_cache(key):
@@ -160,13 +166,13 @@ async def init_http_session(app):
     timeout = aiohttp.ClientTimeout(total=API_TIMEOUT)
     connector = aiohttp.TCPConnector(limit=50, limit_per_host=10, ttl_dns_cache=300)
     _http_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
-    write_log(f"✅ HTTP-сессия инициализирована (v{VERSION})")
+    write_log(f"✅ HTTP-сессия (v{VERSION})")
 
 async def close_http_session(app):
     global _http_session
     if _http_session:
         await _http_session.close()
-        write_log("🔒 HTTP-сессия закрыта.")
+        write_log("🔒 HTTP закрыта.")
 
 # ==================== API ====================
 async def api_request_with_retry(url, headers, payload=None, method='POST'):
@@ -180,15 +186,14 @@ async def api_request_with_retry(url, headers, payload=None, method='POST'):
                         body = await resp.text()
                         if resp.status == 429:
                             wait_time = API_RETRY_DELAY * (2 ** attempt)
-                            write_log(f"⚠️ 429, ждём {wait_time}с (попытка {attempt+1}/{API_RETRY_ATTEMPTS})")
+                            write_log(f"⚠️ 429, ждём {wait_time}с")
                             await asyncio.sleep(wait_time)
                             continue
                         if resp.status >= 400:
                             write_log(f"❌ API {resp.status} {url}: {body[:500]}")
                             raise aiohttp.ClientResponseError(
                                 resp.request_info, resp.history,
-                                status=resp.status, message=body[:200]
-                            )
+                                status=resp.status, message=body[:200])
                         return json.loads(body)
                 else:
                     async with _http_session.get(url, headers=headers, params=payload) as resp:
@@ -202,18 +207,17 @@ async def api_request_with_retry(url, headers, payload=None, method='POST'):
                             write_log(f"❌ API {resp.status} {url}: {body[:500]}")
                             raise aiohttp.ClientResponseError(
                                 resp.request_info, resp.history,
-                                status=resp.status, message=body[:200]
-                            )
+                                status=resp.status, message=body[:200])
                         return json.loads(body)
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 if attempt == API_RETRY_ATTEMPTS - 1:
-                    write_log(f"❌ API failed after {API_RETRY_ATTEMPTS} attempts: {e}")
+                    write_log(f"❌ API failed after {API_RETRY_ATTEMPTS}: {e}")
                     raise
-                write_log(f"⚠️ Request failed (attempt {attempt+1}/{API_RETRY_ATTEMPTS}): {e}")
+                write_log(f"⚠️ Attempt {attempt+1}/{API_RETRY_ATTEMPTS}: {e}")
                 await asyncio.sleep(API_RETRY_DELAY * (attempt + 1))
-        raise Exception("API request failed after retries")
+        raise Exception("API failed")
 
-# ---------- TOKEN PERFORMANCE ----------
+# ==================== PERFORMANCE TOKEN ====================
 async def get_performance_token():
     if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
         return None
@@ -228,70 +232,64 @@ async def get_performance_token():
         if token:
             write_log("✅ Токен Performance получен.")
             return token
-        write_log(f"❌ Ошибка токена: {data}")
+        write_log(f"❌ Токен: {data}")
         return None
     except Exception as e:
         write_log(f"❌ Ошибка токена: {e}")
         return None
 
-# ---------- ОТГРУЗКИ ----------
-async def fetch_postings_from_endpoint(url, date_from, date_to, endpoint_name):
-    """Запрашивает отгрузки с одного эндпоинта. Логирует структуру ответа."""
-    headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY, "Content-Type": "application/json"}
-    since_iso = f"{date_from}T00:00:00Z"
-    to_iso = f"{date_to}T23:59:59Z"
-    all_postings = []
-    offset = 0
-    LIMIT = 100
-    first_page = True
-    while True:
-        payload = {
-            "dir": "ASC",
-            "filter": {"since": since_iso, "to": to_iso},
-            "limit": LIMIT,
-            "offset": offset,
-            "translit": False,
-            "with": {"analytics_data": True, "financial_data": True}
-        }
-        try:
-            data = await api_request_with_retry(url, headers, payload, method='POST')
-        except Exception as e:
-            write_log(f"❌ [{endpoint_name}] ошибка: {e}")
-            break
-        if first_page:
-            keys = list(data.keys()) if isinstance(data, dict) else type(data).__name__
-            write_log(f"🔍 [{endpoint_name}] ключи ответа: {keys}")
-            # Логируем первые 500 символов тела
-            snippet = json.dumps(data, ensure_ascii=False)[:500]
-            write_log(f"🔍 [{endpoint_name}] тело: {snippet}")
-            first_page = False
-        postings = data.get("result", [])
-        if not postings:
-            break
-        all_postings.extend(postings)
-        if len(postings) < LIMIT:
-            break
-        offset += LIMIT
-    write_log(f"📦 [{endpoint_name}] загружено: {len(all_postings)} за {date_from}–{date_to}")
-    return all_postings
-
+# ==================== ОТГРУЗКИ FBO (v3, cursor-пагинация) ====================
 async def fetch_postings(date_from, date_to):
     cache_key = f"postings_{date_from}_{date_to}"
     cached = await get_from_cache(cache_key)
     if cached is not None:
         return cached
 
-    # Сначала FBO
-    postings = await fetch_postings_from_endpoint(OZON_POSTING_FBO_URL, date_from, date_to, "FBO")
-    # Если FBO пусто — пробуем FBS
-    if not postings:
-        write_log(f"ℹ️ FBO пусто, пробую FBS...")
-        postings = await fetch_postings_from_endpoint(OZON_POSTING_FBS_URL, date_from, date_to, "FBS")
+    headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY, "Content-Type": "application/json"}
+    since_iso = f"{date_from}T00:00:00Z"
+    to_iso = f"{date_to}T23:59:59Z"
+    all_postings = []
+    cursor = ""
+    LIMIT = 100
+    page = 0
+    while True:
+        page += 1
+        payload = {
+            "dir": "ASC",
+            "filter": {"since": since_iso, "to": to_iso},
+            "limit": LIMIT,
+            "translit": False,
+            "with": {"analytics_data": True, "financial_data": True}
+        }
+        if cursor:
+            payload["cursor"] = cursor
+        try:
+            data = await api_request_with_retry(OZON_POSTING_FBO_URL, headers, payload, method='POST')
+        except Exception as e:
+            write_log(f"❌ Ошибка FBO: {e}")
+            break
 
-    await save_to_cache(cache_key, postings)
-    return postings
+        # Новая структура ответа v3: postings в корне
+        postings = data.get("postings", [])
+        if page == 1:
+            write_log(f"🔍 [FBO] получено {len(postings)} на первой странице, has_next={data.get('has_next')}")
 
-# ---------- РЕКЛАМА ----------
+        if not postings:
+            break
+        all_postings.extend(postings)
+
+        has_next = data.get("has_next", False)
+        cursor = data.get("cursor", "")
+        if not has_next or not cursor:
+            break
+        if len(postings) < LIMIT:
+            break
+
+    write_log(f"📦 Загружено отгрузок: {len(all_postings)} за {date_from}–{date_to}")
+    await save_to_cache(cache_key, all_postings)
+    return all_postings
+
+# ==================== РЕКЛАМА ====================
 async def fetch_advertising_expense(date_from, date_to):
     cache_key = f"ad_{date_from}_{date_to}"
     cached = await get_from_cache(cache_key)
@@ -319,10 +317,10 @@ async def fetch_advertising_expense(date_from, date_to):
         await save_to_cache(cache_key, total)
         return total
     except Exception as e:
-        write_log(f"❌ Ошибка рекламы: {e}")
+        write_log(f"❌ Реклама: {e}")
         return 0.0
 
-# ---------- ФИНАНСЫ ----------
+# ==================== ФИНАНСЫ ====================
 async def fetch_finance_accruals_by_day(date_str: str) -> List[Dict]:
     headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY, "Content-Type": "application/json"}
     payload = {"date": date_str}
@@ -335,10 +333,10 @@ async def fetch_finance_accruals_by_day(date_str: str) -> List[Dict]:
             write_log(f"❌ Финансы {date_str}: {e}")
             break
         if first_page:
-            keys = list(data.keys()) if isinstance(data, dict) else type(data).__name__
-            write_log(f"🔍 [FIN] {date_str} ключи: {keys}")
+            keys = list(data.keys()) if isinstance(data, dict) else "?"
+            write_log(f"🔍 [FIN {date_str}] ключи: {keys}")
             snippet = json.dumps(data, ensure_ascii=False)[:400]
-            write_log(f"🔍 [FIN] {date_str} тело: {snippet}")
+            write_log(f"🔍 [FIN {date_str}] тело: {snippet}")
             first_page = False
         accruals = data.get("accruals", [])
         if not accruals:
@@ -369,15 +367,15 @@ async def fetch_finance_transactions(date_from, date_to):
     day_idx = 0
     while current <= end_dt:
         day_idx += 1
-        write_log(f"💰 Финансы {date_from}–{date_to}: день {day_idx}/{total_days} ({current.isoformat()})")
+        write_log(f"💰 Финансы: день {day_idx}/{total_days} ({current.isoformat()})")
         day_accruals = await fetch_finance_accruals_by_day(current.isoformat())
         all_accruals.extend(day_accruals)
         current += datetime.timedelta(days=1)
-    write_log(f"💰 Всего начислений: {len(all_accruals)} за {date_from}–{date_to}")
+    write_log(f"💰 Всего начислений: {len(all_accruals)}")
     await save_to_cache(cache_key, all_accruals)
     return all_accruals
 
-# ---------- АГРЕГАЦИЯ ----------
+# ==================== АГРЕГАЦИЯ ====================
 def aggregate_finance_expenses(accruals: List[Dict]) -> Dict[str, float]:
     result = {}
     for item in accruals:
@@ -392,15 +390,19 @@ def aggregate_finance_expenses(accruals: List[Dict]) -> Dict[str, float]:
         if amount < 0:
             result[category] = result.get(category, 0) + abs(amount)
         elif amount > 0 and any(kw in str(category).lower() for kw in
-            ["комиссия", "доставка", "логистика", "эквайринг", "хранение", "возврат", "упаковка", "страхование", "утилизация", "потеря", "кросс-докинг"]):
+            ["комиссия", "доставка", "логистика", "эквайринг", "хранение", "возврат",
+             "упаковка", "страхование", "утилизация", "потеря", "кросс-докинг"]):
             result[category] = result.get(category, 0) + abs(amount)
     return result
 
 def aggregate_postings_multi(postings, ranges):
-    results = {label: {"ordered_units": 0, "ordered_sum": 0.0, "delivered_units": 0,
-                       "delivered_sum": 0.0, "canceled_units": 0, "canceled_sum": 0.0}
+    results = {label: {"ordered_units": 0, "ordered_sum": 0.0,
+                       "delivered_units": 0, "delivered_sum": 0.0,
+                       "canceled_units": 0, "canceled_sum": 0.0}
                for label, _, _, _, _ in ranges}
     for posting in postings:
+        if not isinstance(posting, dict):
+            continue
         created_at = posting.get("created_at", "")
         if not created_at:
             continue
@@ -415,16 +417,17 @@ def aggregate_postings_multi(postings, ranges):
             if df and date_str < df: continue
             if dt_ and date_str > dt_: continue
             if tl is not None and ad is not None and date_str == ad and t > tl: continue
+
             total_units = 0
             total_sum = 0.0
             for product in posting.get("products", []):
+                if not isinstance(product, dict):
+                    continue
                 qty = int(product.get("quantity", 0))
-                try:
-                    price = float(product.get("price", "0"))
-                except:
-                    price = 0.0
+                price = parse_price(product)
                 total_units += qty
                 total_sum += price * qty
+
             status = posting.get("status", "")
             res = results[label]
             res["ordered_units"] += total_units
@@ -437,7 +440,7 @@ def aggregate_postings_multi(postings, ranges):
                 res["delivered_sum"] += total_sum
     return results
 
-# ---------- ФОРМАТИРОВАНИЕ ----------
+# ==================== ФОРМАТИРОВАНИЕ ====================
 def format_expense_block(expenses_by_type, title):
     if not expenses_by_type:
         return f"🔹 *{title}*\nНет данных о расходах.\n"
@@ -460,7 +463,7 @@ def fmt_pct(val):
         return "∞"
     return f"+{val:.1f}%" if val > 0 else f"{val:.1f}%"
 
-# ---------- ОТЧЁТ ----------
+# ==================== ОТЧЁТ ====================
 async def build_today_report():
     now = get_current_time_msk()
     today_date = now.date()
@@ -476,12 +479,10 @@ async def build_today_report():
     pm_end = pm_start + datetime.timedelta(days=days_passed - 1)
     pm_end_str = pm_end.isoformat()
 
-    write_log("📊 Начинаю формирование отчёта...")
-
-    write_log("📦 Шаг 1/4: отгрузки за текущий месяц")
+    write_log("📊 Шаг 1/4: отгрузки текущий месяц")
     postings_cur = await fetch_postings(cm_start_str, today_str)
 
-    write_log("📦 Шаг 2/4: отгрузки за прошлый период")
+    write_log("📊 Шаг 2/4: отгрузки прошлый период")
     postings_prev = await fetch_postings(pm_start_str, pm_end_str)
 
     ranges_cur = [
@@ -499,13 +500,14 @@ async def build_today_report():
     month_m = agg_cur.get("month", {})
     prev_m = agg_prev.get("prev", {})
 
-    write_log(f"📊 Сегодня: {today_m.get('ordered_units', 0)} шт, месяц: {month_m.get('ordered_units', 0)} шт")
+    write_log(f"📊 Сегодня: {today_m.get('ordered_units', 0)} шт / {today_m.get('ordered_sum', 0)} ₽")
+    write_log(f"📊 Месяц: {month_m.get('ordered_units', 0)} шт / {month_m.get('ordered_sum', 0)} ₽")
 
-    write_log("📢 Шаг 3/4: реклама")
+    write_log("📊 Шаг 3/4: реклама")
     ad_today = await fetch_advertising_expense(today_str, today_str)
     ad_month = await fetch_advertising_expense(cm_start_str, today_str)
 
-    write_log("💰 Шаг 4/4: финансы")
+    write_log("📊 Шаг 4/4: финансы")
     fin_today = await fetch_finance_transactions(today_str, today_str)
     fin_month = await fetch_finance_transactions(cm_start_str, today_str)
 
@@ -569,7 +571,7 @@ async def build_today_report():
     parts.append(format_expense_block(exp_today, "Расходы сегодня"))
     parts.append(format_expense_block(exp_month, "Расходы за текущий месяц"))
     report = "📊 *Продажи за сегодня*\n\n\n" + "\n\n".join(parts)
-    write_log(f"✅ Отчёт сформирован, длина: {len(report)}")
+    write_log(f"✅ Отчёт готов, длина: {len(report)}")
     return report
 
 # ==================== ТЕЛЕГРАМ ====================
@@ -585,9 +587,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Нет доступа.", reply_markup=ReplyKeyboardRemove())
         return
     await update.message.reply_text(
-        f"🤖 Версия бота: {VERSION}\n\nНажмите кнопку ниже, чтобы получить отчёт.",
-        reply_markup=main_keyboard()
-    )
+        f"🤖 Версия: {VERSION}\n\nНажмите кнопку для отчёта.",
+        reply_markup=main_keyboard())
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🤖 Версия: {VERSION}")
@@ -597,13 +598,13 @@ async def today_report_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if not is_admin(chat_id):
         await update.message.reply_text("❌ Нет доступа.")
         return
-    progress_msg = await update.message.reply_text("⏳ Загружаю данные...")
+    progress_msg = await update.message.reply_text("⏳ Загружаю данные (может занять 1-2 мин)...")
     try:
         report = await build_today_report()
         await progress_msg.delete()
         await update.message.reply_text(report, parse_mode="Markdown")
     except Exception as e:
-        write_log(f"❌ Ошибка формирования отчёта: {e}")
+        write_log(f"❌ Ошибка отчёта: {e}")
         await progress_msg.edit_text(f"❌ Ошибка: {e}")
 
 # ==================== ЗАПУСК ====================
@@ -616,7 +617,7 @@ def main():
     write_log(f"✅ TELEGRAM_BOT_TOKEN: {mask_secret(TELEGRAM_BOT_TOKEN)}")
     write_log(f"✅ ADMIN_CHAT_ID: {ADMIN_CHAT_ID}")
     if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
-        write_log("⚠️ PERFORMANCE_CLIENT_ID/SECRET не заданы — реклама будет 0.")
+        write_log("⚠️ PERFORMANCE не задан — реклама 0.")
     update_version_history(VERSION, CHANGELOG_MESSAGE)
 
     app = (Application.builder()
@@ -632,8 +633,7 @@ def main():
     app.add_handler(CommandHandler("version", version_command))
     app.add_handler(MessageHandler(
         filters.Text(["📊 Продажи за сегодня", "🔄 Обновить"]),
-        today_report_handler
-    ))
+        today_report_handler))
 
     write_log("🚀 Бот готов.")
     app.run_polling(allowed_updates=Update.ALL_TYPES, timeout=30)
