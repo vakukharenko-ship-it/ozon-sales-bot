@@ -30,8 +30,8 @@ from telegram.warnings import PTBUserWarning
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ ====================
-VERSION = "2.4.4"
-CHANGELOG_MESSAGE = "Возвращены графики: динамика продаж и динамика по товару с дисковым кэшем."
+VERSION = "2.4.5"
+CHANGELOG_MESSAGE = "Возвращены: администрирование менеджеров, персональные рассылки для каждого пользователя, справка, напоминание о настройке в 12:00 МСК. Файлы настроек в /app/data/."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 60
@@ -41,8 +41,11 @@ POSTINGS_RATE = 0.5
 FINANCE_RATE = 0.5
 PERFORMANCE_RATE = 1.0
 CACHE_TTL_SECONDS = 3600
+DATA_DIR = "/app/data"
 DISK_CACHE_DIR = "/app/data/cache"
 VERSION_HISTORY_FILE = "/app/data/version_history.json"
+SETTINGS_FILE = "/app/data/settings.json"
+MANAGERS_FILE = "/app/data/managers.json"
 LOG_FILE = "/app/data/ozon_log.txt"
 
 # Состояния
@@ -55,7 +58,6 @@ WAITING_PERIOD_MONTH = 6
 WAITING_PERIOD_QUARTER = 7
 WAITING_YEAR_SELECT = 8
 
-WAITING_PRODUCT_DATE = 20
 WAITING_PRODUCT_PERIOD_TYPE = 21
 WAITING_PRODUCT_PERIOD_START = 22
 WAITING_PRODUCT_PERIOD_END = 23
@@ -76,6 +78,15 @@ WAITING_PC_YEAR = 53
 WAITING_PC_RANGE_START = 54
 WAITING_PC_RANGE_END = 55
 
+WAITING_ADD_MANAGER = 100
+WAITING_MANAGER_PHONE = 101
+WAITING_REMOVE_MANAGER = 102
+
+WAITING_AUTO_SCHEDULE = 110
+WAITING_AUTO_YESTERDAY = 111
+WAITING_AUTO_SILENCE_START = 112
+WAITING_AUTO_SILENCE_END = 113
+
 # ==================== ГЛОБАЛЬНЫЕ ====================
 _http_session = None
 _postings_sem = None
@@ -87,6 +98,7 @@ _perf_rate = None
 _cache_lock = asyncio.Lock()
 _api_cache = {}
 _cache_timestamps = {}
+_settings_lock = asyncio.Lock()
 
 # ==================== КОНФИГ ====================
 OZON_CLIENT_ID = os.getenv("OZON_CLIENT_ID")
@@ -110,12 +122,9 @@ CATEGORY_FALLBACK = {"ITEM": "Услуги по товарам", "NON_ITEM": "В
                      "POSTING": "Услуги отправления", "CONTAINER": "Контейнеры"}
 
 METRIC_LABELS = {
-    "ordered_sum": "Заказано (₽)",
-    "ordered_units": "Заказано (шт.)",
-    "delivered_sum": "Доставлено (₽)",
-    "delivered_units": "Доставлено (шт.)",
-    "canceled_sum": "Отменено (₽)",
-    "canceled_units": "Отменено (шт.)",
+    "ordered_sum": "Заказано (₽)", "ordered_units": "Заказано (шт.)",
+    "delivered_sum": "Доставлено (₽)", "delivered_units": "Доставлено (шт.)",
+    "canceled_sum": "Отменено (₽)", "canceled_units": "Отменено (шт.)",
     "avg_check": "Средний чек (₽)",
 }
 
@@ -151,14 +160,14 @@ def update_version_history(version, message):
     try:
         os.makedirs(os.path.dirname(VERSION_HISTORY_FILE), exist_ok=True)
     except Exception as e:
-        write_log(f"⚠️ Не удалось создать папку для истории: {e}")
+        write_log(f"⚠️ Папка истории: {e}")
     history = []
     if os.path.exists(VERSION_HISTORY_FILE):
         try:
             with open(VERSION_HISTORY_FILE, "r", encoding="utf-8") as f:
                 history = json.load(f)
         except Exception as e:
-            write_log(f"⚠️ Ошибка чтения истории: {e}"); history = []
+            write_log(f"⚠️ Чтение истории: {e}"); history = []
     for e in history:
         if e.get("version") == version:
             write_log(f"ℹ️ Версия {version} уже в истории.")
@@ -170,7 +179,7 @@ def update_version_history(version, message):
             json.dump(history, f, ensure_ascii=False, indent=2)
         write_log(f"✅ История: {version} (всего записей: {len(history)})")
     except Exception as e:
-        write_log(f"❌ Ошибка записи истории: {e}")
+        write_log(f"❌ Запись истории: {e}")
 
 # ==================== PERSISTENT CACHE ====================
 def _disk_path(key):
@@ -192,7 +201,7 @@ def disk_cache_set(key, value):
         with open(_disk_path(key), "w", encoding="utf-8") as f:
             json.dump(value, f, ensure_ascii=False)
     except Exception as e:
-        write_log(f"⚠️ Ошибка disk-cache: {e}")
+        write_log(f"⚠️ disk-cache: {e}")
 
 async def get_from_cache(key):
     async with _cache_lock:
@@ -214,11 +223,102 @@ async def save_to_cache(key, value):
         _cache_timestamps[key] = time.time()
     disk_cache_set(key, value)
 
+# ==================== НАСТРОЙКИ И МЕНЕДЖЕРЫ ====================
+def _ensure_data_dir():
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        os.makedirs(DISK_CACHE_DIR, exist_ok=True)
+    except Exception as e:
+        write_log(f"⚠️ Не удалось создать {DATA_DIR}: {e}")
+
+async def load_settings() -> Dict:
+    """{chat_id_str: {schedule_hours, yesterday_report_hours, silence_start, silence_end, last_sent, last_reminder}}"""
+    async with _settings_lock:
+        if os.path.exists(SETTINGS_FILE):
+            try:
+                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                write_log(f"⚠️ Ошибка settings: {e}"); return {}
+        return {}
+
+async def save_settings(settings: Dict):
+    async with _settings_lock:
+        try:
+            os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(settings, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            write_log(f"❌ Ошибка сохранения settings: {e}")
+
+def get_user_settings(settings: Dict, chat_id: int) -> Dict:
+    sid = str(chat_id)
+    if sid not in settings:
+        settings[sid] = {
+            "schedule_hours": [],
+            "yesterday_report_hours": [],
+            "silence_start": None,
+            "silence_end": None,
+            "last_sent": None,
+            "last_reminder": None,
+        }
+    return settings[sid]
+
+def user_has_schedule(chat_id: int) -> bool:
+    """Проверяет настроены ли рассылки (синхронно читает файл)."""
+    if not os.path.exists(SETTINGS_FILE): return False
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            s = json.load(f)
+        us = s.get(str(chat_id), {})
+        return bool(us.get("schedule_hours")) and bool(us.get("yesterday_report_hours"))
+    except:
+        return False
+
+def load_managers():
+    if os.path.exists(MANAGERS_FILE):
+        try:
+            with open(MANAGERS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except: return []
+    return []
+
+def save_managers(managers):
+    try:
+        os.makedirs(os.path.dirname(MANAGERS_FILE), exist_ok=True)
+        with open(MANAGERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(managers, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        write_log(f"❌ Ошибка managers: {e}")
+
+def is_manager(chat_id):
+    return any(m.get("id") == chat_id for m in load_managers())
+
+def is_admin(chat_id):
+    return chat_id == ADMIN_CHAT_ID
+
+def has_access(chat_id):
+    return is_admin(chat_id) or is_manager(chat_id)
+
+def add_manager(chat_id, username=None, first_name=None, last_name=None, phone=None):
+    managers = load_managers()
+    for m in managers:
+        if m.get("id") == chat_id: return False
+    managers.append({"id": chat_id, "username": username or "", "first_name": first_name or "",
+                     "last_name": last_name or "", "phone": phone or ""})
+    save_managers(managers)
+    return True
+
+def remove_manager(chat_id):
+    managers = load_managers()
+    new_m = [m for m in managers if m.get("id") != chat_id]
+    if len(new_m) == len(managers): return False
+    save_managers(new_m)
+    return True
+
 # ==================== УТИЛИТЫ ====================
 def get_moscow_today(): return datetime.datetime.now(MOSCOW_TZ).date()
 def get_current_time_msk(): return datetime.datetime.now(MOSCOW_TZ)
-def is_admin(chat_id): return chat_id == ADMIN_CHAT_ID
-
 def fmt_num(val): return f"{val:,.2f}".replace(",", " ") if val else "0.00"
 def fmt_int(val): return str(val) if val else "0"
 
@@ -226,8 +326,7 @@ def parse_money(obj) -> float:
     if obj is None: return 0.0
     if isinstance(obj, dict):
         val = obj.get("amount", obj.get("value", 0))
-    else:
-        val = obj
+    else: val = obj
     try: return float(str(val).replace(",", "."))
     except (TypeError, ValueError): return 0.0
 
@@ -277,9 +376,7 @@ def prev_period(df, dt):
 # ==================== RATE LIMITER ====================
 class RateLimiter:
     def __init__(self, rate):
-        self.rate = rate
-        self.lock = asyncio.Lock()
-        self.last = 0
+        self.rate = rate; self.lock = asyncio.Lock(); self.last = 0
     async def acquire(self):
         async with self.lock:
             now = time.time()
@@ -314,7 +411,6 @@ async def api_request_with_retry(url, headers, payload=None, method='POST', kind
     if kind == 'perf': sem, rate = _perf_sem, _perf_rate
     elif kind == 'postings': sem, rate = _postings_sem, _postings_rate
     else: sem, rate = _finance_sem, _finance_rate
-
     async with sem:
         for attempt in range(API_RETRY_ATTEMPTS):
             try:
@@ -324,8 +420,7 @@ async def api_request_with_retry(url, headers, payload=None, method='POST', kind
                         body = await resp.text()
                         if resp.status == 429:
                             w = API_RETRY_DELAY * (2 ** attempt)
-                            write_log(f"⚠️ 429, ждём {w}с")
-                            await asyncio.sleep(w); continue
+                            write_log(f"⚠️ 429, ждём {w}с"); await asyncio.sleep(w); continue
                         if resp.status >= 400:
                             write_log(f"❌ API {resp.status}: {body[:300]}")
                             raise aiohttp.ClientResponseError(resp.request_info, resp.history,
@@ -336,8 +431,7 @@ async def api_request_with_retry(url, headers, payload=None, method='POST', kind
                         body = await resp.text()
                         if resp.status == 429:
                             w = API_RETRY_DELAY * (2 ** attempt)
-                            write_log(f"⚠️ 429, ждём {w}с")
-                            await asyncio.sleep(w); continue
+                            write_log(f"⚠️ 429, ждём {w}с"); await asyncio.sleep(w); continue
                         if resp.status >= 400:
                             write_log(f"❌ API {resp.status}: {body[:300]}")
                             raise aiohttp.ClientResponseError(resp.request_info, resp.history,
@@ -349,7 +443,6 @@ async def api_request_with_retry(url, headers, payload=None, method='POST', kind
                 await asyncio.sleep(API_RETRY_DELAY * (attempt + 1))
         raise Exception("API failed")
 
-# ==================== TOKEN ====================
 async def get_performance_token():
     if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET: return None
     url = "https://api-performance.ozon.ru/api/client/token"
@@ -361,14 +454,12 @@ async def get_performance_token():
         data = await api_request_with_retry(url, headers, payload, method='POST', kind='perf')
         return data.get("access_token")
     except Exception as e:
-        write_log(f"❌ Ошибка токена: {e}"); return None
+        write_log(f"❌ Токен: {e}"); return None
 
-# ==================== ОТГРУЗКИ ====================
 async def fetch_postings(date_from, date_to):
     cache_key = f"postings_{date_from}_{date_to}"
     cached = await get_from_cache(cache_key)
     if cached is not None: return cached
-
     headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY, "Content-Type": "application/json"}
     since = f"{date_from}T00:00:00Z"; to = f"{date_to}T23:59:59Z"
     all_p = []; cursor = ""; LIMIT = 100
@@ -392,7 +483,6 @@ async def fetch_postings(date_from, date_to):
     await save_to_cache(cache_key, all_p)
     return all_p
 
-# ==================== РЕКЛАМА ====================
 async def fetch_advertising_expense(date_from, date_to):
     cache_key = f"ad_{date_from}_{date_to}"
     cached = await get_from_cache(cache_key)
@@ -417,7 +507,6 @@ async def fetch_advertising_expense(date_from, date_to):
     except Exception as e:
         write_log(f"❌ Реклама: {e}"); return 0.0
 
-# ==================== ФИНАНСЫ ====================
 async def fetch_finance_accruals_by_day(date_str):
     headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY, "Content-Type": "application/json"}
     payload = {"date": date_str}; all_a = []
@@ -540,10 +629,8 @@ def aggregate_products(postings, df, dt, tl=None, ad=None):
         for prod in p.get("products", []):
             if not isinstance(prod, dict): continue
             sku = str(prod.get("sku", "0"))
-            name = prod.get("name", "—")
-            oid = prod.get("offer_id", "")
-            q = int(prod.get("quantity", 0))
-            price = parse_price(prod)
+            name = prod.get("name", "—"); oid = prod.get("offer_id", "")
+            q = int(prod.get("quantity", 0)); price = parse_price(prod)
             if sku not in stats:
                 stats[sku] = {"name": name[:60], "offer_id": oid,
                               "ordered_units": 0, "ordered_sum": 0.0,
@@ -561,7 +648,6 @@ def aggregate_products(postings, df, dt, tl=None, ad=None):
 
 # ==================== ГРАФИКИ ====================
 async def get_monthly_delivered_sum(year):
-    """Возвращает [12 значений] доставленной выручки по месяцам года (кэш на диск)."""
     cache_key = f"monthly_delivered_{year}"
     cached = await get_from_cache(cache_key)
     if cached is not None: return cached
@@ -587,7 +673,6 @@ async def get_monthly_delivered_sum(year):
     return monthly
 
 async def generate_sales_chart(years):
-    """График доставленной выручки по месяцам за один или несколько лет."""
     data = {}
     for y in years:
         data[y] = await get_monthly_delivered_sum(y)
@@ -599,19 +684,14 @@ async def generate_sales_chart(years):
     ax.set_xlabel("Месяц"); ax.set_ylabel("Сумма, ₽")
     ax.xaxis.set_major_locator(mdates.MonthLocator())
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
-    ax.grid(True, linestyle='--', alpha=0.7)
-    ax.legend()
+    ax.grid(True, linestyle='--', alpha=0.7); ax.legend()
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{int(x):,}'.replace(',', ' ')))
     plt.tight_layout()
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=100); buf.seek(0); plt.close(fig)
+    buf = io.BytesIO(); plt.savefig(buf, format='png', dpi=100); buf.seek(0); plt.close(fig)
     return buf
 
 async def generate_product_chart(sku, metric, years):
-    """График по товару: метрика по месяцам за год(ы)."""
-    metric_key = f"product_chart_{sku}_{metric}"
-    # Кэш на диск: [year][metric] -> [12 values]
-    cache_key = f"{metric_key}_{'_'.join(str(y) for y in years)}"
+    cache_key = f"product_chart_{sku}_{metric}_{'_'.join(str(y) for y in years)}"
     cached = await get_from_cache(cache_key)
     if cached is not None:
         data = {int(y): vals for y, vals in cached.items()}
@@ -621,8 +701,7 @@ async def generate_product_chart(sku, metric, years):
             start = datetime.date(y, 1, 1).isoformat()
             end = datetime.date(y, 12, 31).isoformat()
             postings = await fetch_postings(start, end)
-            monthly = [0.0] * 12
-            counts = [0] * 12
+            monthly = [0.0] * 12; counts = [0] * 12
             for p in postings:
                 if not isinstance(p, dict): continue
                 ca = p.get("created_at", "")
@@ -636,27 +715,19 @@ async def generate_product_chart(sku, metric, years):
                 for prod in p.get("products", []):
                     if not isinstance(prod, dict): continue
                     if str(prod.get("sku", "0")) != sku: continue
-                    q = int(prod.get("quantity", 0))
-                    price = parse_price(prod)
-                    if metric == "ordered_sum":
-                        monthly[idx] += price * q
-                    elif metric == "ordered_units":
-                        monthly[idx] += q
-                    elif metric == "delivered_sum" and st in ("delivered", "completed"):
-                        monthly[idx] += price * q
-                    elif metric == "delivered_units" and st in ("delivered", "completed"):
-                        monthly[idx] += q
-                    elif metric == "canceled_sum" and st in ("cancelled", "canceled"):
-                        monthly[idx] += price * q
-                    elif metric == "canceled_units" and st in ("cancelled", "canceled"):
-                        monthly[idx] += q
+                    q = int(prod.get("quantity", 0)); price = parse_price(prod)
+                    if metric == "ordered_sum": monthly[idx] += price * q
+                    elif metric == "ordered_units": monthly[idx] += q
+                    elif metric == "delivered_sum" and st in ("delivered", "completed"): monthly[idx] += price * q
+                    elif metric == "delivered_units" and st in ("delivered", "completed"): monthly[idx] += q
+                    elif metric == "canceled_sum" and st in ("cancelled", "canceled"): monthly[idx] += price * q
+                    elif metric == "canceled_units" and st in ("cancelled", "canceled"): monthly[idx] += q
                     elif metric == "avg_check":
                         monthly[idx] += price * q; counts[idx] += 1
             if metric == "avg_check":
                 monthly = [(monthly[i] / counts[i]) if counts[i] > 0 else 0.0 for i in range(12)]
             data[y] = monthly
         await save_to_cache(cache_key, {str(y): v for y, v in data.items()})
-
     fig, ax = plt.subplots(figsize=(10, 6))
     months = [datetime.date(2000, m, 1) for m in range(1, 13)]
     ylabel = METRIC_LABELS.get(metric, "Значение")
@@ -670,8 +741,7 @@ async def generate_product_chart(sku, metric, years):
     if metric in ("ordered_sum", "delivered_sum", "canceled_sum", "avg_check"):
         ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{int(x):,}'.replace(',', ' ')))
     plt.tight_layout()
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=100); buf.seek(0); plt.close(fig)
+    buf = io.BytesIO(); plt.savefig(buf, format='png', dpi=100); buf.seek(0); plt.close(fig)
     return buf
 
 # ==================== ФОРМАТИРОВАНИЕ ====================
@@ -688,8 +758,7 @@ def format_top_products(products, title, limit=15):
     sorted_items = sorted(products.items(), key=lambda x: x[1]["ordered_sum"], reverse=True)[:limit]
     lines = [f"📦 *{title}*", ""]
     for i, (sku, s) in enumerate(sorted_items, 1):
-        name = s["name"][:40]
-        oid = s["offer_id"]
+        name = s["name"][:40]; oid = s["offer_id"]
         lines.append(f"{i}. {name}" + (f" (Арт: {oid})" if oid else ""))
         lines.append(f"   🛒 {fmt_num(s['ordered_sum'])} ₽ / {s['ordered_units']} шт.")
         lines.append(f"   📦 {fmt_num(s['delivered_sum'])} ₽ / {s['delivered_units']} шт.")
@@ -708,24 +777,22 @@ def format_products_summary(products):
 
 def format_period_comparison(cur, prev, name):
     lines = [f"📊 *Продажи за {name}*", ""]
-    for label, key_sum, key_units in [
-        ("🛒 *Заказано*", "ordered_sum", "ordered_units"),
-        ("📦 *Доставлено*", "delivered_sum", "delivered_units"),
-        ("❌ *Отменено*", "canceled_sum", "canceled_units")]:
-        cs = cur.get(key_sum, 0); ps = prev.get(key_sum, 0)
-        cu = cur.get(key_units, 0); pu = prev.get(key_units, 0)
+    for label, ks, ku in [("🛒 *Заказано*", "ordered_sum", "ordered_units"),
+                          ("📦 *Доставлено*", "delivered_sum", "delivered_units"),
+                          ("❌ *Отменено*", "canceled_sum", "canceled_units")]:
+        cs = cur.get(ks, 0); ps = prev.get(ks, 0)
+        cu = cur.get(ku, 0); pu = prev.get(ku, 0)
         lines.append(label)
         lines.append(f"  {fmt_num(cs)} ₽ ({fmt_pct(calc_delta(cs, ps))}) / {fmt_int(cu)} шт. ({fmt_pct(calc_delta(cu, pu))})")
         lines.append(f"  vs: {fmt_num(ps)} ₽ / {fmt_int(pu)} шт.")
         lines.append("")
-    cur_ad = cur.get("ad_expense", 0); prev_ad = prev.get("ad_expense", 0)
+    ca = cur.get("ad_expense", 0); pa = prev.get("ad_expense", 0)
     drr = cur.get("drr"); edrr = cur.get("effective_drr")
     lines.append("📢 *Реклама*")
-    lines.append(f"  {fmt_num(cur_ad)} ₽ ({fmt_pct(calc_delta(cur_ad, prev_ad))})")
+    lines.append(f"  {fmt_num(ca)} ₽ ({fmt_pct(calc_delta(ca, pa))})")
     lines.append(f"  ДРР: {f'{drr:.2f}%' if drr is not None else '∞'} | "
                  f"ДРР по доставл.: {f'{edrr:.2f}%' if edrr is not None else '∞'}")
-    lines.append(f"  vs: {fmt_num(prev_ad)} ₽")
-    lines.append("")
+    lines.append(f"  vs: {fmt_num(pa)} ₽"); lines.append("")
     lines.append(format_expense_block(cur.get("expenses", {}), "Расходы за период"))
     return "\n".join(lines)
 
@@ -734,8 +801,7 @@ async def get_period_metrics(df, dt):
     postings, ad, fin = await asyncio.gather(
         fetch_postings(df, dt),
         fetch_advertising_expense(df, dt),
-        fetch_finance_transactions(df, dt),
-    )
+        fetch_finance_transactions(df, dt))
     agg = aggregate_postings_range(postings, df, dt)
     exp = aggregate_finance_expenses(fin)
     osum = agg["ordered_sum"]; dsum = agg["delivered_sum"]
@@ -744,8 +810,7 @@ async def get_period_metrics(df, dt):
             "effective_drr": (ad / dsum * 100) if dsum > 0 else None,
             "expenses": exp}
 
-# ==================== ОТЧЁТЫ ====================
-async def build_today_report():
+async def build_today_report(include_yesterday=False):
     now = get_current_time_msk()
     td = now.date(); today = td.isoformat()
     yest = (td - datetime.timedelta(days=1)).isoformat()
@@ -755,27 +820,21 @@ async def build_today_report():
     pm_e = pm + datetime.timedelta(days=dp - 1); pm_e_s = pm_e.isoformat()
 
     postings_cur, postings_prev, ad_t, ad_m, fin_t, fin_m = await asyncio.gather(
-        fetch_postings(cm_s, today),
-        fetch_postings(pm_s, pm_e_s),
-        fetch_advertising_expense(today, today),
-        fetch_advertising_expense(cm_s, today),
-        fetch_finance_transactions(today, today),
-        fetch_finance_transactions(cm_s, today),
-    )
+        fetch_postings(cm_s, today), fetch_postings(pm_s, pm_e_s),
+        fetch_advertising_expense(today, today), fetch_advertising_expense(cm_s, today),
+        fetch_finance_transactions(today, today), fetch_finance_transactions(cm_s, today))
     t_m = aggregate_postings_range(postings_cur, today, today)
     y_m = aggregate_postings_range(postings_cur, yest, yest)
     m_m = aggregate_postings_range(postings_cur, cm_s, today)
     p_m = aggregate_postings_range(postings_prev, pm_s, pm_e_s)
-    exp_t = aggregate_finance_expenses(fin_t)
-    exp_m = aggregate_finance_expenses(fin_m)
+    exp_t = aggregate_finance_expenses(fin_t); exp_m = aggregate_finance_expenses(fin_m)
     if ad_t > 0: exp_t["Оплата за клик"] = exp_t.get("Оплата за клик", 0) + ad_t
     if ad_m > 0: exp_m["Оплата за клик"] = exp_m.get("Оплата за клик", 0) + ad_m
 
     def blk_today():
         os_ = t_m["ordered_sum"]; ou_ = t_m["ordered_units"]
         cs_ = t_m["canceled_sum"]; cu_ = t_m["canceled_units"]
-        du = t_m["delivered_units"]
-        cr = (cu_ / du * 100) if du > 0 else None
+        du = t_m["delivered_units"]; cr = (cu_ / du * 100) if du > 0 else None
         return (f"🔹 *Сегодня (на {now.strftime('%H:%M')} МСК)*\n"
                 f"  🛒 {fmt_num(os_)} ₽ / {fmt_int(ou_)} шт.\n"
                 f"    vs вчера: {fmt_pct(calc_delta(os_, y_m['ordered_sum']))} / "
@@ -799,18 +858,28 @@ async def build_today_report():
                 f"  📢 Реклама: {fmt_num(ad_m)} ₽\n"
                 f"  ДРР: {f'{drr:.2f}%' if drr is not None else '∞'} | "
                 f"ДРР по доставл.: {f'{edrr:.2f}%' if edrr is not None else '∞'}")
-    parts = [blk_today(), blk_month(),
-             format_expense_block(exp_t, "Расходы сегодня"),
-             format_expense_block(exp_m, "Расходы за текущий месяц")]
-    return "📊 *Продажи за сегодня*\n\n\n" + "\n\n".join(parts)
+
+    parts = []
+    if include_yesterday:
+        def blk_yesterday():
+            yest_str = yest
+            postings_y = postings_cur  # уже загружены
+            yfull = aggregate_postings_range(postings_y, yest_str, yest_str)
+            ad_y = ad_t  # переиспользуем дневную рекламу (она за сегодня, для вчера нужен отдельный запрос)
+            return f"🔹 *Вчера ({yest_str})*\n" \
+                   f"  🛒 Заказано: {fmt_num(yfull['ordered_sum'])} ₽ / {fmt_int(yfull['ordered_units'])} шт.\n" \
+                   f"  📦 Доставлено: {fmt_num(yfull['delivered_sum'])} ₽ / {fmt_int(yfull['delivered_units'])} шт.\n" \
+                   f"  ❌ Отменено: {fmt_num(yfull['canceled_sum'])} ₽ / {fmt_int(yfull['canceled_units'])} шт."
+        parts.append(blk_yesterday())
+    parts.append(blk_today()); parts.append(blk_month())
+    parts.append(format_expense_block(exp_t, "Расходы сегодня"))
+    parts.append(format_expense_block(exp_m, "Расходы за текущий месяц"))
+    return "📊 *Продажи*\n\n\n" + "\n\n".join(parts)
 
 async def build_period_report(df, dt, name):
     pf, pt = prev_period(df, dt)
     write_log(f"📊 Период {df}–{dt}, предыдущий {pf}–{pt}")
-    cur, prev = await asyncio.gather(
-        get_period_metrics(df, dt),
-        get_period_metrics(pf, pt),
-    )
+    cur, prev = await asyncio.gather(get_period_metrics(df, dt), get_period_metrics(pf, pt))
     return format_period_comparison(cur, prev, name)
 
 # ==================== КАЛЕНДАРЬ ====================
@@ -818,9 +887,8 @@ MONTH_NAMES = ["Январь", "Февраль", "Март", "Апрель", "М
                "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
 
 def create_calendar(year, month, prefix):
-    kb = []
-    kb.append([InlineKeyboardButton(f"{MONTH_NAMES[month-1]} {year}", callback_data="ignore")])
-    kb.append([InlineKeyboardButton(d, callback_data="ignore") for d in ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]])
+    kb = [[InlineKeyboardButton(f"{MONTH_NAMES[month-1]} {year}", callback_data="ignore")],
+          [InlineKeyboardButton(d, callback_data="ignore") for d in ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]]]
     first, ndays = cal_mod.monthrange(year, month)
     row = [InlineKeyboardButton(" ", callback_data="ignore") for _ in range(first)]
     for d in range(1, ndays+1):
@@ -829,22 +897,51 @@ def create_calendar(year, month, prefix):
     if row:
         while len(row) < 7: row.append(InlineKeyboardButton(" ", callback_data="ignore"))
         kb.append(row)
-    kb.append([
-        InlineKeyboardButton("◀️", callback_data=f"{prefix}prev_{year}_{month}"),
-        InlineKeyboardButton(" ", callback_data="ignore"),
-        InlineKeyboardButton("▶️", callback_data=f"{prefix}next_{year}_{month}")])
+    kb.append([InlineKeyboardButton("◀️", callback_data=f"{prefix}prev_{year}_{month}"),
+               InlineKeyboardButton(" ", callback_data="ignore"),
+               InlineKeyboardButton("▶️", callback_data=f"{prefix}next_{year}_{month}")])
     kb.append([InlineKeyboardButton("🔙 Назад", callback_data=f"{prefix}cancel")])
     return InlineKeyboardMarkup(kb)
 
 # ==================== КЛАВИАТУРЫ ====================
-def main_kb():
+def main_kb(chat_id):
+    buttons = [
+        [KeyboardButton("📊 Отчёт по продажам")],
+        [KeyboardButton("📦 Отчёт по товарам")],
+        [KeyboardButton("🔔 Автоматические рассылки")],
+    ]
+    if is_admin(chat_id):
+        buttons.append([KeyboardButton("⚙️ Администрирование")])
+    buttons.append([KeyboardButton("📖 Справка")])
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+def sales_reports_kb():
     return ReplyKeyboardMarkup([
-        [KeyboardButton("📊 Продажи за сегодня")],
+        [KeyboardButton("📅 Продажи за сегодня")],
         [KeyboardButton("📅 Выбрать дату"), KeyboardButton("📆 Выбрать период")],
+        [KeyboardButton("📈 Динамика продаж")],
+        [KeyboardButton("🔙 Назад")]], resize_keyboard=True)
+
+def products_reports_kb():
+    return ReplyKeyboardMarkup([
         [KeyboardButton("📦 Топ товаров за сегодня")],
         [KeyboardButton("🏆 Товары за период")],
-        [KeyboardButton("📈 Динамика продаж"), KeyboardButton("📈 Динамика по товару")],
-    ], resize_keyboard=True)
+        [KeyboardButton("📈 Динамика по товару")],
+        [KeyboardButton("🔙 Назад")]], resize_keyboard=True)
+
+def admin_kb():
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("➕ Добавить менеджера"), KeyboardButton("➖ Удалить менеджера")],
+        [KeyboardButton("📋 Список менеджеров")],
+        [KeyboardButton("🔙 Назад")]], resize_keyboard=True)
+
+def auto_kb():
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("🕒 Выбор времени рассылок")],
+        [KeyboardButton("📅 Добавление отчета за Вчера")],
+        [KeyboardButton("🔕 Режим тишины")],
+        [KeyboardButton("📤 Отправить отчет за Вчера сейчас")],
+        [KeyboardButton("🔙 Назад")]], resize_keyboard=True)
 
 def products_period_kb():
     return InlineKeyboardMarkup([
@@ -852,32 +949,119 @@ def products_period_kb():
         [InlineKeyboardButton("📅 По кварталам", callback_data="tpq")],
         [InlineKeyboardButton("📆 По годам", callback_data="tpy")],
         [InlineKeyboardButton("✏️ Произвольный период", callback_data="tpc")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="tpcancel")],
-    ])
+        [InlineKeyboardButton("🔙 Назад", callback_data="tpcancel")]])
 
-# ==================== ХЕНДЛЕРЫ ОСНОВНЫЕ ====================
+def hours_kb(selected, prefix, available=None):
+    kb = []
+    hrs = sorted(available) if available is not None else list(range(1, 25))
+    for h in hrs:
+        hour = h % 24
+        checked = "✅" if hour in selected else "⬜"
+        kb.append([InlineKeyboardButton(f"{h:02d}:00 {checked}", callback_data=f"{prefix}{hour}")])
+    kb.append([InlineKeyboardButton("💾 Сохранить", callback_data=f"{prefix}save"),
+               InlineKeyboardButton("🔙 Назад", callback_data=f"{prefix}back")])
+    return InlineKeyboardMarkup(kb)
+
+def hours_kb_silence(prefix):
+    kb = []
+    for h in range(1, 25):
+        kb.append([InlineKeyboardButton(f"{h:02d}:00", callback_data=f"{prefix}{h%24}")])
+    kb.append([InlineKeyboardButton("🔙 Назад", callback_data=f"{prefix}back")])
+    return InlineKeyboardMarkup(kb)
+
+# ==================== ГЛАВНОЕ МЕНЮ ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_chat.id):
-        await update.message.reply_text("❌ Нет доступа.", reply_markup=ReplyKeyboardRemove())
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    if not has_access(chat_id):
+        await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.",
+                                        reply_markup=ReplyKeyboardRemove())
         return
-    await update.message.reply_text(f"🤖 Версия: {VERSION}\n\nВыберите действие:", reply_markup=main_kb())
+    name = user.first_name or ""
+    hour = datetime.datetime.now(MOSCOW_TZ).hour
+    if 5 <= hour < 12: greet = "Доброе утро"
+    elif 12 <= hour < 18: greet = "Добрый день"
+    elif 18 <= hour < 24: greet = "Добрый вечер"
+    else: greet = "Доброй ночи"
+    greeting = f"{greet}, {name}!" if name else f"{greet}!"
+    await update.message.reply_text(f"{greeting}\n\n🤖 Версия бота: {VERSION}",
+                                    reply_markup=main_kb(chat_id))
+    if not user_has_schedule(chat_id):
+        await update.message.reply_text(
+            "⚠️ *Необходимо настроить автоматические рассылки!*\n\n"
+            "Зайдите в раздел «🔔 Автоматические рассылки» и настройте:\n"
+            "1. Часы рассылок\n"
+            "2. Часы отправки отчёта за Вчера",
+            parse_mode="Markdown")
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🤖 Версия: {VERSION}")
 
-async def today_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_chat.id): return
-    msg = await update.message.reply_text("⏳ Загружаю данные...")
+async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    chat_id = update.effective_chat.id
+    if not has_access(chat_id):
+        await update.message.reply_text("❌ Нет доступа.")
+        return
+    if text == "📊 Отчёт по продажам":
+        await update.message.reply_text("Отчёты по продажам:", reply_markup=sales_reports_kb())
+    elif text == "📦 Отчёт по товарам":
+        await update.message.reply_text("Отчёты по товарам:", reply_markup=products_reports_kb())
+    elif text == "🔔 Автоматические рассылки":
+        await update.message.reply_text("🔔 *Автоматические рассылки*\n\nВыберите действие:",
+                                        reply_markup=auto_kb(), parse_mode="Markdown")
+    elif text == "⚙️ Администрирование":
+        if not is_admin(chat_id):
+            await update.message.reply_text("⛔ Только для администратора.")
+            return
+        await update.message.reply_text("Управление менеджерами:", reply_markup=admin_kb())
+    elif text == "📖 Справка":
+        await send_help(update, context)
+
+async def send_help(update, context):
+    chat_id = update.effective_chat.id
+    common = (
+        "📖 *Справка*\n\n"
+        "🔹 *Основные функции*\n"
+        "• 📊 Отчёт по продажам — сводка за сегодня и текущий месяц.\n"
+        "• 📦 Отчёт по товарам — топ товаров и периоды.\n"
+        "• 📈 Динамика продаж — график доставленных заказов по месяцам.\n"
+        "• 📈 Динамика по товару — график конкретного товара.\n"
+        "• 🔔 Автоматические рассылки — персональные отчёты.\n\n"
+        "🔹 *Автоматические рассылки (персональные)*\n"
+        "• 🕒 Выбор времени рассылок — задайте часы.\n"
+        "• 📅 Добавление отчёта за Вчера — выберите часы из разрешённых.\n"
+        "• 🔕 Режим тишины — интервал, когда рассылки не отправляются.\n"
+        "• 📤 Отправить отчёт за Вчера сейчас — тест.\n\n"
+        "🔹 *Часовой пояс*\n"
+        "• Все расчёты — по московскому времени (МСК, UTC+3).\n\n"
+        f"🤖 Версия бота: {VERSION}"
+    )
+    if is_admin(chat_id):
+        help_text = common + (
+            "\n\n🔹 *Администрирование (только админ)*\n"
+            "• ➕ Добавить менеджера — ID или @username + телефон.\n"
+            "• ➖ Удалить менеджера — по ID.\n"
+            "• 📋 Список менеджеров.\n\n"
+            "⚠️ Каждый менеджер настраивает свои рассылки сам — администратор их не настраивает."
+        )
+    else:
+        help_text = common
+    await update.message.reply_text(help_text, parse_mode="Markdown")
+
+# ==================== ПРОДАЖИ: СЕГОДНЯ / ДАТА / ПЕРИОД ====================
+async def today_report(update, context):
+    if not has_access(update.effective_chat.id): return
+    msg = await update.message.reply_text("⏳ Загружаю данные за сегодня...")
     try:
-        r = await build_today_report()
+        r = await build_today_report(include_yesterday=False)
         await msg.delete()
         await update.message.reply_text(r, parse_mode="Markdown")
     except Exception as e:
-        write_log(f"❌ Ошибка: {e}"); await msg.edit_text(f"❌ Ошибка: {e}")
+        write_log(f"❌ {e}"); await msg.edit_text(f"❌ Ошибка: {e}")
 
-# ----- Дата -----
 async def date_menu(update, context):
-    if not is_admin(update.effective_chat.id): return
+    if not has_access(update.effective_chat.id): return
     now = get_moscow_today()
     await update.message.reply_text("Выберите дату:",
         reply_markup=create_calendar(now.year, now.month, "d_"))
@@ -887,7 +1071,7 @@ async def date_cb(update, context):
     q = update.callback_query; await q.answer(); d = q.data
     if d == "d_cancel":
         await q.edit_message_text("Отменено.")
-        await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+        await q.message.reply_text("Выберите действие:", reply_markup=main_kb(q.message.chat_id))
         return ConversationHandler.END
     if d.startswith("d_prev_") or d.startswith("d_next_"):
         m = re.search(r'(prev|next)_(\d+)_(\d+)', d)
@@ -910,15 +1094,14 @@ async def date_cb(update, context):
             try:
                 rpt = await build_period_report(ds, ds, ds)
                 await q.edit_message_text(rpt, parse_mode="Markdown")
-                await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+                await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
             except Exception as e:
                 write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
             return ConversationHandler.END
     return WAITING_DATE_SINGLE
 
-# ----- Период -----
 async def period_menu(update, context):
-    if not is_admin(update.effective_chat.id): return
+    if not has_access(update.effective_chat.id): return
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🗓️ По месяцам", callback_data="pm")],
         [InlineKeyboardButton("📅 По кварталам", callback_data="pq")],
@@ -930,11 +1113,10 @@ async def period_menu(update, context):
 
 async def period_type_cb(update, context):
     q = update.callback_query; await q.answer(); d = q.data
-    cy = get_moscow_today().year
-    ys = list(range(cy-9, cy+1))
+    cy = get_moscow_today().year; ys = list(range(cy-9, cy+1))
     if d == "pcancel":
         await q.edit_message_text("Отменено.")
-        await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+        await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
         return ConversationHandler.END
     if d == "pm":
         btns = [[InlineKeyboardButton(str(y), callback_data=f"pmy_{y}")] for y in ys]
@@ -953,8 +1135,7 @@ async def period_type_cb(update, context):
         return WAITING_YEAR_SELECT
     if d == "pcustom":
         now = get_moscow_today()
-        await q.edit_message_text("Начало:",
-            reply_markup=create_calendar(now.year, now.month, "s_"))
+        await q.edit_message_text("Начало:", reply_markup=create_calendar(now.year, now.month, "s_"))
         return WAITING_PERIOD_START
     return ConversationHandler.END
 
@@ -962,7 +1143,7 @@ async def period_year_cb(update, context):
     q = update.callback_query; await q.answer(); d = q.data
     if d == "pcancel":
         await q.edit_message_text("Отменено.")
-        await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+        await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
         return ConversationHandler.END
     if d.startswith("pmy_"):
         y = int(d.split("_")[1])
@@ -983,7 +1164,7 @@ async def period_year_cb(update, context):
         try:
             rpt = await build_period_report(df, dt, f"{y} год")
             await q.edit_message_text(rpt, parse_mode="Markdown")
-            await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+            await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
         except Exception as e:
             write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
         return ConversationHandler.END
@@ -993,7 +1174,7 @@ async def period_month_cb(update, context):
     q = update.callback_query; await q.answer(); d = q.data
     if d == "pcancel":
         await q.edit_message_text("Отменено.")
-        await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+        await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
         return ConversationHandler.END
     if d.startswith("pmm_"):
         pr = d.split("_"); m, y = int(pr[1]), int(pr[2])
@@ -1004,7 +1185,7 @@ async def period_month_cb(update, context):
         try:
             rpt = await build_period_report(f.isoformat(), l.isoformat(), name)
             await q.edit_message_text(rpt, parse_mode="Markdown")
-            await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+            await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
         except Exception as e:
             write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
         return ConversationHandler.END
@@ -1014,7 +1195,7 @@ async def period_quarter_cb(update, context):
     q = update.callback_query; await q.answer(); d = q.data
     if d == "pcancel":
         await q.edit_message_text("Отменено.")
-        await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+        await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
         return ConversationHandler.END
     if d.startswith("pqq_"):
         pr = d.split("_"); qn, y = int(pr[1]), int(pr[2])
@@ -1026,7 +1207,7 @@ async def period_quarter_cb(update, context):
         try:
             rpt = await build_period_report(f.isoformat(), l.isoformat(), name)
             await q.edit_message_text(rpt, parse_mode="Markdown")
-            await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+            await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
         except Exception as e:
             write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
         return ConversationHandler.END
@@ -1036,7 +1217,7 @@ async def custom_start_cb(update, context):
     q = update.callback_query; await q.answer(); d = q.data
     if d == "s_cancel":
         await q.edit_message_text("Отменено.")
-        await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+        await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
         return ConversationHandler.END
     if d.startswith("s_prev_") or d.startswith("s_next_"):
         m = re.search(r'(prev|next)_(\d+)_(\d+)', d)
@@ -1066,7 +1247,7 @@ async def custom_end_cb(update, context):
     q = update.callback_query; await q.answer(); d = q.data
     if d == "e_cancel":
         await q.edit_message_text("Отменено.")
-        await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+        await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
         return ConversationHandler.END
     if d.startswith("e_prev_") or d.startswith("e_next_"):
         m = re.search(r'(prev|next)_(\d+)_(\d+)', d)
@@ -1084,7 +1265,7 @@ async def custom_end_cb(update, context):
         if re.match(r"\d{4}-\d{2}-\d{2}$", de):
             ds = context.user_data.get('p_start')
             if not ds:
-                await q.edit_message_text("❌ потеряна начальная дата"); return ConversationHandler.END
+                await q.edit_message_text("❌ потеряна дата"); return ConversationHandler.END
             ok, r = validate_period(ds, de)
             if not ok:
                 await q.edit_message_text(r); return WAITING_PERIOD_END
@@ -1093,16 +1274,16 @@ async def custom_end_cb(update, context):
             try:
                 rpt = await build_period_report(ds, de, nm)
                 await q.edit_message_text(rpt, parse_mode="Markdown")
-                await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+                await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
             except Exception as e:
                 write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
             context.user_data.pop('p_start', None)
             return ConversationHandler.END
     return WAITING_PERIOD_END
 
-# ----- Товары сегодня -----
+# ==================== ТОВАРЫ ====================
 async def top_today(update, context):
-    if not is_admin(update.effective_chat.id): return
+    if not has_access(update.effective_chat.id): return
     msg = await update.message.reply_text("⏳ Загружаю товары за сегодня...")
     now = get_current_time_msk(); td = now.date().isoformat()
     try:
@@ -1114,9 +1295,8 @@ async def top_today(update, context):
     except Exception as e:
         write_log(f"❌ {e}"); await msg.edit_text(f"❌ {e}")
 
-# ----- Товары за период -----
 async def products_period_menu(update, context):
-    if not is_admin(update.effective_chat.id): return
+    if not has_access(update.effective_chat.id): return
     await update.message.reply_text("Период для товаров:", reply_markup=products_period_kb())
     return WAITING_PRODUCT_PERIOD_TYPE
 
@@ -1125,7 +1305,7 @@ async def products_period_type_cb(update, context):
     cy = get_moscow_today().year; ys = list(range(cy-9, cy+1))
     if d == "tpcancel":
         await q.edit_message_text("Отменено.")
-        await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+        await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
         return ConversationHandler.END
     if d in ("tpm", "tpq"):
         prefix = "tmy_" if d == "tpm" else "tqy_"
@@ -1148,7 +1328,7 @@ async def products_year_cb(update, context):
     q = update.callback_query; await q.answer(); d = q.data
     if d == "tpcancel":
         await q.edit_message_text("Отменено.")
-        await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+        await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
         return ConversationHandler.END
     if d.startswith("tmy_"):
         y = int(d.split("_")[1])
@@ -1171,7 +1351,7 @@ async def products_year_cb(update, context):
             stats = aggregate_products(postings, df, dt)
             txt = format_top_products(stats, f"Товары за {y} год", 20) + "\n" + format_products_summary(stats)
             await q.edit_message_text(txt)
-            await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+            await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
         except Exception as e:
             write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
         return ConversationHandler.END
@@ -1181,7 +1361,7 @@ async def products_month_cb(update, context):
     q = update.callback_query; await q.answer(); d = q.data
     if d == "tpcancel":
         await q.edit_message_text("Отменено.")
-        await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+        await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
         return ConversationHandler.END
     if d.startswith("tmm_"):
         pr = d.split("_"); m, y = int(pr[1]), int(pr[2])
@@ -1194,7 +1374,7 @@ async def products_month_cb(update, context):
             stats = aggregate_products(postings, f.isoformat(), l.isoformat())
             txt = format_top_products(stats, f"Товары за {nm}", 20) + "\n" + format_products_summary(stats)
             await q.edit_message_text(txt)
-            await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+            await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
         except Exception as e:
             write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
         return ConversationHandler.END
@@ -1204,7 +1384,7 @@ async def products_quarter_cb(update, context):
     q = update.callback_query; await q.answer(); d = q.data
     if d == "tpcancel":
         await q.edit_message_text("Отменено.")
-        await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+        await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
         return ConversationHandler.END
     if d.startswith("tqq_"):
         pr = d.split("_"); qn, y = int(pr[1]), int(pr[2])
@@ -1218,7 +1398,7 @@ async def products_quarter_cb(update, context):
             stats = aggregate_products(postings, f.isoformat(), l.isoformat())
             txt = format_top_products(stats, f"Товары за {nm}", 20) + "\n" + format_products_summary(stats)
             await q.edit_message_text(txt)
-            await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+            await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
         except Exception as e:
             write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
         return ConversationHandler.END
@@ -1228,7 +1408,7 @@ async def products_custom_start(update, context):
     q = update.callback_query; await q.answer(); d = q.data
     if d == "ts_cancel":
         await q.edit_message_text("Отменено.")
-        await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+        await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
         return ConversationHandler.END
     if d.startswith("ts_prev_") or d.startswith("ts_next_"):
         m = re.search(r'(prev|next)_(\d+)_(\d+)', d)
@@ -1258,7 +1438,7 @@ async def products_custom_end(update, context):
     q = update.callback_query; await q.answer(); d = q.data
     if d == "te_cancel":
         await q.edit_message_text("Отменено.")
-        await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+        await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
         return ConversationHandler.END
     if d.startswith("te_prev_") or d.startswith("te_next_"):
         m = re.search(r'(prev|next)_(\d+)_(\d+)', d)
@@ -1287,7 +1467,7 @@ async def products_custom_end(update, context):
                 stats = aggregate_products(postings, ds, de)
                 txt = format_top_products(stats, f"Товары за {nm}", 20) + "\n" + format_products_summary(stats)
                 await q.edit_message_text(txt)
-                await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+                await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
             except Exception as e:
                 write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
             context.user_data.pop('tp_start', None)
@@ -1296,31 +1476,29 @@ async def products_custom_end(update, context):
 
 # ==================== ГРАФИК: ДИНАМИКА ПРОДАЖ ====================
 async def dynamics_menu(update, context):
-    if not is_admin(update.effective_chat.id): return
+    if not has_access(update.effective_chat.id): return
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📅 Текущий год", callback_data="dyc")],
         [InlineKeyboardButton("📆 Выбрать год", callback_data="dys")],
         [InlineKeyboardButton("📊 Диапазон лет", callback_data="dyr")],
         [InlineKeyboardButton("🔙 Назад", callback_data="dyx")]])
-    await update.message.reply_text(
-        "Динамика доставленных заказов по месяцам.\nВыберите вариант:", reply_markup=kb)
+    await update.message.reply_text("Динамика доставленных заказов по месяцам:", reply_markup=kb)
     return WAITING_DYN_SELECT
 
 async def dynamics_select_cb(update, context):
     q = update.callback_query; await q.answer(); d = q.data
-    cy = get_moscow_today().year
-    ys = list(range(cy-9, cy+1))
+    cy = get_moscow_today().year; ys = list(range(cy-9, cy+1))
     if d == "dyx":
         await q.edit_message_text("Отменено.")
-        await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+        await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
         return ConversationHandler.END
     if d == "dyc":
         await q.edit_message_text(f"⏳ Строю график за {cy}...")
         try:
             buf = await generate_sales_chart([cy])
-            await q.message.reply_photo(photo=buf, caption=f"Динамика доставленных заказов за {cy} год")
+            await q.message.reply_photo(photo=buf, caption=f"Динамика за {cy}")
             await q.delete_message()
-            await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+            await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
         except Exception as e:
             write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
         return ConversationHandler.END
@@ -1338,16 +1516,16 @@ async def dynamics_year_cb(update, context):
     q = update.callback_query; await q.answer(); d = q.data
     if d == "dyx":
         await q.edit_message_text("Отменено.")
-        await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+        await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
         return ConversationHandler.END
     if d.startswith("dyy_"):
         y = int(d.split("_")[1])
-        await q.edit_message_text(f"⏳ Строю график за {y}...")
+        await q.edit_message_text(f"⏳ График за {y}...")
         try:
             buf = await generate_sales_chart([y])
-            await q.message.reply_photo(photo=buf, caption=f"Динамика доставленных заказов за {y} год")
+            await q.message.reply_photo(photo=buf, caption=f"Динамика за {y}")
             await q.delete_message()
-            await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+            await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
         except Exception as e:
             write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
         return ConversationHandler.END
@@ -1358,38 +1536,33 @@ async def dynamics_range_start(update, context):
     if not t.isdigit():
         await update.message.reply_text("❌ Введите число (год).")
         return WAITING_DYN_RANGE_START
-    y = int(t)
-    cy = get_moscow_today().year
+    y = int(t); cy = get_moscow_today().year
     if y < 2000 or y > cy:
         await update.message.reply_text(f"❌ Год от 2000 до {cy}.")
         return WAITING_DYN_RANGE_START
     context.user_data['dyn_rs'] = y
-    await update.message.reply_text("Введите конечный год (включительно):")
+    await update.message.reply_text("Введите конечный год:")
     return WAITING_DYN_RANGE_END
 
 async def dynamics_range_end(update, context):
     t = update.message.text.strip()
     if not t.isdigit():
-        await update.message.reply_text("❌ Введите число (год).")
+        await update.message.reply_text("❌ Введите число.")
         return WAITING_DYN_RANGE_END
-    ye = int(t)
-    ys_ = context.user_data.get('dyn_rs')
+    ye = int(t); ys_ = context.user_data.get('dyn_rs')
     if ys_ is None:
-        await update.message.reply_text("❌ Ошибка, начните заново.")
-        return ConversationHandler.END
+        await update.message.reply_text("❌ Начните заново."); return ConversationHandler.END
     if ye < ys_:
-        await update.message.reply_text("❌ Конечный год < начального.")
-        return WAITING_DYN_RANGE_END
+        await update.message.reply_text("❌ Конец < начала."); return WAITING_DYN_RANGE_END
     years = list(range(ys_, ye + 1))
     if len(years) > 10:
-        await update.message.reply_text("⚠️ Максимум 10 лет.")
-        return ConversationHandler.END
-    msg = await update.message.reply_text(f"⏳ Строю график за {ys_}-{ye}...")
+        await update.message.reply_text("⚠️ Максимум 10 лет."); return ConversationHandler.END
+    msg = await update.message.reply_text(f"⏳ График за {ys_}-{ye}...")
     try:
         buf = await generate_sales_chart(years)
         await msg.delete()
-        await update.message.reply_photo(photo=buf, caption=f"Динамика за {ys_}-{ye} гг.")
-        await update.message.reply_text("Выберите действие:", reply_markup=main_kb())
+        await update.message.reply_photo(photo=buf, caption=f"Динамика за {ys_}-{ye}")
+        await update.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
     except Exception as e:
         write_log(f"❌ {e}"); await msg.edit_text(f"❌ {e}")
     context.user_data.pop('dyn_rs', None)
@@ -1397,44 +1570,41 @@ async def dynamics_range_end(update, context):
 
 # ==================== ГРАФИК: ДИНАМИКА ПО ТОВАРУ ====================
 async def product_chart_menu(update, context):
-    if not is_admin(update.effective_chat.id): return
+    if not has_access(update.effective_chat.id): return
     msg = await update.message.reply_text("⏳ Загружаю топ товаров за 30 дней...")
     today = get_moscow_today(); td = today.isoformat()
     start = (today - datetime.timedelta(days=30)).isoformat()
     try:
         postings = await fetch_postings(start, td)
         stats = aggregate_products(postings, start, td)
-        sorted_items = sorted(stats.items(), key=lambda x: x[1]["ordered_sum"], reverse=True)[:30]
-        if not sorted_items:
-            await msg.edit_text("❌ Нет данных о товарах за 30 дней.")
-            return ConversationHandler.END
-        context.user_data['pc_list'] = sorted_items
+        items = sorted(stats.items(), key=lambda x: x[1]["ordered_sum"], reverse=True)[:30]
+        if not items:
+            await msg.edit_text("❌ Нет данных."); return ConversationHandler.END
+        context.user_data['pc_list'] = items
         kb = []
-        for sku, s in sorted_items:
+        for sku, s in items:
             nm = s["name"][:18] + ("..." if len(s["name"]) > 18 else "")
             oid = s.get("offer_id") or ""
-            btn_txt = f"{oid} | {nm}" if oid else nm
-            kb.append([InlineKeyboardButton(btn_txt[:60], callback_data=f"pcs_{sku}")])
+            btn = f"{oid} | {nm}" if oid else nm
+            kb.append([InlineKeyboardButton(btn[:60], callback_data=f"pcs_{sku}")])
         kb.append([InlineKeyboardButton("🔙 Назад", callback_data="pcx")])
         await msg.edit_text("Выберите товар:", reply_markup=InlineKeyboardMarkup(kb))
         return WAITING_PC_LIST
     except Exception as e:
-        write_log(f"❌ {e}"); await msg.edit_text(f"❌ {e}")
-        return ConversationHandler.END
+        write_log(f"❌ {e}"); await msg.edit_text(f"❌ {e}"); return ConversationHandler.END
 
 async def product_chart_list_cb(update, context):
     q = update.callback_query; await q.answer(); d = q.data
     if d == "pcx":
         await q.edit_message_text("Отменено.")
-        await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+        await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
         return ConversationHandler.END
     if d.startswith("pcs_"):
         sku = d[4:]
         context.user_data['pc_sku'] = sku
         nm = "Товар"
         for s_sku, s in context.user_data.get('pc_list', []):
-            if s_sku == sku:
-                nm = s["name"][:40]; break
+            if s_sku == sku: nm = s["name"][:40]; break
         context.user_data['pc_name'] = nm
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("Заказано (₽)", callback_data="pcm_ordered_sum")],
@@ -1445,8 +1615,7 @@ async def product_chart_list_cb(update, context):
             [InlineKeyboardButton("Отменено (шт.)", callback_data="pcm_canceled_units")],
             [InlineKeyboardButton("Средний чек (₽)", callback_data="pcm_avg_check")],
             [InlineKeyboardButton("🔙 Назад", callback_data="pcx")]])
-        await q.edit_message_text(f"Товар: {nm} (SKU: {sku})\nВыберите метрику:",
-                                  reply_markup=kb)
+        await q.edit_message_text(f"Товар: {nm} (SKU: {sku})\nВыберите метрику:", reply_markup=kb)
         return WAITING_PC_METRIC
     return WAITING_PC_LIST
 
@@ -1454,34 +1623,29 @@ async def product_chart_metric_cb(update, context):
     q = update.callback_query; await q.answer(); d = q.data
     if d == "pcx":
         await q.edit_message_text("Отменено.")
-        await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+        await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
         return ConversationHandler.END
     if d.startswith("pcm_"):
         m = d[4:]
         context.user_data['pc_metric'] = m
-        cy = get_moscow_today().year
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("📅 Текущий год", callback_data="pcp_current")],
             [InlineKeyboardButton("📆 Выбрать год", callback_data="pcp_year")],
             [InlineKeyboardButton("📊 Диапазон лет", callback_data="pcp_range")],
             [InlineKeyboardButton("🔙 Назад", callback_data="pcx")]])
-        await q.edit_message_text(
-            f"Метрика: {METRIC_LABELS.get(m, m)}\nВыберите период:", reply_markup=kb)
+        await q.edit_message_text(f"Метрика: {METRIC_LABELS.get(m, m)}\nВыберите период:", reply_markup=kb)
         return WAITING_PC_PERIOD
     return WAITING_PC_METRIC
 
 async def product_chart_period_cb(update, context):
     q = update.callback_query; await q.answer(); d = q.data
-    sku = context.user_data.get('pc_sku')
-    metric = context.user_data.get('pc_metric')
+    sku = context.user_data.get('pc_sku'); metric = context.user_data.get('pc_metric')
     if not sku or not metric:
-        await q.edit_message_text("❌ Потеряны данные.")
-        return ConversationHandler.END
-    cy = get_moscow_today().year
-    ys = list(range(cy-9, cy+1))
+        await q.edit_message_text("❌ Потеряны данные."); return ConversationHandler.END
+    cy = get_moscow_today().year; ys = list(range(cy-9, cy+1))
     if d == "pcx":
         await q.edit_message_text("Отменено.")
-        await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+        await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
         return ConversationHandler.END
     if d == "pcp_current":
         await q.edit_message_text("⏳ Строю график...")
@@ -1491,7 +1655,7 @@ async def product_chart_period_cb(update, context):
             await q.message.reply_photo(photo=buf,
                 caption=f"{nm} | {METRIC_LABELS.get(metric, metric)} | {cy}")
             await q.delete_message()
-            await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+            await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
         except Exception as e:
             write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
         return ConversationHandler.END
@@ -1509,22 +1673,21 @@ async def product_chart_year_cb(update, context):
     q = update.callback_query; await q.answer(); d = q.data
     sku = context.user_data.get('pc_sku'); metric = context.user_data.get('pc_metric')
     if not sku or not metric:
-        await q.edit_message_text("❌ Потеряны данные.")
-        return ConversationHandler.END
+        await q.edit_message_text("❌ Потеряны данные."); return ConversationHandler.END
     if d == "pcx":
         await q.edit_message_text("Отменено.")
-        await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+        await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
         return ConversationHandler.END
     if d.startswith("pcy_"):
         y = int(d.split("_")[1])
-        await q.edit_message_text(f"⏳ Строю график за {y}...")
+        await q.edit_message_text(f"⏳ График за {y}...")
         try:
             buf = await generate_product_chart(sku, metric, [y])
             nm = context.user_data.get('pc_name', sku)
             await q.message.reply_photo(photo=buf,
                 caption=f"{nm} | {METRIC_LABELS.get(metric, metric)} | {y}")
             await q.delete_message()
-            await q.message.reply_text("Выберите действие:", reply_markup=main_kb())
+            await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
         except Exception as e:
             write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
         return ConversationHandler.END
@@ -1533,12 +1696,10 @@ async def product_chart_year_cb(update, context):
 async def product_chart_range_start(update, context):
     t = update.message.text.strip()
     if not t.isdigit():
-        await update.message.reply_text("❌ Введите число.")
-        return WAITING_PC_RANGE_START
+        await update.message.reply_text("❌ Введите число."); return WAITING_PC_RANGE_START
     y = int(t); cy = get_moscow_today().year
     if y < 2000 or y > cy:
-        await update.message.reply_text(f"❌ Год от 2000 до {cy}.")
-        return WAITING_PC_RANGE_START
+        await update.message.reply_text(f"❌ Год 2000-{cy}."); return WAITING_PC_RANGE_START
     context.user_data['pc_rs'] = y
     await update.message.reply_text("Введите конечный год:")
     return WAITING_PC_RANGE_END
@@ -1546,53 +1707,384 @@ async def product_chart_range_start(update, context):
 async def product_chart_range_end(update, context):
     t = update.message.text.strip()
     if not t.isdigit():
-        await update.message.reply_text("❌ Введите число.")
-        return WAITING_PC_RANGE_END
+        await update.message.reply_text("❌ Введите число."); return WAITING_PC_RANGE_END
     ye = int(t); ys_ = context.user_data.get('pc_rs')
     sku = context.user_data.get('pc_sku'); metric = context.user_data.get('pc_metric')
     if not ys_ or not sku or not metric:
-        await update.message.reply_text("❌ Ошибка, начните заново.")
-        return ConversationHandler.END
+        await update.message.reply_text("❌ Начните заново."); return ConversationHandler.END
     if ye < ys_:
-        await update.message.reply_text("❌ Конец < начала.")
-        return WAITING_PC_RANGE_END
+        await update.message.reply_text("❌ Конец < начала."); return WAITING_PC_RANGE_END
     years = list(range(ys_, ye + 1))
     if len(years) > 10:
-        await update.message.reply_text("⚠️ Максимум 10 лет.")
-        return ConversationHandler.END
-    msg = await update.message.reply_text(f"⏳ Строю график...")
+        await update.message.reply_text("⚠️ Максимум 10 лет."); return ConversationHandler.END
+    msg = await update.message.reply_text("⏳ Строю график...")
     try:
         buf = await generate_product_chart(sku, metric, years)
         nm = context.user_data.get('pc_name', sku)
         await msg.delete()
         await update.message.reply_photo(photo=buf,
             caption=f"{nm} | {METRIC_LABELS.get(metric, metric)} | {ys_}-{ye}")
-        await update.message.reply_text("Выберите действие:", reply_markup=main_kb())
+        await update.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
     except Exception as e:
         write_log(f"❌ {e}"); await msg.edit_text(f"❌ {e}")
     context.user_data.pop('pc_rs', None)
     return ConversationHandler.END
 
+# ==================== АВТОМАТИЧЕСКИЕ РАССЫЛКИ (персональные) ====================
+async def auto_schedule_start(update, context):
+    chat_id = update.effective_chat.id
+    if not has_access(chat_id): return
+    settings = await load_settings()
+    us = get_user_settings(settings, chat_id)
+    current = us.get("schedule_hours", [])
+    context.user_data['temp_sch'] = list(current)
+    if current:
+        txt = f"Текущие часы: {', '.join(f'{h:02d}:00' for h in sorted(current))}\nНажмите для изменения:"
+    else:
+        txt = "Часы рассылок не настроены. Выберите часы:"
+    await update.message.reply_text(txt, reply_markup=hours_kb(current, "sch_"))
+
+async def auto_yesterday_start(update, context):
+    chat_id = update.effective_chat.id
+    if not has_access(chat_id): return
+    settings = await load_settings()
+    us = get_user_settings(settings, chat_id)
+    sch = us.get("schedule_hours", [])
+    if not sch:
+        await update.message.reply_text("❌ Сначала настройте «Выбор времени рассылок».")
+        return
+    cur = us.get("yesterday_report_hours", [])
+    context.user_data['temp_yest'] = list(cur)
+    await update.message.reply_text(
+        "Выберите часы отправки отчёта за Вчера (из ваших часов рассылок):",
+        reply_markup=hours_kb(cur, "yest_", available=sch))
+
+async def auto_silence_start(update, context):
+    chat_id = update.effective_chat.id
+    if not has_access(chat_id): return
+    settings = await load_settings()
+    us = get_user_settings(settings, chat_id)
+    s = us.get("silence_start"); e = us.get("silence_end")
+    if s is not None and e is not None:
+        txt = f"Режим тишины: с {s:02d}:00 до {e:02d}:00"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Изменить", callback_data="sil_edit")],
+            [InlineKeyboardButton("❌ Отключить", callback_data="sil_disable")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="sil_back")]])
+    else:
+        txt = "Режим тишины не настроен."
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔕 Установить", callback_data="sil_edit")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="sil_back")]])
+    await update.message.reply_text(txt, reply_markup=kb)
+
+async def auto_send_now(update, context):
+    chat_id = update.effective_chat.id
+    if not has_access(chat_id): return
+    await update.message.reply_text("⏳ Формирую отчёт за Вчера...")
+    try:
+        rpt = await build_today_report(include_yesterday=True)
+        await context.bot.send_message(chat_id=chat_id, text=rpt, parse_mode="Markdown")
+        await update.message.reply_text("✅ Отчёт отправлен вам.")
+    except Exception as e:
+        write_log(f"❌ {e}"); await update.message.reply_text(f"❌ Ошибка: {e}")
+
+async def auto_menu_router(update, context):
+    t = update.message.text
+    if t == "🕒 Выбор времени рассылок":
+        await auto_schedule_start(update, context)
+    elif t == "📅 Добавление отчета за Вчера":
+        await auto_yesterday_start(update, context)
+    elif t == "🔕 Режим тишины":
+        await auto_silence_start(update, context)
+    elif t == "📤 Отправить отчет за Вчера сейчас":
+        await auto_send_now(update, context)
+    elif t == "🔙 Назад":
+        await update.message.reply_text("Главное меню:", reply_markup=main_kb(update.effective_chat.id))
+
+async def schedule_cb(update, context):
+    q = update.callback_query; await q.answer(); d = q.data
+    chat_id = q.message.chat_id
+    if d == "sch_back":
+        await q.edit_message_text("Отменено.")
+        await q.message.reply_text("Выберите действие:", reply_markup=auto_kb())
+        return ConversationHandler.END
+    if d.startswith("sch_") and d[4:].isdigit():
+        h = int(d[4:])
+        temp = context.user_data.get('temp_sch', [])
+        if h in temp: temp.remove(h)
+        else: temp.append(h)
+        context.user_data['temp_sch'] = temp
+        await q.edit_message_reply_markup(reply_markup=hours_kb(temp, "sch_"))
+        return WAITING_AUTO_SCHEDULE
+    if d == "sch_save":
+        temp = context.user_data.get('temp_sch', [])
+        settings = await load_settings()
+        us = get_user_settings(settings, chat_id)
+        us["schedule_hours"] = temp
+        us["yesterday_report_hours"] = [h for h in us.get("yesterday_report_hours", []) if h in temp]
+        settings[str(chat_id)] = us
+        await save_settings(settings)
+        txt = ', '.join(f'{h:02d}:00' for h in sorted(temp)) if temp else 'не выбраны'
+        await q.edit_message_text(f"✅ Сохранено. Часы рассылок: {txt}")
+        await q.message.reply_text("Выберите действие:", reply_markup=auto_kb())
+        return ConversationHandler.END
+    return WAITING_AUTO_SCHEDULE
+
+async def yesterday_cb(update, context):
+    q = update.callback_query; await q.answer(); d = q.data
+    chat_id = q.message.chat_id
+    if d == "yest_back":
+        await q.edit_message_text("Отменено.")
+        await q.message.reply_text("Выберите действие:", reply_markup=auto_kb())
+        return ConversationHandler.END
+    if d.startswith("yest_") and d[5:].isdigit():
+        h = int(d[5:])
+        temp = context.user_data.get('temp_yest', [])
+        if h in temp: temp.remove(h)
+        else: temp.append(h)
+        context.user_data['temp_yest'] = temp
+        settings = await load_settings()
+        us = get_user_settings(settings, chat_id)
+        sch = us.get("schedule_hours", [])
+        await q.edit_message_reply_markup(reply_markup=hours_kb(temp, "yest_", available=sch))
+        return WAITING_AUTO_YESTERDAY
+    if d == "yest_save":
+        temp = context.user_data.get('temp_yest', [])
+        settings = await load_settings()
+        us = get_user_settings(settings, chat_id)
+        us["yesterday_report_hours"] = temp
+        settings[str(chat_id)] = us
+        await save_settings(settings)
+        txt = ', '.join(f'{h:02d}:00' for h in sorted(temp)) if temp else 'не выбраны'
+        await q.edit_message_text(f"✅ Сохранено. Часы отчёта за Вчера: {txt}")
+        await q.message.reply_text("Выберите действие:", reply_markup=auto_kb())
+        return ConversationHandler.END
+    return WAITING_AUTO_YESTERDAY
+
+async def silence_cb(update, context):
+    q = update.callback_query; await q.answer(); d = q.data
+    chat_id = q.message.chat_id
+    if d == "sil_back":
+        await q.edit_message_text("Отменено.")
+        await q.message.reply_text("Выберите действие:", reply_markup=auto_kb())
+        return ConversationHandler.END
+    if d == "sil_disable":
+        settings = await load_settings()
+        us = get_user_settings(settings, chat_id)
+        us["silence_start"] = None; us["silence_end"] = None
+        settings[str(chat_id)] = us
+        await save_settings(settings)
+        await q.edit_message_text("✅ Режим тишины отключён.")
+        await q.message.reply_text("Выберите действие:", reply_markup=auto_kb())
+        return ConversationHandler.END
+    if d == "sil_edit":
+        await q.edit_message_text("Выберите час начала тишины:",
+                                  reply_markup=hours_kb_silence("sil_s_"))
+        return WAITING_AUTO_SILENCE_START
+    return ConversationHandler.END
+
+async def silence_start_cb(update, context):
+    q = update.callback_query; await q.answer(); d = q.data
+    chat_id = q.message.chat_id
+    if d == "sil_s_back":
+        await q.edit_message_text("Отменено.")
+        await q.message.reply_text("Выберите действие:", reply_markup=auto_kb())
+        return ConversationHandler.END
+    if d.startswith("sil_s_") and d[6:].isdigit():
+        h = int(d[6:])
+        context.user_data['temp_sil_s'] = h
+        await q.edit_message_text(f"Начало: {h:02d}:00\nТеперь конец:",
+                                  reply_markup=hours_kb_silence("sil_e_"))
+        return WAITING_AUTO_SILENCE_END
+    return WAITING_AUTO_SILENCE_START
+
+async def silence_end_cb(update, context):
+    q = update.callback_query; await q.answer(); d = q.data
+    chat_id = q.message.chat_id
+    if d == "sil_e_back":
+        await q.edit_message_text("Отменено.")
+        await q.message.reply_text("Выберите действие:", reply_markup=auto_kb())
+        return ConversationHandler.END
+    if d.startswith("sil_e_") and d[6:].isdigit():
+        h = int(d[6:])
+        s = context.user_data.get('temp_sil_s')
+        if s is None:
+            await q.edit_message_text("❌ Ошибка."); return ConversationHandler.END
+        settings = await load_settings()
+        us = get_user_settings(settings, chat_id)
+        us["silence_start"] = s; us["silence_end"] = h
+        settings[str(chat_id)] = us
+        await save_settings(settings)
+        await q.edit_message_text(f"✅ Тишина: с {s:02d}:00 до {h:02d}:00")
+        await q.message.reply_text("Выберите действие:", reply_markup=auto_kb())
+        context.user_data.pop('temp_sil_s', None)
+        return ConversationHandler.END
+    return WAITING_AUTO_SILENCE_END
+
+# ==================== АДМИНИСТРИРОВАНИЕ ====================
+async def admin_add_start(update, context):
+    if not is_admin(update.effective_chat.id): return
+    await update.message.reply_text("Введите ID (число) или @username:")
+    return WAITING_ADD_MANAGER
+
+async def admin_add_input(update, context):
+    if not is_admin(update.effective_chat.id): return ConversationHandler.END
+    t = update.message.text.strip()
+    if not t:
+        await update.message.reply_text("❌ Введите ID или @username.")
+        return WAITING_ADD_MANAGER
+    if t.isdigit():
+        uid = int(t)
+        try:
+            u = await context.bot.get_chat(uid)
+            un = u.username or ""; fn = u.first_name or ""; ln = u.last_name or ""
+        except Exception:
+            await update.message.reply_text(f"❌ Не найден ID {uid}. Напишите боту.")
+            return WAITING_ADD_MANAGER
+    else:
+        un = t.lstrip('@')
+        try:
+            u = await context.bot.get_chat(un)
+            uid = u.id; fn = u.first_name or ""; ln = u.last_name or ""
+        except Exception:
+            await update.message.reply_text(f"❌ Не найден @{un}.")
+            return WAITING_ADD_MANAGER
+    if uid == ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ Админ уже имеет доступ.")
+        return WAITING_ADD_MANAGER
+    context.user_data['new_m'] = {"id": uid, "username": un, "first_name": fn, "last_name": ln}
+    await update.message.reply_text("Введите телефон (или '-' пропустить):")
+    return WAITING_MANAGER_PHONE
+
+async def admin_add_phone(update, context):
+    if not is_admin(update.effective_chat.id): return ConversationHandler.END
+    ph = update.message.text.strip()
+    if ph == "-": ph = ""
+    d = context.user_data.get('new_m')
+    if not d:
+        await update.message.reply_text("❌ Потеряны данные."); return ConversationHandler.END
+    if add_manager(d["id"], d["username"], d["first_name"], d["last_name"], ph):
+        await update.message.reply_text(f"✅ Менеджер {d['id']} добавлен.")
+    else:
+        await update.message.reply_text(f"⚠️ Менеджер {d['id']} уже существует.")
+    context.user_data.pop('new_m', None)
+    await update.message.reply_text("Управление:", reply_markup=admin_kb())
+    return ConversationHandler.END
+
+async def admin_remove_start(update, context):
+    if not is_admin(update.effective_chat.id): return
+    await update.message.reply_text("Введите ID менеджера:")
+    return WAITING_REMOVE_MANAGER
+
+async def admin_remove_input(update, context):
+    if not is_admin(update.effective_chat.id): return ConversationHandler.END
+    try: uid = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ Введите число."); return WAITING_REMOVE_MANAGER
+    if uid == ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ Админа нельзя удалить."); return WAITING_REMOVE_MANAGER
+    if remove_manager(uid):
+        await update.message.reply_text(f"✅ Менеджер {uid} удалён.")
+    else:
+        await update.message.reply_text(f"❌ Менеджер {uid} не найден.")
+    await update.message.reply_text("Управление:", reply_markup=admin_kb())
+    return ConversationHandler.END
+
+async def admin_list(update, context):
+    if not is_admin(update.effective_chat.id): return
+    ms = load_managers()
+    if not ms:
+        await update.message.reply_text("Список менеджеров пуст.")
+        return
+    lines = ["📋 Список менеджеров:"]
+    for m in ms:
+        info = f"ID: {m.get('id')}"
+        if m.get('username'): info += f", @{m['username']}"
+        if m.get('first_name'): info += f", {m['first_name']}"
+        if m.get('phone'): info += f", 📞 {m['phone']}"
+        lines.append(info)
+    await update.message.reply_text("\n".join(lines))
+
+# ==================== ПЛАНИРОВЩИК ====================
+async def check_auto_reports(context: ContextTypes.DEFAULT_TYPE):
+    """Раз в 15 минут: рассылки по расписанию + напоминание в 12:00."""
+    now = datetime.datetime.now(MOSCOW_TZ)
+    cur_hour = now.hour
+    cur_date = now.strftime("%Y-%m-%d")
+    settings = await load_settings()
+
+    # 1. Напоминание в 12:00 для пользователей без настроенных рассылок
+    if cur_hour == 12:
+        recipients = [ADMIN_CHAT_ID] + [m["id"] for m in load_managers()]
+        for uid in set(recipients):
+            try:
+                us = get_user_settings(settings, uid)
+                if us.get("schedule_hours") and us.get("yesterday_report_hours"):
+                    continue
+                if us.get("last_reminder") == cur_date:
+                    continue
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text="⚠️ *Напоминание:* у вас не настроены автоматические рассылки.\n"
+                         "Зайдите в «🔔 Автоматические рассылки» и выберите часы.",
+                    parse_mode="Markdown")
+                us["last_reminder"] = cur_date
+                settings[str(uid)] = us
+                write_log(f"📨 Напоминание о настройке → {uid}")
+            except Exception as e:
+                write_log(f"⚠️ Не отправлено {uid}: {e}")
+        await save_settings(settings)
+
+    # 2. Рассылки отчётов по расписанию
+    for sid, us in settings.items():
+        try:
+            uid = int(sid)
+        except: continue
+        yest_hours = us.get("yesterday_report_hours", [])
+        if cur_hour not in yest_hours: continue
+
+        s = us.get("silence_start"); e = us.get("silence_end")
+        if s is not None and e is not None:
+            if s < e:
+                if s <= cur_hour < e: continue
+            else:
+                if cur_hour >= s or cur_hour < e: continue
+
+        last = us.get("last_sent")
+        if last:
+            try:
+                ld, lh = last.split()
+                if ld == cur_date and int(lh) == cur_hour:
+                    continue
+            except: pass
+
+        write_log(f"📤 Автоотчёт → {uid}")
+        try:
+            rpt = await build_today_report(include_yesterday=True)
+            await context.bot.send_message(chat_id=uid, text=rpt, parse_mode="Markdown")
+            us["last_sent"] = f"{cur_date} {cur_hour}"
+            settings[sid] = us
+            await save_settings(settings)
+        except Exception as e:
+            write_log(f"❌ Автоотчёт {uid}: {e}")
+
 async def cancel(update, context):
-    await update.message.reply_text("Отменено.", reply_markup=main_kb())
+    chat_id = update.effective_chat.id
+    await update.message.reply_text("Отменено.", reply_markup=main_kb(chat_id))
     return ConversationHandler.END
 
 # ==================== ЗАПУСК ====================
 def main():
     if not validate_env_vars(): sys.exit(1)
-    try:
-        os.makedirs("/app/data", exist_ok=True)
-        os.makedirs(DISK_CACHE_DIR, exist_ok=True)
-    except Exception as e:
-        print(f"⚠️ Не удалось создать /app/data: {e}")
+    _ensure_data_dir()
 
     write_log(f"🚀 Запуск (v{VERSION})")
     write_log(f"✅ OZON_CLIENT_ID: {mask_secret(OZON_CLIENT_ID)}")
     write_log(f"✅ OZON_API_KEY: {mask_secret(OZON_API_KEY)}")
     write_log(f"✅ TELEGRAM_BOT_TOKEN: {mask_secret(TELEGRAM_BOT_TOKEN)}")
     write_log(f"✅ ADMIN_CHAT_ID: {ADMIN_CHAT_ID}")
-    write_log(f"✅ Disk cache: {DISK_CACHE_DIR}")
-    write_log(f"✅ История версий: {VERSION_HISTORY_FILE}")
+    write_log(f"✅ Data dir: {DATA_DIR}")
     update_version_history(VERSION, CHANGELOG_MESSAGE)
 
     app = (Application.builder()
@@ -1602,11 +2094,25 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("version", version_command))
+    app.add_handler(CommandHandler("help", send_help))
     app.add_handler(CommandHandler("cancel", cancel))
 
-    app.add_handler(MessageHandler(filters.Text(["📊 Продажи за сегодня"]), today_report))
-    app.add_handler(MessageHandler(filters.Text(["📦 Топ товаров за сегодня"]), top_today))
+    # Главное меню
+    app.add_handler(MessageHandler(filters.Regex(
+        "^(📊 Отчёт по продажам|📦 Отчёт по товарам|🔔 Автоматические рассылки|"
+        "⚙️ Администрирование|📖 Справка)$"), handle_main_menu))
 
+    # Продажи
+    app.add_handler(MessageHandler(filters.Text(["📅 Продажи за сегодня"]), today_report))
+    app.add_handler(MessageHandler(filters.Text(["📦 Топ товаров за сегодня"]), top_today))
+    app.add_handler(MessageHandler(filters.Text(["📋 Список менеджеров"]), admin_list))
+
+    # Автоматические рассылки - маршрутизатор
+    app.add_handler(MessageHandler(filters.Regex(
+        "^(🕒 Выбор времени рассылок|📅 Добавление отчета за Вчера|"
+        "🔕 Режим тишины|📤 Отправить отчет за Вчера сейчас|🔙 Назад)$"), auto_menu_router))
+
+    # Диалоги
     conv_date = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📅 Выбрать дату"), date_menu)],
         states={WAITING_DATE_SINGLE: [CallbackQueryHandler(date_cb)]},
@@ -1660,11 +2166,54 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)])
 
+    conv_sch = ConversationHandler(
+        entry_points=[CallbackQueryHandler(schedule_cb, pattern="^sch_")],
+        states={WAITING_AUTO_SCHEDULE: [CallbackQueryHandler(schedule_cb, pattern="^sch_")]},
+        fallbacks=[CommandHandler("cancel", cancel)])
+
+    conv_yest = ConversationHandler(
+        entry_points=[CallbackQueryHandler(yesterday_cb, pattern="^yest_")],
+        states={WAITING_AUTO_YESTERDAY: [CallbackQueryHandler(yesterday_cb, pattern="^yest_")]},
+        fallbacks=[CommandHandler("cancel", cancel)])
+
+    conv_sil = ConversationHandler(
+        entry_points=[CallbackQueryHandler(silence_cb, pattern="^sil_")],
+        states={
+            WAITING_AUTO_SILENCE_START: [CallbackQueryHandler(silence_start_cb, pattern="^sil_s_")],
+            WAITING_AUTO_SILENCE_END: [CallbackQueryHandler(silence_end_cb, pattern="^sil_e_")],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)])
+
+    conv_add = ConversationHandler(
+        entry_points=[MessageHandler(filters.Text("➕ Добавить менеджера"), admin_add_start)],
+        states={
+            WAITING_ADD_MANAGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_input)],
+            WAITING_MANAGER_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_phone)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)])
+
+    conv_rm = ConversationHandler(
+        entry_points=[MessageHandler(filters.Text("➖ Удалить менеджера"), admin_remove_start)],
+        states={WAITING_REMOVE_MANAGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_remove_input)]},
+        fallbacks=[CommandHandler("cancel", cancel)])
+
     app.add_handler(conv_date)
     app.add_handler(conv_period)
     app.add_handler(conv_prod)
     app.add_handler(conv_dyn)
     app.add_handler(conv_pchart)
+    app.add_handler(conv_sch)
+    app.add_handler(conv_yest)
+    app.add_handler(conv_sil)
+    app.add_handler(conv_add)
+    app.add_handler(conv_rm)
+
+    # Планировщик
+    if app.job_queue:
+        app.job_queue.run_repeating(check_auto_reports, interval=900, first=10)
+        write_log("✅ Планировщик запущен (каждые 15 минут).")
+    else:
+        write_log("⚠️ JobQueue недоступен.")
 
     write_log("🚀 Бот готов.")
     app.run_polling(allowed_updates=Update.ALL_TYPES, timeout=30)
