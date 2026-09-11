@@ -29,8 +29,8 @@ from telegram.warnings import PTBUserWarning
 
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
-VERSION = "2.7.2"
-CHANGELOG_MESSAGE = "Исправлена обрезка длинных сообщений в Telegram: добавлена автоматическая разбивка длинных отчётов на несколько сообщений (лимит 4096 символов у Telegram). Теперь отчёты по продажам, товарам, рекламе, справочник расходов и рассылки приходят полностью, без потери данных."
+VERSION = "2.7.3"
+CHANGELOG_MESSAGE = "Исправлена обрезка длинных сообщений в Telegram (окончательно): сменён ключ кэша отчётов по рекламе (_v2 -> _v3), из-за чего старые обрезанные отчёты больше не подставляются. Добавлена команда /clearcache для сброса кэша вручную."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 60
@@ -313,6 +313,22 @@ async def save_to_cache(key, value):
         _api_cache[key] = value; _cache_timestamps[key] = time.time()
     disk_cache_set(key, value)
 
+def clear_all_cache():
+    """Полный сброс дискового и in-memory кэша."""
+    global _api_cache, _cache_timestamps
+    _api_cache = {}
+    _cache_timestamps = {}
+    try:
+        if os.path.isdir(DISK_CACHE_DIR):
+            for f in os.listdir(DISK_CACHE_DIR):
+                if f.endswith(".json"):
+                    try:
+                        os.remove(os.path.join(DISK_CACHE_DIR, f))
+                    except Exception as e:
+                        write_log(f"⚠️ Удаление {f}: {e}")
+    except Exception as e:
+        write_log(f"⚠️ Очистка дискового кэша: {e}")
+
 # ==================== НАСТРОЙКИ / МЕНЕДЖЕРЫ ====================
 def _ensure_data_dir():
     try:
@@ -462,9 +478,7 @@ def prev_period(df, dt):
 
 # ==================== РАЗБИВКА ДЛИННЫХ СООБЩЕНИЙ ====================
 def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> List[str]:
-    """Разбивает длинный текст на части по max_len символов, сохраняя переносы строк.
-    Telegram допускает ~4096 символов на сообщение; берём 4000 для запаса.
-    """
+    """Разбивает длинный текст на части по max_len символов, сохраняя переносы строк."""
     if not text:
         return [""]
     if len(text) <= max_len:
@@ -475,13 +489,10 @@ def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> List[str]:
         if len(remaining) <= max_len:
             parts.append(remaining)
             break
-        # Ищем последний перенос строки в пределах max_len
         split_pos = remaining.rfind('\n', 0, max_len)
         if split_pos <= 0:
-            # Нет переноса — ищем пробел
             split_pos = remaining.rfind(' ', 0, max_len)
         if split_pos <= 0:
-            # Совсем нет разделителей — режем жёстко
             split_pos = max_len
         chunk = remaining[:split_pos].rstrip()
         if not chunk:
@@ -508,7 +519,6 @@ async def _safe_edit(msg, text, parse_mode="Markdown"):
         except Exception as e2:
             write_log(f"⚠️ edit_text без parse_mode: {e2}")
     if not edited:
-        # Не смогли отредактировать — отправляем всё как новые сообщения
         for chunk in chunks:
             try:
                 await msg.reply_text(chunk, parse_mode=parse_mode)
@@ -518,7 +528,6 @@ async def _safe_edit(msg, text, parse_mode="Markdown"):
                 except Exception as e3:
                     write_log(f"⚠️ reply_text fallback: {e3}")
         return
-    # Отправляем остальные части новыми сообщениями
     for chunk in chunks[1:]:
         try:
             await msg.reply_text(chunk, parse_mode=parse_mode)
@@ -529,7 +538,6 @@ async def _safe_edit(msg, text, parse_mode="Markdown"):
                 write_log(f"⚠️ reply_text: {e2}")
 
 async def send_long_message(message, text, parse_mode="Markdown", reply_markup=None):
-    """Отправляет длинный текст от имени Message, разбивая на части."""
     chunks = split_message(text)
     for i, chunk in enumerate(chunks):
         markup = reply_markup if i == len(chunks) - 1 else None
@@ -543,7 +551,6 @@ async def send_long_message(message, text, parse_mode="Markdown", reply_markup=N
                 write_log(f"⚠️ send_long_message fallback: {e2}")
 
 async def send_long_to_bot(bot, chat_id, text, parse_mode="Markdown"):
-    """Отправляет длинный текст через bot.send_message, разбивая на части."""
     chunks = split_message(text)
     for chunk in chunks:
         try:
@@ -1277,7 +1284,7 @@ def ad_build_report(cur_total, prev_total, cur_camps, prev_camps,
         lines.append(Lc("CTR, %", "ctr", ad_fmt_pct, True))
         lines.append("")
 
-    # Без обрезки: длинный текст будет разбит функцией split_message
+    # БЕЗ ОБРЕЗКИ: длинный текст будет разбит функцией split_message
     return "\n".join(lines)
 
 async def _get_all_campaign_data(token, status_msg=None):
@@ -1296,7 +1303,8 @@ async def _get_all_campaign_data(token, status_msg=None):
     return campaigns, skus_by_campaign
 
 async def build_ad_report_month(status_msg=None):
-    cache_key = f"ad_report_month_{get_moscow_today().isoformat()}_v2"
+    # ВАЖНО: ключ кэша содержит _v3 — старые обрезанные отчёты _v2 больше не подтянутся
+    cache_key = f"ad_report_month_{get_moscow_today().isoformat()}_v3"
     cached = await get_from_cache(cache_key)
     if cached is not None: return cached
     today = get_moscow_today()
@@ -1333,7 +1341,8 @@ async def build_ad_report_month(status_msg=None):
     return report
 
 async def build_ad_report_period(date_from: str, date_to: str, period_name: str, status_msg=None):
-    cache_key = f"ad_report_{date_from}_{date_to}_v2"
+    # ВАЖНО: ключ кэша содержит _v3 — старые обрезанные отчёты _v2 больше не подтянутся
+    cache_key = f"ad_report_{date_from}_{date_to}_v3"
     cached = await get_from_cache(cache_key)
     if cached is not None: return cached
     if status_msg: await _safe_edit(status_msg, "⏳ Загружаю токен...")
@@ -1861,6 +1870,18 @@ async def check_access_cmd(update, context):
 async def version_command(update, context):
     await update.message.reply_text(f"🤖 Версия: {VERSION}")
 
+async def clearcache_command(update, context):
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await update.message.reply_text("⛔ Только для администратора.")
+        return
+    try:
+        clear_all_cache()
+        await update.message.reply_text("✅ Кэш очищен. Следующие отчёты будут построены заново.")
+    except Exception as e:
+        write_log(f"❌ clearcache: {e}")
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat_id = update.effective_chat.id
@@ -2298,7 +2319,6 @@ async def show_expense_types(update, context):
         for tid, name, cnt, sm in unknown[:30]:
             lines.append(f"  `{tid}` → {name}" + (f" ({cnt}× / {sm:,.0f} ₽)" if cnt > 0 else ""))
     text = "\n".join(lines)
-    # Без обрезки: длинный текст разбивается через send_long_message
     await send_long_message(update.message, text, parse_mode="Markdown",
                             reply_markup=expense_types_kb())
 
@@ -2346,7 +2366,8 @@ async def send_help(update, context):
             "• ➕ Добавить менеджера.\n"
             "• ➖ Удалить менеджера.\n"
             "• 📋 Список менеджеров.\n"
-            "• 📚 Справочник расходов.\n\n"
+            "• 📚 Справочник расходов.\n"
+            "• /clearcache – сбросить кэш API (принудительное обновление данных).\n\n"
             f"🤖 Версия бота: {VERSION}"
         )
     else:
@@ -3345,6 +3366,7 @@ def main():
     app.add_handler(CommandHandler("version", version_command))
     app.add_handler(CommandHandler("help", send_help))
     app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("clearcache", clearcache_command))
     app.add_handler(MessageHandler(filters.Regex(
         "^(📊 Отчёт по продажам|📦 Отчёт по товарам|📈 Отчёт по рекламе|"
         "🔔 Автоматические рассылки|⚙️ Администрирование|"
@@ -3354,7 +3376,6 @@ def main():
     app.add_handler(MessageHandler(filters.Text(["📅 Топ товаров за сегодня"]), top_today))
     app.add_handler(MessageHandler(filters.Text(["📋 Список менеджеров"]), admin_list))
     app.add_handler(MessageHandler(filters.Text(["📅 Реклама за текущий месяц"]), ad_report_month_handler))
-    # ВАЖНО: НЕ добавляем тут MessageHandler для "📅 Реклама за период" и "📈 Динамика по рекламе" — они в ConversationHandler
     app.add_handler(MessageHandler(filters.Regex(
         "^(🕒 Выбор времени рассылок|📅 Добавление отчета за Вчера|"
         "🔕 Режим тишины|📤 Отправить отчет за Вчера сейчас|🔙 Назад)$"), auto_menu_router))
