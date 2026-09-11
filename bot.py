@@ -29,8 +29,8 @@ from telegram.warnings import PTBUserWarning
 
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
-VERSION = "2.6.0"
-CHANGELOG_MESSAGE = "Добавлен 'Отчёт по рекламе': раздел 'Текущий месяц' с VS-сравнением и индикаторами 🟢/🔴."
+VERSION = "2.6.1"
+CHANGELOG_MESSAGE = "Отчёт по рекламе: пропуск архивных кампаний, тихий 404 для /objects, прогресс-сообщения."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 60
@@ -40,7 +40,6 @@ POSTINGS_RATE = 0.5
 FINANCE_RATE = 0.5
 PERFORMANCE_RATE = 1.0
 CACHE_TTL_SECONDS = 3600
-AD_REPORT_CACHE_TTL = 1800  # 30 минут для отчёта по рекламе
 DATA_DIR = "/app/data"
 DISK_CACHE_DIR = "/app/data/cache"
 VERSION_HISTORY_FILE = "/app/data/version_history.json"
@@ -89,8 +88,6 @@ WAITING_AUTO_YESTERDAY = 111
 WAITING_AUTO_SILENCE_START = 112
 WAITING_AUTO_SILENCE_END = 113
 
-WAITING_AD_MENU = 130
-
 # ==================== ГЛОБАЛЬНЫЕ ====================
 _http_session = None
 _postings_sem = None
@@ -104,7 +101,6 @@ _api_cache = {}
 _cache_timestamps = {}
 _settings_lock = asyncio.Lock()
 _expense_types_cache = None
-_expense_types_lock = asyncio.Lock()
 
 OZON_CLIENT_ID = os.getenv("OZON_CLIENT_ID")
 OZON_API_KEY = os.getenv("OZON_API_KEY")
@@ -120,14 +116,9 @@ OZON_FINANCE_ACCRUAL_BY_DAY_URL = "https://api-seller.ozon.ru/v1/finance/accrual
 MOSCOW_TZ = datetime.timezone(datetime.timedelta(hours=3))
 
 DEFAULT_EXPENSE_TYPES = {
-    "1": "Обработка товара",
-    "12": "Прочие услуги Ozon",
-    "29": "Последняя миля",
-    "32": "Логистика",
-    "76": "Внешние услуги Ozon",
-    "98": "Доп. услуги отправления",
+    "1": "Обработка товара", "12": "Прочие услуги Ozon", "29": "Последняя миля",
+    "32": "Логистика", "76": "Внешние услуги Ozon", "98": "Доп. услуги отправления",
 }
-
 CATEGORY_FALLBACK = {"ITEM": "Услуги по товарам", "NON_ITEM": "Внешние услуги Ozon",
                      "POSTING": "Услуги отправления", "CONTAINER": "Контейнеры"}
 METRIC_LABELS = {
@@ -413,8 +404,7 @@ def indicator(value_current, value_prev, better_is_higher):
     if delta is None: return ""
     if better_is_higher:
         return "🟢" if delta > 0 else ("🔴" if delta < 0 else "")
-    else:
-        return "🟢" if delta < 0 else ("🔴" if delta > 0 else "")
+    return "🟢" if delta < 0 else ("🔴" if delta > 0 else "")
 
 def validate_date(date_str):
     try:
@@ -476,7 +466,7 @@ async def close_http_session(app):
         write_log("🔒 HTTP закрыта.")
 
 # ==================== API ====================
-async def api_request_with_retry(url, headers, payload=None, method='POST', kind='finance'):
+async def api_request_with_retry(url, headers, payload=None, method='POST', kind='finance', silent_404=False):
     global _http_session
     if kind == 'perf': sem, rate = _perf_sem, _perf_rate
     elif kind == 'postings': sem, rate = _postings_sem, _postings_rate
@@ -488,28 +478,36 @@ async def api_request_with_retry(url, headers, payload=None, method='POST', kind
                 if method == 'POST':
                     async with _http_session.post(url, headers=headers, json=payload) as resp:
                         body = await resp.text()
+                        if resp.status == 404 and silent_404:
+                            return None
                         if resp.status == 429:
                             w = API_RETRY_DELAY * (2 ** attempt)
                             write_log(f"⚠️ 429, ждём {w}с"); await asyncio.sleep(w); continue
                         if resp.status >= 400:
-                            write_log(f"❌ API {resp.status}: {body[:300]}")
+                            if not silent_404:
+                                write_log(f"❌ API {resp.status}: {body[:300]}")
                             raise aiohttp.ClientResponseError(resp.request_info, resp.history,
                                 status=resp.status, message=body[:200])
                         return json.loads(body)
                 else:
                     async with _http_session.get(url, headers=headers, params=payload) as resp:
                         body = await resp.text()
+                        if resp.status == 404 and silent_404:
+                            return None
                         if resp.status == 429:
                             w = API_RETRY_DELAY * (2 ** attempt)
                             write_log(f"⚠️ 429, ждём {w}с"); await asyncio.sleep(w); continue
                         if resp.status >= 400:
-                            write_log(f"❌ API {resp.status}: {body[:300]}")
+                            if not silent_404:
+                                write_log(f"❌ API {resp.status}: {body[:300]}")
                             raise aiohttp.ClientResponseError(resp.request_info, resp.history,
                                 status=resp.status, message=body[:200])
                         return json.loads(body)
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 if attempt == API_RETRY_ATTEMPTS - 1:
-                    write_log(f"❌ API failed: {e}"); raise
+                    if not silent_404:
+                        write_log(f"❌ API failed: {e}")
+                    raise
                 await asyncio.sleep(API_RETRY_DELAY * (attempt + 1))
         raise Exception("API failed")
 
@@ -551,13 +549,11 @@ async def fetch_postings(date_from, date_to):
         if not data.get("has_next"): break
         cursor = data.get("cursor", "")
         if not cursor or len(postings) < LIMIT: break
-        if page % 20 == 0:
-            write_log(f"📦 FBO: загружено {len(all_p)} записей (стр. {page})")
     write_log(f"📦 Отгрузок: {len(all_p)} за {date_from}–{date_to}")
     await save_to_cache(cache_key, all_p)
     return all_p
 
-# ==================== РЕКЛАМА (общая сумма расходов) ====================
+# ==================== РЕКЛАМА (общая сумма) ====================
 async def _fetch_advertising_expense_single(date_from, date_to):
     token = await get_performance_token()
     if not token: return 0.0
@@ -584,45 +580,35 @@ async def fetch_advertising_expense(date_from, date_to):
     cache_key = f"ad_{date_from}_{date_to}"
     cached = await get_from_cache(cache_key)
     if cached is not None: return cached
-
     start_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d").date()
     end_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d").date()
     today = get_moscow_today()
     if start_dt > today: return 0.0
     if end_dt > today: end_dt = today
-
     total_days = (end_dt - start_dt).days + 1
-
     if total_days <= AD_CHUNK_DAYS:
         result = await _fetch_advertising_expense_single(date_from, end_dt.isoformat())
         await save_to_cache(cache_key, result)
         return result
-
     total = 0.0
     chunks_count = (total_days + AD_CHUNK_DAYS - 1) // AD_CHUNK_DAYS
-    write_log(f"📢 Реклама: разбивка {date_from}–{date_to} на {chunks_count} частей по {AD_CHUNK_DAYS} дней")
+    write_log(f"📢 Реклама: разбивка {date_from}–{date_to} на {chunks_count} частей")
     cur = start_dt
     chunk_idx = 0
     while cur <= end_dt:
         chunk_idx += 1
         chunk_end = min(cur + datetime.timedelta(days=AD_CHUNK_DAYS - 1), end_dt)
-        chunk_from = cur.isoformat()
-        chunk_to = chunk_end.isoformat()
-        write_log(f"📢 Реклама [{chunk_idx}/{chunks_count}]: {chunk_from}–{chunk_to}")
-        part = await _fetch_advertising_expense_single(chunk_from, chunk_to)
+        part = await _fetch_advertising_expense_single(cur.isoformat(), chunk_end.isoformat())
         total += part
         cur = chunk_end + datetime.timedelta(days=1)
-
-    write_log(f"📢 Реклама: итого {total:.2f} ₽ за {date_from}–{date_to}")
     await save_to_cache(cache_key, total)
     return total
 
-# ==================== ФИНАНСЫ (по дням) ====================
+# ==================== ФИНАНСЫ ====================
 async def fetch_finance_accruals_by_day(date_str):
     cache_key = f"fin_day_{date_str}"
     cached = await get_from_cache(cache_key)
-    if cached is not None:
-        return cached
+    if cached is not None: return cached
     headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY, "Content-Type": "application/json"}
     payload = {"date": date_str}; all_a = []
     while True:
@@ -649,21 +635,16 @@ async def fetch_finance_transactions(date_from, date_to, status_msg=None):
     today = get_moscow_today()
     if start > today: return []
     if end > today: end = today
-
     days = []; cur = start
     while cur <= end:
         days.append(cur.isoformat()); cur += datetime.timedelta(days=1)
-
     all_a = []; missing = []
     for d in days:
         c = disk_cache_get(f"fin_day_{d}")
-        if c is not None:
-            all_a.extend(c)
-        else:
-            missing.append(d)
-
+        if c is not None: all_a.extend(c)
+        else: missing.append(d)
     if missing:
-        write_log(f"💰 Финансы: {len(missing)}/{len(days)} дней новых ({date_from}–{date_to})")
+        write_log(f"💰 Финансы: {len(missing)}/{len(days)} дней новых")
         total = len(missing)
         for i, d in enumerate(missing):
             if status_msg and (i % 30 == 0 or i == total - 1):
@@ -672,13 +653,9 @@ async def fetch_finance_transactions(date_from, date_to, status_msg=None):
                         f"⏳ Финансы: загружено {i+1}/{total} дней\n"
                         f"_(всего {len(days)} дн., {date_from} – {date_to})_",
                         parse_mode="Markdown")
-                except Exception:
-                    pass
+                except Exception: pass
             day_acc = await fetch_finance_accruals_by_day(d)
             all_a.extend(day_acc)
-    else:
-        write_log(f"💰 Финансы: все {len(days)} дней из кэша")
-
     write_log(f"💰 Начислений: {len(all_a)}")
     await save_to_cache(cache_key, all_a)
     return all_a
@@ -688,7 +665,6 @@ def aggregate_finance_expenses(accruals):
     result = {}
     def add(name, amount):
         if amount > 0: result[name] = result.get(name, 0) + amount
-
     for item in accruals:
         if not isinstance(item, dict): continue
         cat = item.get("accrued_category", "")
@@ -702,9 +678,7 @@ def aggregate_finance_expenses(accruals):
                 for svc in delivery.get("services", []) or []:
                     tid = svc.get("type_id"); amt = parse_money(svc.get("accrued"))
                     if amt < 0:
-                        name = type_name(tid, cat)
-                        add(name, abs(amt))
-                        register_expense_hit(tid, abs(amt))
+                        name = type_name(tid, cat); add(name, abs(amt)); register_expense_hit(tid, abs(amt))
             continue
         if cat == "ITEM":
             i_fees = item.get("item_fees") or {}
@@ -712,17 +686,13 @@ def aggregate_finance_expenses(accruals):
                 for fee in grp.get("fees", []) or []:
                     tid = fee.get("type_id"); amt = parse_money(fee.get("accrued"))
                     if amt < 0:
-                        name = type_name(tid, cat)
-                        add(name, abs(amt))
-                        register_expense_hit(tid, abs(amt))
+                        name = type_name(tid, cat); add(name, abs(amt)); register_expense_hit(tid, abs(amt))
             continue
         if cat == "NON_ITEM":
             non = item.get("non_item_fee") or {}
             tid = non.get("type_id"); amt = parse_money(non.get("accrued"))
             if amt < 0:
-                name = type_name(tid, cat)
-                add(name, abs(amt))
-                register_expense_hit(tid, abs(amt))
+                name = type_name(tid, cat); add(name, abs(amt)); register_expense_hit(tid, abs(amt))
             continue
         if cat == "CONTAINER":
             cont = item.get("container_fees") or {}
@@ -731,7 +701,6 @@ def aggregate_finance_expenses(accruals):
             continue
         total = parse_money(item.get("total_amount"))
         if total < 0: add(cat or "Прочее", abs(total))
-
     flush_expense_types()
     return result
 
@@ -777,8 +746,7 @@ def aggregate_products(postings, df, dt, tl=None, ad=None):
         st = p.get("status", "")
         for prod in p.get("products", []):
             if not isinstance(prod, dict): continue
-            sku = str(prod.get("sku", "0"))
-            name = prod.get("name", "—"); oid = prod.get("offer_id", "")
+            sku = str(prod.get("sku", "0")); name = prod.get("name", "—"); oid = prod.get("offer_id", "")
             q = int(prod.get("quantity", 0)); price = parse_price(prod)
             if sku not in stats:
                 stats[sku] = {"name": name[:60], "offer_id": oid,
@@ -899,8 +867,7 @@ async def generate_product_chart(sku, metric, years):
 def ad_to_float(val, default=0.0):
     if val is None: return default
     if isinstance(val, (int, float)): return float(val)
-    if isinstance(val, dict):
-        val = val.get("amount", val.get("value", 0))
+    if isinstance(val, dict): val = val.get("amount", val.get("value", 0))
     s = str(val).strip().replace(" ", "").replace(",", ".")
     try: return float(s)
     except (ValueError, TypeError): return default
@@ -925,20 +892,18 @@ async def ad_fetch_campaigns(token) -> List[Dict]:
     return []
 
 async def ad_fetch_campaign_objects(token, campaign_id: str) -> List[str]:
+    """Тихий 404 для архивных кампаний."""
     url = f"https://api-performance.ozon.ru/api/client/campaign/{campaign_id}/objects"
     headers = {"Authorization": f"Bearer {token}"}
     try:
-        data = await api_request_with_retry(url, headers, method='GET', kind='perf')
+        data = await api_request_with_retry(url, headers, method='GET', kind='perf', silent_404=True)
+        if not data: return []
         result = []
         if isinstance(data, dict):
             for item in data.get("list", []):
                 if isinstance(item, dict) and item.get("id"):
                     result.append(str(item["id"]))
         return result
-    except aiohttp.ClientResponseError as e:
-        if e.status == 404:
-            return []
-        return []
     except Exception:
         return []
 
@@ -952,8 +917,7 @@ async def ad_fetch_stats(token, campaign_ids: List[str], date_from: str, date_to
     url = base + "?" + "&".join(parts)
     try:
         data = await api_request_with_retry(url, headers, method='GET', kind='perf')
-        rows = data.get("rows", []) if isinstance(data, dict) else []
-        return rows
+        return data.get("rows", []) if isinstance(data, dict) else []
     except Exception as e:
         write_log(f"❌ Статистика рекламы: {e}")
         return []
@@ -980,8 +944,7 @@ def ad_aggregate_total(rows, skus_by_campaign, postings):
     for r in rows:
         cid = str(r.get("id", ""))
         bid = ad_to_float(r.get("clickPrice"))
-        if bid > 0:
-            total_bid += bid; bid_count += 1
+        if bid > 0: total_bid += bid; bid_count += 1
         total_expense += ad_to_float(r.get("moneySpent"))
         total_ad_sales += ad_to_float(r.get("ordersMoney"))
         total_views += ad_to_int(r.get("views"))
@@ -1018,20 +981,13 @@ def ad_aggregate_by_campaign(rows, skus_by_campaign, postings):
         skus = skus_by_campaign.get(cid, [])
         total_sales = ad_sum_sales_by_sku_set(postings, set(skus))
         result.append({
-            "campaign_id": cid,
-            "campaign_name": r.get("title", cid),
-            "skus": skus,
+            "campaign_id": cid, "campaign_name": r.get("title", cid), "skus": skus,
             "avg_bid": click_price,
             "avg_cpc": expense / clicks if clicks > 0 else 0.0,
-            "ad_sales": ad_sales,
-            "total_sales": total_sales,
-            "expense": expense,
+            "ad_sales": ad_sales, "total_sales": total_sales, "expense": expense,
             "drr_ad": (expense / ad_sales * 100) if ad_sales > 0 else None,
             "drr_total": (expense / total_sales * 100) if total_sales > 0 else None,
-            "impressions": views,
-            "clicks": clicks,
-            "carts": carts,
-            "orders": orders,
+            "impressions": views, "clicks": clicks, "carts": carts, "orders": orders,
             "ctr": (clicks / views * 100) if views > 0 else 0.0,
         })
     return result
@@ -1039,12 +995,10 @@ def ad_aggregate_by_campaign(rows, skus_by_campaign, postings):
 def ad_indicator(cur, prev, better_is_higher=True):
     if cur is None or prev is None: return ""
     if prev == 0 and cur == 0: return ""
-    if prev == 0:
-        return "🟢" if cur > 0 else "🔴"
+    if prev == 0: return "🟢" if cur > 0 else "🔴"
     delta = (cur - prev) / abs(prev)
     if delta == 0: return ""
-    if better_is_higher:
-        return "🟢" if delta > 0 else "🔴"
+    if better_is_higher: return "🟢" if delta > 0 else "🔴"
     return "🟢" if delta < 0 else "🔴"
 
 def ad_fmt_f(val):
@@ -1130,12 +1084,16 @@ def ad_build_report(cur_total, prev_total, cur_camps, prev_camps, period_label, 
         lines.append("")
 
     text = "\n".join(lines)
-    if len(text) > 4000:
-        text = text[:3950] + "\n\n_…сообщение обрезано_"
+    if len(text) > 4000: text = text[:3950] + "\n\n_…сообщение обрезано_"
     return text
 
-async def build_ad_report_month():
-    """Формирует отчёт по рекламе за текущий месяц vs аналогичный период прошлого месяца."""
+async def _safe_edit(msg, text, parse_mode="Markdown"):
+    try:
+        await msg.edit_text(text, parse_mode=parse_mode)
+    except Exception as e:
+        write_log(f"⚠️ edit_text: {e}")
+
+async def build_ad_report_month(status_msg=None):
     cache_key = f"ad_report_month_{get_moscow_today().isoformat()}"
     cached = await get_from_cache(cache_key)
     if cached is not None:
@@ -1146,33 +1104,53 @@ async def build_ad_report_month():
     yesterday = today - datetime.timedelta(days=1)
     cur_from = today.replace(day=1)
     cur_to = yesterday
-
     days_count = (cur_to - cur_from).days + 1
     prev_month_end = cur_from - datetime.timedelta(days=1)
     prev_from = prev_month_end.replace(day=1)
     prev_to = prev_from + datetime.timedelta(days=days_count - 1)
-    if prev_to > prev_month_end:
-        prev_to = prev_month_end
+    if prev_to > prev_month_end: prev_to = prev_month_end
 
     write_log(f"📈 Отчёт по рекламе: текущий {cur_from}–{cur_to}, предыдущий {prev_from}–{prev_to}")
+
+    if status_msg:
+        await _safe_edit(status_msg, "⏳ Загружаю токен Performance API...")
 
     token = await get_performance_token()
     if not token:
         return "❌ Не удалось получить токен Performance API"
 
+    if status_msg:
+        await _safe_edit(status_msg, "⏳ Загружаю список кампаний...")
+
     campaigns = await ad_fetch_campaigns(token)
     if not campaigns:
         return "❌ Кампании не найдены"
 
-    skus_by_campaign = {}
+    # Фильтруем: только активные (running)
+    running = []
     for c in campaigns:
+        state = c.get("state", "")
+        if state == "CAMPAIGN_STATE_RUNNING" or not state:
+            running.append(c)
+    write_log(f"📋 Кампаний: всего {len(campaigns)}, активных {len(running)}")
+
+    if status_msg:
+        await _safe_edit(status_msg, f"⏳ Собираю SKU кампаний (активных: {len(running)})...")
+
+    skus_by_campaign = {}
+    for i, c in enumerate(running):
         cid = str(c.get("id", ""))
         if not cid: continue
+        if status_msg and (i % 3 == 0 or i == len(running) - 1):
+            await _safe_edit(status_msg, f"⏳ SKU кампаний: {i+1}/{len(running)}...")
         objs = await ad_fetch_campaign_objects(token, cid)
-        if objs:
-            skus_by_campaign[cid] = objs
+        if objs: skus_by_campaign[cid] = objs
+    write_log(f"🗂 SKU собраны для {len(skus_by_campaign)} кампаний")
 
-    campaign_ids = [str(c.get("id")) for c in campaigns if c.get("id")]
+    campaign_ids = [str(c.get("id")) for c in running if c.get("id")]
+
+    if status_msg:
+        await _safe_edit(status_msg, "⏳ Загружаю статистику и заказы...")
 
     cur_rows, prev_rows, cur_postings, prev_postings = await asyncio.gather(
         ad_fetch_stats(token, campaign_ids, cur_from.isoformat(), cur_to.isoformat()),
@@ -1181,16 +1159,16 @@ async def build_ad_report_month():
         fetch_postings(prev_from.isoformat(), prev_to.isoformat()),
     )
 
-    has_prev = bool(prev_rows) and any(ad_to_int(r.get("views")) > 0 for r in prev_rows)
+    if status_msg:
+        await _safe_edit(status_msg, "⏳ Формирую отчёт...")
 
+    has_prev = bool(prev_rows) and any(ad_to_int(r.get("views")) > 0 for r in prev_rows)
     cur_total = ad_aggregate_total(cur_rows, skus_by_campaign, cur_postings)
     prev_total = ad_aggregate_total(prev_rows, skus_by_campaign, prev_postings)
     cur_camps = ad_aggregate_by_campaign(cur_rows, skus_by_campaign, cur_postings)
     prev_camps = ad_aggregate_by_campaign(prev_rows, skus_by_campaign, prev_postings)
-
     period_label = cur_to.strftime("%d.%m.%Y")
-    report = ad_build_report(cur_total, prev_total, cur_camps, prev_camps,
-                            period_label, has_prev)
+    report = ad_build_report(cur_total, prev_total, cur_camps, prev_camps, period_label, has_prev)
     await save_to_cache(cache_key, report)
     return report
 
@@ -1231,39 +1209,28 @@ def format_products_summary(products):
 
 def format_period_comparison(cur, prev, name):
     lines = [f"📊 *Продажи за {name}*", ""]
-    cur_os = cur.get("ordered_sum", 0); prev_os = prev.get("ordered_sum", 0)
-    cur_ou = cur.get("ordered_units", 0); prev_ou = prev.get("ordered_units", 0)
-    lines.append("🛒 *Заказано*")
-    lines.append(f"  На сумму: {fmt_num(cur_os)} ₽ {indicator(cur_os, prev_os, True)}")
-    lines.append(f"  Штук: {fmt_int(cur_ou)} {indicator(cur_ou, prev_ou, True)}")
-    lines.append("vs предыдущий период:")
-    lines.append(f"  На сумму: {fmt_num(prev_os)} ₽")
-    lines.append(f"  Штук: {fmt_int(prev_ou)}")
-    lines.append("")
-    cur_ds = cur.get("delivered_sum", 0); prev_ds = prev.get("delivered_sum", 0)
-    cur_du = cur.get("delivered_units", 0); prev_du = prev.get("delivered_units", 0)
-    lines.append("📦 *Доставлено*")
-    lines.append(f"  На сумму: {fmt_num(cur_ds)} ₽ {indicator(cur_ds, prev_ds, True)}")
-    lines.append(f"  Штук: {fmt_int(cur_du)} {indicator(cur_du, prev_du, True)}")
-    lines.append("vs предыдущий период:")
-    lines.append(f"  На сумму: {fmt_num(prev_ds)} ₽")
-    lines.append(f"  Штук: {fmt_int(prev_du)}")
-    lines.append("")
-    cur_cs = cur.get("canceled_sum", 0); prev_cs = prev.get("canceled_sum", 0)
-    cur_cu = cur.get("canceled_units", 0); prev_cu = prev.get("canceled_units", 0)
-    cur_cr = (cur_cu / cur_du * 100) if cur_du > 0 else None
-    prev_cr = (prev_cu / prev_du * 100) if prev_du > 0 else None
-    cur_cr_txt = f"{cur_cr:.2f}%" if cur_cr is not None else "∞"
-    prev_cr_txt = f"{prev_cr:.2f}%" if prev_cr is not None else "∞"
-    lines.append("❌ *Отменено*")
-    lines.append(f"  На сумму: {fmt_num(cur_cs)} ₽ {indicator(cur_cs, prev_cs, False)}")
-    lines.append(f"  Штук: {fmt_int(cur_cu)} {indicator(cur_cu, prev_cu, False)}")
-    lines.append(f"  Доля отмен: {cur_cr_txt} {indicator(cur_cr, prev_cr, False)}")
-    lines.append("vs предыдущий период:")
-    lines.append(f"  На сумму: {fmt_num(prev_cs)} ₽")
-    lines.append(f"  Штук: {fmt_int(prev_cu)}")
-    lines.append(f"  Доля отмен: {prev_cr_txt}")
-    lines.append("")
+    for label, key_sum, key_units, better_sum in [
+        ("🛒 *Заказано*", "ordered_sum", "ordered_units", True),
+        ("📦 *Доставлено*", "delivered_sum", "delivered_units", True),
+        ("❌ *Отменено*", "canceled_sum", "canceled_units", False)]:
+        cs = cur.get(key_sum, 0); ps = prev.get(key_sum, 0)
+        cu = cur.get(key_units, 0); pu = prev.get(key_units, 0)
+        lines.append(label)
+        lines.append(f"  На сумму: {fmt_num(cs)} ₽ {indicator(cs, ps, better_sum)}")
+        lines.append(f"  Штук: {fmt_int(cu)} {indicator(cu, pu, better_sum)}")
+        if label.startswith("❌"):
+            cdu = cur.get("delivered_units", 0); pdu = prev.get("delivered_units", 0)
+            cr = (cu / cdu * 100) if cdu > 0 else None
+            pr = (pu / pdu * 100) if pdu > 0 else None
+            crt = f"{cr:.2f}%" if cr is not None else "∞"
+            prt = f"{pr:.2f}%" if pr is not None else "∞"
+            lines.append(f"  Доля отмен: {crt} {indicator(cr, pr, False)}")
+        lines.append("vs предыдущий период:")
+        lines.append(f"  На сумму: {fmt_num(ps)} ₽")
+        lines.append(f"  Штук: {fmt_int(pu)}")
+        if label.startswith("❌"):
+            lines.append(f"  Доля отмен: {prt}")
+        lines.append("")
     cur_ad = cur.get("ad_expense", 0); prev_ad = prev.get("ad_expense", 0)
     cur_drr = cur.get("drr"); prev_drr = prev.get("drr")
     cur_edrr = cur.get("effective_drr"); prev_edrr = prev.get("effective_drr")
@@ -1274,7 +1241,7 @@ def format_period_comparison(cur, prev, name):
     lines.append("📢 *Реклама*")
     lines.append(f"  Расходы: {fmt_num(cur_ad)} ₽ {indicator(cur_ad, prev_ad, False)}")
     lines.append(f"  ДРР (общий): {cur_drr_txt} {indicator(cur_drr, prev_drr, False)}")
-    lines.append(f"  ДРР (по доставленным): {cur_edrr_txt} {indicator(cur_edrr, prev_edrr, False)}")
+    lines.append(f"  ДРР (по доставленным): {cur_eddr_txt if False else cur_edrr_txt} {indicator(cur_edrr, prev_edrr, False)}")
     lines.append("vs предыдущий период:")
     lines.append(f"  Расходы: {fmt_num(prev_ad)} ₽")
     lines.append(f"  ДРР (общий): {prev_drr_txt}")
@@ -1402,12 +1369,10 @@ async def build_today_report(include_yesterday=False):
 
     parts = []
     if include_yesterday:
-        parts.append(blk_yesterday())
-        parts.append(blk_month())
+        parts.append(blk_yesterday()); parts.append(blk_month())
         header = "📊 *Отчёт за Вчера*"
     else:
-        parts.append(blk_today())
-        parts.append(blk_month())
+        parts.append(blk_today()); parts.append(blk_month())
         header = "📊 *Продажи за сегодня*"
     parts.append(format_expense_block(exp_t, "Расходы сегодня"))
     parts.append(format_expense_block(exp_m, "Расходы за текущий месяц"))
@@ -1416,7 +1381,6 @@ async def build_today_report(include_yesterday=False):
 async def build_period_report(df, dt, name, status_msg=None):
     pf, pt = prev_period(df, dt)
     write_log(f"📊 Период {df}–{dt}, предыдущий {pf}–{pt}")
-
     missing_days = set()
     for d_from, d_to in [(df, dt), (pf, pt)]:
         cur_d = datetime.datetime.strptime(d_from, "%Y-%m-%d").date()
@@ -1425,22 +1389,15 @@ async def build_period_report(df, dt, name, status_msg=None):
         if cur_d > today: continue
         if end_d > today: end_d = today
         while cur_d <= end_d:
-            key = f"fin_day_{cur_d.isoformat()}"
-            if disk_cache_get(key) is None:
+            if disk_cache_get(f"fin_day_{cur_d.isoformat()}") is None:
                 missing_days.add(cur_d.isoformat())
             cur_d += datetime.timedelta(days=1)
-
     if missing_days and status_msg:
-        est_min_low = len(missing_days) * 2 // 60
-        est_min_high = len(missing_days) * 3 // 60
-        try:
-            await status_msg.edit_text(
-                f"⏳ Загрузка финансов: {len(missing_days)} дней\n"
-                f"_Ориентировочно {est_min_low}–{est_min_high} мин. Это первый запрос периода._",
-                parse_mode="Markdown")
-        except Exception:
-            pass
-
+        est_low = len(missing_days) * 2 // 60
+        est_high = len(missing_days) * 3 // 60
+        await _safe_edit(status_msg,
+            f"⏳ Загрузка финансов: {len(missing_days)} дней\n"
+            f"_Ориентировочно {est_low}–{est_high} мин._")
     cur, prev = await asyncio.gather(
         get_period_metrics(df, dt, status_msg=status_msg),
         get_period_metrics(pf, pt, status_msg=status_msg))
@@ -1613,22 +1570,19 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================== ОТЧЁТ ПО РЕКЛАМЕ ====================
 async def ad_report_month_handler(update, context):
     if not has_access(update.effective_chat.id): return
-    status_msg = await update.message.reply_text(
-        "⏳ Загружаю данные по рекламе (может занять до 30 секунд)...")
+    status_msg = await update.message.reply_text("⏳ Загружаю отчёт по рекламе...")
     try:
-        rpt = await build_ad_report_month()
+        rpt = await build_ad_report_month(status_msg=status_msg)
         try:
             await status_msg.edit_text(rpt, parse_mode="Markdown")
-        except Exception as e:
-            write_log(f"⚠️ Markdown ошибка, отправляю plain: {e}")
+        except Exception:
             await status_msg.edit_text(rpt)
         await update.message.reply_text("Выберите действие:", reply_markup=ad_reports_kb())
     except Exception as e:
         write_log(f"❌ Ошибка отчёта по рекламе: {e}")
         try:
             await status_msg.edit_text(f"❌ Ошибка: {e}")
-        except Exception:
-            pass
+        except Exception: pass
 
 # ==================== СПРАВОЧНИК РАСХОДОВ (UI) ====================
 async def show_expense_types(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1656,20 +1610,14 @@ async def show_expense_types(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if known:
         lines.append("✅ *Известные услуги:*")
         for tid, name, cnt, sm in known[:30]:
-            if cnt > 0:
-                lines.append(f"  `{tid}` → {name} ({cnt}× / {sm:,.0f} ₽)")
-            else:
-                lines.append(f"  `{tid}` → {name}")
+            lines.append(f"  `{tid}` → {name}" + (f" ({cnt}× / {sm:,.0f} ₽)" if cnt > 0 else ""))
         lines.append("")
     if unknown:
         lines.append("❓ *Требуют уточнения (правьте файл вручную):*")
         for tid, name, cnt, sm in unknown[:30]:
-            if cnt > 0:
-                lines.append(f"  `{tid}` → {name} ({cnt}× / {sm:,.0f} ₽)")
-            else:
-                lines.append(f"  `{tid}` → {name}")
+            lines.append(f"  `{tid}` → {name}" + (f" ({cnt}× / {sm:,.0f} ₽)" if cnt > 0 else ""))
     text = "\n".join(lines)
-    if len(text) > 4000: text = text[:4000] + "\n\n_…список обрезан, смотрите файл_"
+    if len(text) > 4000: text = text[:4000] + "\n\n_…обрезано_"
     try:
         await update.message.reply_text(text, parse_mode="Markdown", reply_markup=expense_types_kb())
     except Exception:
@@ -1687,37 +1635,38 @@ async def expense_types_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         global _expense_types_cache
         _expense_types_cache = _load_expense_types_sync()
         await q.edit_message_text("🔄 Справочник перечитан.")
-        data = get_expense_types()
-        items = []
-        for tid, entry in data.items():
-            if isinstance(entry, dict):
-                name = entry.get("name", "?"); cnt = entry.get("count", 0); sm = entry.get("sum", 0.0)
-            else:
-                name = str(entry); cnt = 0; sm = 0.0
-            items.append((tid, name, cnt, sm))
-        def sort_key(x):
-            is_unknown = x[1].startswith("❓") or "(type " in x[1]
-            return (is_unknown, -x[3])
-        items.sort(key=sort_key)
-        known = [i for i in items if not (i[1].startswith("❓") or "(type " in i[1] and "Услуги" in i[1])]
-        unknown = [i for i in items if i not in known]
-        lines = ["📚 *Справочник расходов*", f"_Всего записей: {len(items)}_", ""]
-        if known:
-            lines.append("✅ *Известные:*")
-            for tid, name, cnt, sm in known[:30]:
-                if cnt > 0: lines.append(f"  `{tid}` → {name} ({cnt}× / {sm:,.0f} ₽)")
-                else: lines.append(f"  `{tid}` → {name}")
-        if unknown:
-            lines.append(""); lines.append("❓ *Требуют уточнения:*")
-            for tid, name, cnt, sm in unknown[:30]:
-                if cnt > 0: lines.append(f"  `{tid}` → {name} ({cnt}× / {sm:,.0f} ₽)")
-                else: lines.append(f"  `{tid}` → {name}")
-        text = "\n".join(lines)
-        if len(text) > 4000: text = text[:4000] + "\n\n_…обрезано_"
-        try:
-            await q.message.reply_text(text, parse_mode="Markdown", reply_markup=expense_types_kb())
-        except Exception:
-            await q.message.reply_text(text[:4000], reply_markup=expense_types_kb())
+        await show_expense_types_from(q.message, chat_id)
+
+async def show_expense_types_from(message, chat_id):
+    data = get_expense_types()
+    items = []
+    for tid, entry in data.items():
+        if isinstance(entry, dict):
+            name = entry.get("name", "?"); cnt = entry.get("count", 0); sm = entry.get("sum", 0.0)
+        else:
+            name = str(entry); cnt = 0; sm = 0.0
+        items.append((tid, name, cnt, sm))
+    def sort_key(x):
+        is_unknown = x[1].startswith("❓") or "(type " in x[1]
+        return (is_unknown, -x[3])
+    items.sort(key=sort_key)
+    known = [i for i in items if not (i[1].startswith("❓") or "(type " in i[1] and "Услуги" in i[1])]
+    unknown = [i for i in items if i not in known]
+    lines = ["📚 *Справочник расходов*", f"_Всего записей: {len(items)}_", ""]
+    if known:
+        lines.append("✅ *Известные:*")
+        for tid, name, cnt, sm in known[:30]:
+            lines.append(f"  `{tid}` → {name}" + (f" ({cnt}× / {sm:,.0f} ₽)" if cnt > 0 else ""))
+    if unknown:
+        lines.append(""); lines.append("❓ *Требуют уточнения:*")
+        for tid, name, cnt, sm in unknown[:30]:
+            lines.append(f"  `{tid}` → {name}" + (f" ({cnt}× / {sm:,.0f} ₽)" if cnt > 0 else ""))
+    text = "\n".join(lines)
+    if len(text) > 4000: text = text[:4000] + "\n\n_…обрезано_"
+    try:
+        await message.reply_text(text, parse_mode="Markdown", reply_markup=expense_types_kb())
+    except Exception:
+        await message.reply_text(text[:4000], reply_markup=expense_types_kb())
 
 async def send_help(update, context):
     chat_id = update.effective_chat.id
@@ -1733,16 +1682,16 @@ async def send_help(update, context):
         "• 📈 Динамика по товару – график продаж конкретного товара.\n"
         "• 🔔 Автоматические рассылки – персональная настройка.\n\n"
         "🔹 *Отчёт по рекламе*\n"
-        "• 📅 Реклама за текущий месяц – статистика по всем кампаниям с VS сравнением.\n\n"
+        "• 📅 Реклама за текущий месяц – статистика по всем активным кампаниям с VS сравнением.\n\n"
         "🔹 *Автоматические отчёты (персональные)*\n"
         "• 🕒 Выбор времени рассылок – обычный отчёт.\n"
         "• 📅 Добавление отчёта за Вчера – отчёт с блоком «Вчера».\n"
-        "• 🔕 Режим тишины – интервал, когда рассылки не отправляются.\n"
-        "• 📤 Отправить сейчас – принудительная отправка.\n\n"
+        "• 🔕 Режим тишины.\n"
+        "• 📤 Отправить сейчас.\n\n"
         "🔹 *Метрики*\n"
         "• 🛒 Заказано / 📦 Доставлено / ❌ Отменено.\n"
         "• 📢 Реклама – расходы, ДРР (общий) и ДРР (по доставленным).\n"
-        "• 💰 Расходы (финансовые) – разбивка по услугам.\n\n"
+        "• 💰 Расходы (финансовые).\n\n"
         "🔹 *Длительные периоды*\n"
         "• Первый запрос за период может занять 5–15 минут.\n"
         "• Повторные запросы — мгновенные (кэш по дням).\n\n"
@@ -1807,10 +1756,10 @@ async def date_cb(update, context):
             status_msg = await q.message.reply_text(f"⏳ Данные за {ds}...")
             try:
                 rpt = await build_period_report(ds, ds, ds, status_msg=status_msg)
-                await status_msg.edit_text(rpt, parse_mode="Markdown")
+                await _safe_edit(status_msg, rpt)
                 await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
             except Exception as e:
-                write_log(f"❌ {e}"); await status_msg.edit_text(f"❌ {e}")
+                write_log(f"❌ {e}"); await _safe_edit(status_msg, f"❌ {e}")
             return ConversationHandler.END
     return WAITING_DATE_SINGLE
 
@@ -1874,14 +1823,13 @@ async def period_year_cb(update, context):
     if d.startswith("pyy_"):
         y = int(d.split("_")[1])
         df = datetime.date(y,1,1).isoformat(); dt = datetime.date(y,12,31).isoformat()
-        await q.delete_message()
         status_msg = await q.message.reply_text(f"⏳ За {y} год. Первый запрос может занять до 15 минут...")
         try:
             rpt = await build_period_report(df, dt, f"{y} год", status_msg=status_msg)
-            await status_msg.edit_text(rpt, parse_mode="Markdown")
+            await _safe_edit(status_msg, rpt)
             await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
         except Exception as e:
-            write_log(f"❌ {e}"); await status_msg.edit_text(f"❌ {e}")
+            write_log(f"❌ {e}"); await _safe_edit(status_msg, f"❌ {e}")
         return ConversationHandler.END
     return WAITING_PERIOD_YEAR
 
@@ -1899,10 +1847,10 @@ async def period_month_cb(update, context):
         status_msg = await q.message.reply_text(f"⏳ За {name}...")
         try:
             rpt = await build_period_report(f.isoformat(), l.isoformat(), name, status_msg=status_msg)
-            await status_msg.edit_text(rpt, parse_mode="Markdown")
+            await _safe_edit(status_msg, rpt)
             await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
         except Exception as e:
-            write_log(f"❌ {e}"); await status_msg.edit_text(f"❌ {e}")
+            write_log(f"❌ {e}"); await _safe_edit(status_msg, f"❌ {e}")
         return ConversationHandler.END
     return WAITING_PERIOD_MONTH
 
@@ -1921,10 +1869,10 @@ async def period_quarter_cb(update, context):
         status_msg = await q.message.reply_text(f"⏳ За {name}...")
         try:
             rpt = await build_period_report(f.isoformat(), l.isoformat(), name, status_msg=status_msg)
-            await status_msg.edit_text(rpt, parse_mode="Markdown")
+            await _safe_edit(status_msg, rpt)
             await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
         except Exception as e:
-            write_log(f"❌ {e}"); await status_msg.edit_text(f"❌ {e}")
+            write_log(f"❌ {e}"); await _safe_edit(status_msg, f"❌ {e}")
         return ConversationHandler.END
     return WAITING_PERIOD_QUARTER
 
@@ -1985,14 +1933,13 @@ async def custom_end_cb(update, context):
             if not ok:
                 await q.edit_message_text(r); return WAITING_PERIOD_END
             nm = f"{ds} – {de}"
-            await q.delete_message()
             status_msg = await q.message.reply_text(f"⏳ За {nm}. Первый запрос может занять до 15 минут...")
             try:
                 rpt = await build_period_report(ds, de, nm, status_msg=status_msg)
-                await status_msg.edit_text(rpt, parse_mode="Markdown")
+                await _safe_edit(status_msg, rpt)
                 await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
             except Exception as e:
-                write_log(f"❌ {e}"); await status_msg.edit_text(f"❌ {e}")
+                write_log(f"❌ {e}"); await _safe_edit(status_msg, f"❌ {e}")
             context.user_data.pop('p_start', None)
             return ConversationHandler.END
     return WAITING_PERIOD_END
@@ -2066,10 +2013,10 @@ async def products_year_cb(update, context):
             postings = await fetch_postings(df, dt)
             stats = aggregate_products(postings, df, dt)
             txt = format_top_products(stats, f"Товары за {y} год", 20) + "\n" + format_products_summary(stats)
-            await status_msg.edit_text(txt)
+            await _safe_edit(status_msg, txt, parse_mode=None)
             await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
         except Exception as e:
-            write_log(f"❌ {e}"); await status_msg.edit_text(f"❌ {e}")
+            write_log(f"❌ {e}"); await _safe_edit(status_msg, f"❌ {e}")
         return ConversationHandler.END
     return WAITING_PRODUCT_YEAR
 
@@ -2089,10 +2036,10 @@ async def products_month_cb(update, context):
             postings = await fetch_postings(f.isoformat(), l.isoformat())
             stats = aggregate_products(postings, f.isoformat(), l.isoformat())
             txt = format_top_products(stats, f"Товары за {nm}", 20) + "\n" + format_products_summary(stats)
-            await status_msg.edit_text(txt)
+            await _safe_edit(status_msg, txt, parse_mode=None)
             await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
         except Exception as e:
-            write_log(f"❌ {e}"); await status_msg.edit_text(f"❌ {e}")
+            write_log(f"❌ {e}"); await _safe_edit(status_msg, f"❌ {e}")
         return ConversationHandler.END
     return WAITING_PRODUCT_MONTH
 
@@ -2113,10 +2060,10 @@ async def products_quarter_cb(update, context):
             postings = await fetch_postings(f.isoformat(), l.isoformat())
             stats = aggregate_products(postings, f.isoformat(), l.isoformat())
             txt = format_top_products(stats, f"Товары за {nm}", 20) + "\n" + format_products_summary(stats)
-            await status_msg.edit_text(txt)
+            await _safe_edit(status_msg, txt, parse_mode=None)
             await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
         except Exception as e:
-            write_log(f"❌ {e}"); await status_msg.edit_text(f"❌ {e}")
+            write_log(f"❌ {e}"); await _safe_edit(status_msg, f"❌ {e}")
         return ConversationHandler.END
     return WAITING_PRODUCT_QUARTER
 
@@ -2182,10 +2129,10 @@ async def products_custom_end(update, context):
                 postings = await fetch_postings(ds, de)
                 stats = aggregate_products(postings, ds, de)
                 txt = format_top_products(stats, f"Товары за {nm}", 20) + "\n" + format_products_summary(stats)
-                await status_msg.edit_text(txt)
+                await _safe_edit(status_msg, txt, parse_mode=None)
                 await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
             except Exception as e:
-                write_log(f"❌ {e}"); await status_msg.edit_text(f"❌ {e}")
+                write_log(f"❌ {e}"); await _safe_edit(status_msg, f"❌ {e}")
             context.user_data.pop('tp_start', None)
             return ConversationHandler.END
     return WAITING_PRODUCT_PERIOD_END
@@ -2216,7 +2163,7 @@ async def dynamics_select_cb(update, context):
             await q.delete_message()
             await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
         except Exception as e:
-            write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
+            write_log(f"❌ {e}"); await _safe_edit(q.message, f"❌ {e}")
         return ConversationHandler.END
     if d == "dys":
         btns = [[InlineKeyboardButton(str(y), callback_data=f"dyy_{y}")] for y in ys]
@@ -2243,7 +2190,7 @@ async def dynamics_year_cb(update, context):
             await q.delete_message()
             await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
         except Exception as e:
-            write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
+            write_log(f"❌ {e}"); await _safe_edit(q.message, f"❌ {e}")
         return ConversationHandler.END
     return WAITING_DYN_YEAR
 
@@ -2369,7 +2316,7 @@ async def product_chart_period_cb(update, context):
             await q.delete_message()
             await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
         except Exception as e:
-            write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
+            write_log(f"❌ {e}"); await _safe_edit(q.message, f"❌ {e}")
         return ConversationHandler.END
     if d == "pcp_year":
         btns = [[InlineKeyboardButton(str(y), callback_data=f"pcy_{y}")] for y in ys]
@@ -2401,7 +2348,7 @@ async def product_chart_year_cb(update, context):
             await q.delete_message()
             await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
         except Exception as e:
-            write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
+            write_log(f"❌ {e}"); await _safe_edit(q.message, f"❌ {e}")
         return ConversationHandler.END
     return WAITING_PC_YEAR
 
@@ -2724,16 +2671,13 @@ async def check_auto_reports(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.datetime.now(MOSCOW_TZ)
     cur_hour = now.hour; cur_date = now.strftime("%Y-%m-%d")
     settings = await load_settings()
-
     if cur_hour == 12:
         recipients = [ADMIN_CHAT_ID] + [m["id"] for m in load_managers()]
         for uid in set(recipients):
             try:
                 us = get_user_settings(settings, uid)
-                if us.get("schedule_hours"):
-                    continue
-                if us.get("last_reminder") == cur_date:
-                    continue
+                if us.get("schedule_hours"): continue
+                if us.get("last_reminder") == cur_date: continue
                 await context.bot.send_message(
                     chat_id=uid,
                     text="⚠️ *Напоминание:* у вас не настроены автоматические рассылки.\n"
@@ -2745,24 +2689,19 @@ async def check_auto_reports(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 write_log(f"⚠️ Не отправлено {uid}: {e}")
         await save_settings(settings)
-
     for sid, us in settings.items():
         try: uid = int(sid)
         except: continue
-
         sch = us.get("schedule_hours", [])
         if not sch: continue
         if cur_hour not in sch: continue
-
         s = us.get("silence_start"); e = us.get("silence_end")
         if s is not None and e is not None:
             if s < e:
                 if s <= cur_hour < e: continue
             else:
                 if cur_hour >= s or cur_hour < e: continue
-
         yest_hours = us.get("yesterday_report_hours", [])
-
         if cur_hour in yest_hours:
             last = us.get("last_sent_yesterday")
             if last:
@@ -2806,7 +2745,6 @@ def main():
     if not validate_env_vars(): sys.exit(1)
     _ensure_data_dir()
     _init_expense_types_file()
-
     write_log(f"🚀 Запуск (v{VERSION})")
     write_log(f"✅ OZON_CLIENT_ID: {mask_secret(OZON_CLIENT_ID)}")
     write_log(f"✅ OZON_API_KEY: {mask_secret(OZON_API_KEY)}")
@@ -2814,39 +2752,31 @@ def main():
     write_log(f"✅ ADMIN_CHAT_ID: {ADMIN_CHAT_ID}")
     write_log(f"✅ Data dir: {DATA_DIR}")
     update_version_history(VERSION, CHANGELOG_MESSAGE)
-
     app = (Application.builder()
            .token(TELEGRAM_BOT_TOKEN)
            .connect_timeout(30.0).read_timeout(30.0).write_timeout(30.0)
            .post_init(init_http_session).post_shutdown(close_http_session).build())
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("version", version_command))
     app.add_handler(CommandHandler("help", send_help))
     app.add_handler(CommandHandler("cancel", cancel))
-
     app.add_handler(MessageHandler(filters.Regex(
         "^(📊 Отчёт по продажам|📦 Отчёт по товарам|📈 Отчёт по рекламе|"
         "🔔 Автоматические рассылки|⚙️ Администрирование|"
         "📚 Справочник расходов|📖 Справка)$"), handle_main_menu))
-
     app.add_handler(MessageHandler(filters.Text(["🔄 Проверить доступ"]), check_access_cmd))
     app.add_handler(MessageHandler(filters.Text(["📅 Продажи за сегодня"]), today_report))
     app.add_handler(MessageHandler(filters.Text(["📅 Топ товаров за сегодня"]), top_today))
     app.add_handler(MessageHandler(filters.Text(["📋 Список менеджеров"]), admin_list))
     app.add_handler(MessageHandler(filters.Text(["📅 Реклама за текущий месяц"]), ad_report_month_handler))
-
     app.add_handler(MessageHandler(filters.Regex(
         "^(🕒 Выбор времени рассылок|📅 Добавление отчета за Вчера|"
         "🔕 Режим тишины|📤 Отправить отчет за Вчера сейчас|🔙 Назад)$"), auto_menu_router))
-
     app.add_handler(CallbackQueryHandler(expense_types_cb, pattern="^et_"))
-
     conv_date = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📆 Выбрать дату"), date_menu)],
         states={WAITING_DATE_SINGLE: [CallbackQueryHandler(date_cb)]},
         fallbacks=[CommandHandler("cancel", cancel)])
-
     conv_period = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📊 Выбрать период"), period_menu)],
         states={
@@ -2858,7 +2788,6 @@ def main():
             WAITING_PERIOD_END: [CallbackQueryHandler(custom_end_cb)],
             WAITING_YEAR_SELECT: [CallbackQueryHandler(period_year_cb)]},
         fallbacks=[CommandHandler("cancel", cancel)])
-
     conv_prod = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("🏆 Товары за период"), products_period_menu)],
         states={
@@ -2870,7 +2799,6 @@ def main():
             WAITING_PRODUCT_PERIOD_END: [CallbackQueryHandler(products_custom_end)],
             WAITING_PRODUCT_YEAR_SELECT: [CallbackQueryHandler(products_year_cb)]},
         fallbacks=[CommandHandler("cancel", cancel)])
-
     conv_dyn = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📈 Динамика продаж"), dynamics_menu)],
         states={
@@ -2879,7 +2807,6 @@ def main():
             WAITING_DYN_RANGE_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, dynamics_range_start)],
             WAITING_DYN_RANGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, dynamics_range_end)]},
         fallbacks=[CommandHandler("cancel", cancel)])
-
     conv_pchart = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📈 Динамика по товару"), product_chart_menu)],
         states={
@@ -2890,47 +2817,39 @@ def main():
             WAITING_PC_RANGE_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_chart_range_start)],
             WAITING_PC_RANGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_chart_range_end)]},
         fallbacks=[CommandHandler("cancel", cancel)])
-
     conv_sch = ConversationHandler(
         entry_points=[CallbackQueryHandler(schedule_cb, pattern="^sch_")],
         states={WAITING_AUTO_SCHEDULE: [CallbackQueryHandler(schedule_cb, pattern="^sch_")]},
         fallbacks=[CommandHandler("cancel", cancel)])
-
     conv_yest = ConversationHandler(
         entry_points=[CallbackQueryHandler(yesterday_cb, pattern="^yest_")],
         states={WAITING_AUTO_YESTERDAY: [CallbackQueryHandler(yesterday_cb, pattern="^yest_")]},
         fallbacks=[CommandHandler("cancel", cancel)])
-
     conv_sil = ConversationHandler(
         entry_points=[CallbackQueryHandler(silence_cb, pattern="^sil_")],
         states={
             WAITING_AUTO_SILENCE_START: [CallbackQueryHandler(silence_start_cb, pattern="^sil_s_")],
             WAITING_AUTO_SILENCE_END: [CallbackQueryHandler(silence_end_cb, pattern="^sil_e_")]},
         fallbacks=[CommandHandler("cancel", cancel)])
-
     conv_add = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➕ Добавить менеджера"), admin_add_start)],
         states={
             WAITING_ADD_MANAGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_input)],
             WAITING_MANAGER_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_phone)]},
         fallbacks=[CommandHandler("cancel", cancel)])
-
     conv_rm = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➖ Удалить менеджера"), admin_remove_start)],
         states={WAITING_REMOVE_MANAGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_remove_input)]},
         fallbacks=[CommandHandler("cancel", cancel)])
-
     app.add_handler(conv_date); app.add_handler(conv_period); app.add_handler(conv_prod)
     app.add_handler(conv_dyn); app.add_handler(conv_pchart)
     app.add_handler(conv_sch); app.add_handler(conv_yest); app.add_handler(conv_sil)
     app.add_handler(conv_add); app.add_handler(conv_rm)
-
     if app.job_queue:
         app.job_queue.run_repeating(check_auto_reports, interval=900, first=10)
         write_log("✅ Планировщик запущен (каждые 15 минут).")
     else:
         write_log("⚠️ JobQueue недоступен.")
-
     write_log("🚀 Бот готов.")
     app.run_polling(allowed_updates=Update.ALL_TYPES, timeout=30)
 
