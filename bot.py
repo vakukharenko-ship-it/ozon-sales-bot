@@ -29,8 +29,8 @@ from telegram.warnings import PTBUserWarning
 
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
-VERSION = "2.4.7"
-CHANGELOG_MESSAGE = "Справочник расходов в /app/data/expense_types.json с авто-дополнением. Исправлены опечатки du/du_ в блоках 'Текущий месяц' и 'Вчера'."
+VERSION = "2.4.9"
+CHANGELOG_MESSAGE = "Правильная логика рассылок: schedule_hours = обычные отчёты, yesterday_report_hours = с блоком Вчера. Раздельные last_sent."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 60
@@ -318,20 +318,31 @@ async def save_settings(settings: Dict):
             write_log(f"❌ settings: {e}")
 
 def get_user_settings(settings: Dict, chat_id: int) -> Dict:
+    """Возвращает настройки пользователя. Мигрирует старый last_sent → last_sent_regular."""
     sid = str(chat_id)
     if sid not in settings:
         settings[sid] = {"schedule_hours": [], "yesterday_report_hours": [],
                          "silence_start": None, "silence_end": None,
-                         "last_sent": None, "last_reminder": None}
-    return settings[sid]
+                         "last_sent_regular": None, "last_sent_yesterday": None,
+                         "last_reminder": None}
+    us = settings[sid]
+    # Миграция со старого формата
+    if "last_sent" in us:
+        us.setdefault("last_sent_regular", us.get("last_sent"))
+        us.setdefault("last_sent_yesterday", None)
+        us.pop("last_sent", None)
+    us.setdefault("last_sent_regular", None)
+    us.setdefault("last_sent_yesterday", None)
+    return us
 
 def user_has_schedule(chat_id: int) -> bool:
+    """Настроены ли рассылки. Достаточно schedule_hours."""
     if not os.path.exists(SETTINGS_FILE): return False
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             s = json.load(f)
         us = s.get(str(chat_id), {})
-        return bool(us.get("schedule_hours")) and bool(us.get("yesterday_report_hours"))
+        return bool(us.get("schedule_hours"))
     except: return False
 
 def load_managers():
@@ -914,8 +925,12 @@ async def get_period_metrics(df, dt):
             "effective_drr": (ad / dsum * 100) if dsum > 0 else None,
             "expenses": exp}
 
-# ==================== ОТЧЁТ «ПРОДАЖИ ЗА СЕГОДНЯ» ====================
+# ==================== ОТЧЁТЫ ====================
 async def build_today_report(include_yesterday=False):
+    """
+    include_yesterday=False → обычный отчёт: Сегодня + Текущий месяц + Расходы
+    include_yesterday=True  → отчёт за Вчера: Вчера + Текущий месяц + Расходы
+    """
     now = get_current_time_msk()
     td = now.date(); today = td.isoformat()
     yest = (td - datetime.timedelta(days=1)).isoformat()
@@ -924,6 +939,7 @@ async def build_today_report(include_yesterday=False):
     dp = (td - cm).days + 1
     pm_e = pm + datetime.timedelta(days=dp - 1); pm_e_s = pm_e.isoformat()
 
+    # Всегда загружаем всё нужное
     postings_cur, postings_prev, ad_t, ad_y, ad_m, ad_pm, fin_t, fin_m = await asyncio.gather(
         fetch_postings(cm_s, today), fetch_postings(pm_s, pm_e_s),
         fetch_advertising_expense(today, today), fetch_advertising_expense(yest, yest),
@@ -957,6 +973,28 @@ async def build_today_report(include_yesterday=False):
             f"  ❌ Отменено: \n  {fmt_num(cs_)} ₽ / {fmt_int(cu_)} шт.\n"
             f"    vs Вчера: \n  {d_cs} ₽ / {d_cu} шт.\n"
             f"  Доля отмен: {cr_txt}\n"
+        )
+
+    def blk_yesterday():
+        os_ = y_m["ordered_sum"]; ou_ = y_m["ordered_units"]
+        ds_ = y_m["delivered_sum"]; du_ = y_m["delivered_units"]
+        cs_ = y_m["canceled_sum"]; cu_ = y_m["canceled_units"]
+        cr = (cu_ / du_ * 100) if du_ > 0 else None
+        cr_txt = f"{cr:.2f}%" if cr is not None else "∞"
+        drr = (ad_y / os_ * 100) if os_ > 0 else None
+        edrr = (ad_y / ds_ * 100) if ds_ > 0 else None
+        drr_txt = f"{drr:.2f}%" if drr is not None else "∞"
+        edrr_txt = f"{edrr:.2f}%" if edrr is not None else "∞"
+        yest_dt = datetime.datetime.strptime(yest, "%Y-%m-%d").date()
+        yest_fmt = yest_dt.strftime("%d.%m.%Y")
+        return (
+            f"🔹 *Вчера ({yest_fmt}, полный день)*\n"
+            f"  🛒 Заказано: \n  {fmt_num(os_)} ₽ / {fmt_int(ou_)} шт.\n\n"
+            f"  📦 Доставлено: \n  {fmt_num(ds_)} ₽ / {fmt_int(du_)} шт.\n\n"
+            f"  ❌ Отменено: \n  {fmt_num(cs_)} ₽ / {fmt_int(cu_)} шт.\n"
+            f"  Доля отмен: {cr_txt}\n\n"
+            f"  📢 Реклама: {fmt_num(ad_y)} ₽\n"
+            f"  ДРР (общий): {drr_txt} | ДРР (по доставленным): {edrr_txt}"
         )
 
     def blk_month():
@@ -996,30 +1034,18 @@ async def build_today_report(include_yesterday=False):
             f"  ДРР (по доставленным): {edrr_txt} | vs предыдущий месяц: {p_edrr_txt}"
         )
 
-    def blk_yesterday():
-        os_ = y_m["ordered_sum"]; ou_ = y_m["ordered_units"]
-        ds_ = y_m["delivered_sum"]; du_ = y_m["delivered_units"]
-        cs_ = y_m["canceled_sum"]; cu_ = y_m["canceled_units"]
-        cr = (cu_ / du_ * 100) if du_ > 0 else None
-        cr_txt = f"{cr:.2f}%" if cr is not None else "∞"
-        drr = (ad_y / os_ * 100) if os_ > 0 else None
-        edrr = (ad_y / ds_ * 100) if ds_ > 0 else None
-        drr_txt = f"{drr:.2f}%" if drr is not None else "∞"
-        edrr_txt = f"{edrr:.2f}%" if edrr is not None else "∞"
-        return (
-            f"🔹 *Вчера (полный день)*\n"
-            f"  🛒 Заказано: {fmt_num(os_)} ₽ / {fmt_int(ou_)} шт.\n"
-            f"  📦 Доставлено: {fmt_num(ds_)} ₽ / {fmt_int(du_)} шт.\n"
-            f"  ❌ Отменено: {fmt_num(cs_)} ₽ / {fmt_int(cu_)} шт., доля: {cr_txt}\n"
-            f"  📢 Реклама: {fmt_num(ad_y)} ₽, ДРР (общий): {drr_txt}, ДРР (по доставленным): {edrr_txt}"
-        )
-
-    parts = [blk_today(), blk_month()]
+    parts = []
     if include_yesterday:
         parts.append(blk_yesterday())
+        parts.append(blk_month())
+        header = "📊 *Отчёт за Вчера*"
+    else:
+        parts.append(blk_today())
+        parts.append(blk_month())
+        header = "📊 *Продажи за сегодня*"
     parts.append(format_expense_block(exp_t, "Расходы сегодня"))
     parts.append(format_expense_block(exp_m, "Расходы за текущий месяц"))
-    return "📊 *Продажи за сегодня*\n\n\n" + "\n\n".join(parts)
+    return header + "\n\n\n" + "\n\n".join(parts)
 
 async def build_period_report(df, dt, name):
     pf, pt = prev_period(df, dt)
@@ -1145,9 +1171,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_has_schedule(chat_id):
         await update.message.reply_text(
             "⚠️ *Необходимо настроить автоматические рассылки!*\n\n"
-            "Зайдите в раздел «🔔 Автоматические рассылки» и настройте:\n"
-            "1. Часы рассылок\n"
-            "2. Часы отправки отчёта за Вчера",
+            "Зайдите в раздел «🔔 Автоматические рассылки» и выберите часы рассылок.",
             parse_mode="Markdown")
 
 async def check_access_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1286,10 +1310,10 @@ async def send_help(update, context):
         "• 📈 Динамика по товару – график продаж конкретного товара.\n"
         "• 🔔 Автоматические рассылки – персональная настройка.\n\n"
         "🔹 *Автоматические отчёты (персональные)*\n"
-        "• Настройка времени рассылок – задаются часы (01:00..24:00).\n"
-        "• Добавление отчёта за Вчера – из разрешённых часов.\n"
-        "• Режим тишины – интервал, когда рассылки не отправляются.\n"
-        "• Отправить сейчас – принудительная отправка отчёта за вчера.\n\n"
+        "• 🕒 Выбор времени рассылок – общие часы, когда отправляется обычный отчёт (Сегодня + Текущий месяц).\n"
+        "• 📅 Добавление отчёта за Вчера – часы из выбранных, когда отправляется отчёт с блоком «Вчера».\n"
+        "• 🔕 Режим тишины – интервал, когда рассылки не отправляются.\n"
+        "• 📤 Отправить сейчас – принудительная отправка отчёта за Вчера.\n\n"
         "🔹 *Метрики*\n"
         "• 🛒 Заказано / 📦 Доставлено / ❌ Отменено – суммы и шт.\n"
         "• 📢 Реклама – расходы, ДРР (общий) и ДРР (по доставленным).\n"
@@ -2000,9 +2024,13 @@ async def auto_schedule_start(update, context):
     current = us.get("schedule_hours", [])
     context.user_data['temp_sch'] = list(current)
     if current:
-        txt = f"Текущие часы: {', '.join(f'{h:02d}:00' for h in sorted(current))}\nНажмите для изменения:"
+        txt = f"Текущие часы: {', '.join(f'{h:02d}:00' for h in sorted(current))}\n\n" \
+              "В эти часы будет отправляться обычный отчёт (Сегодня + Текущий месяц).\n\n" \
+              "Нажмите для изменения:"
     else:
-        txt = "Часы рассылок не настроены. Выберите часы:"
+        txt = "Часы рассылок не настроены.\n\n" \
+              "В выбранные часы будет отправляться обычный отчёт (Сегодня + Текущий месяц).\n\n" \
+              "Выберите часы:"
     await update.message.reply_text(txt, reply_markup=hours_kb(current, "sch_"))
 
 async def auto_yesterday_start(update, context):
@@ -2016,8 +2044,11 @@ async def auto_yesterday_start(update, context):
     cur = us.get("yesterday_report_hours", [])
     context.user_data['temp_yest'] = list(cur)
     await update.message.reply_text(
-        "Выберите часы отправки отчёта за Вчера (из ваших часов рассылок):",
-        reply_markup=hours_kb(cur, "yest_", available=sch))
+        "Выберите часы, в которые будет отправляться отчёт *с блоком «Вчера»* "
+        "(из ваших часов рассылок):\n\n"
+        "⚠️ В выбранные часы отчёт *с Вчера* будет заменять обычный отчёт.",
+        reply_markup=hours_kb(cur, "yest_", available=sch),
+        parse_mode="Markdown")
 
 async def auto_silence_start(update, context):
     chat_id = update.effective_chat.id
@@ -2078,6 +2109,7 @@ async def schedule_cb(update, context):
         settings = await load_settings()
         us = get_user_settings(settings, chat_id)
         us["schedule_hours"] = temp
+        # Удаляем из yesterday_report_hours часы, которых больше нет в schedule_hours
         us["yesterday_report_hours"] = [h for h in us.get("yesterday_report_hours", []) if h in temp]
         settings[str(chat_id)] = us
         await save_settings(settings)
@@ -2113,7 +2145,7 @@ async def yesterday_cb(update, context):
         settings[str(chat_id)] = us
         await save_settings(settings)
         txt = ', '.join(f'{h:02d}:00' for h in sorted(temp)) if temp else 'не выбраны'
-        await q.edit_message_text(f"✅ Сохранено. Часы отчёта за Вчера: {txt}")
+        await q.edit_message_text(f"✅ Сохранено. Часы отчёта с «Вчера»: {txt}")
         await q.message.reply_text("Выберите действие:", reply_markup=auto_kb())
         return ConversationHandler.END
     return WAITING_AUTO_YESTERDAY
@@ -2263,23 +2295,32 @@ async def admin_list(update, context):
 
 # ==================== ПЛАНИРОВЩИК ====================
 async def check_auto_reports(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Логика:
+    - schedule_hours = общие часы (обычный отчёт).
+    - yesterday_report_hours ⊆ schedule_hours (отчёт с блоком Вчера).
+    - В час, который в yesterday_report_hours → отправляем отчёт с Вчера.
+    - В остальные часы из schedule_hours → отправляем обычный отчёт.
+    - last_sent_regular и last_sent_yesterday — независимые ключи.
+    """
     now = datetime.datetime.now(MOSCOW_TZ)
     cur_hour = now.hour; cur_date = now.strftime("%Y-%m-%d")
     settings = await load_settings()
 
+    # 1) Напоминание в 12:00 (только если schedule_hours пуст)
     if cur_hour == 12:
         recipients = [ADMIN_CHAT_ID] + [m["id"] for m in load_managers()]
         for uid in set(recipients):
             try:
                 us = get_user_settings(settings, uid)
-                if us.get("schedule_hours") and us.get("yesterday_report_hours"):
+                if us.get("schedule_hours"):
                     continue
                 if us.get("last_reminder") == cur_date:
                     continue
                 await context.bot.send_message(
                     chat_id=uid,
                     text="⚠️ *Напоминание:* у вас не настроены автоматические рассылки.\n"
-                         "Зайдите в «🔔 Автоматические рассылки» и выберите часы.",
+                         "Зайдите в «🔔 Автоматические рассылки» → «🕒 Выбор времени рассылок».",
                     parse_mode="Markdown")
                 us["last_reminder"] = cur_date
                 settings[str(uid)] = us
@@ -2288,32 +2329,59 @@ async def check_auto_reports(context: ContextTypes.DEFAULT_TYPE):
                 write_log(f"⚠️ Не отправлено {uid}: {e}")
         await save_settings(settings)
 
+    # 2) Рассылки
     for sid, us in settings.items():
         try: uid = int(sid)
         except: continue
-        yest_hours = us.get("yesterday_report_hours", [])
-        if cur_hour not in yest_hours: continue
+
+        sch = us.get("schedule_hours", [])
+        if not sch: continue
+        if cur_hour not in sch: continue
+
+        # Режим тишины
         s = us.get("silence_start"); e = us.get("silence_end")
         if s is not None and e is not None:
             if s < e:
                 if s <= cur_hour < e: continue
             else:
                 if cur_hour >= s or cur_hour < e: continue
-        last = us.get("last_sent")
-        if last:
+
+        yest_hours = us.get("yesterday_report_hours", [])
+
+        if cur_hour in yest_hours:
+            # Ветка «с блоком Вчера»
+            last = us.get("last_sent_yesterday")
+            if last:
+                try:
+                    ld, lh = last.split()
+                    if ld == cur_date and int(lh) == cur_hour: continue
+                except: pass
+            write_log(f"📤 Автоотчёт с Вчера → {uid} ({cur_hour:02d}:00)")
             try:
-                ld, lh = last.split()
-                if ld == cur_date and int(lh) == cur_hour: continue
-            except: pass
-        write_log(f"📤 Автоотчёт → {uid}")
-        try:
-            rpt = await build_today_report(include_yesterday=True)
-            await context.bot.send_message(chat_id=uid, text=rpt, parse_mode="Markdown")
-            us["last_sent"] = f"{cur_date} {cur_hour}"
-            settings[sid] = us
-            await save_settings(settings)
-        except Exception as e:
-            write_log(f"❌ Автоотчёт {uid}: {e}")
+                rpt = await build_today_report(include_yesterday=True)
+                await context.bot.send_message(chat_id=uid, text=rpt, parse_mode="Markdown")
+                us["last_sent_yesterday"] = f"{cur_date} {cur_hour}"
+                settings[sid] = us
+                await save_settings(settings)
+            except Exception as e:
+                write_log(f"❌ Автоотчёт (Вчера) {uid}: {e}")
+        else:
+            # Ветка обычного отчёта
+            last = us.get("last_sent_regular")
+            if last:
+                try:
+                    ld, lh = last.split()
+                    if ld == cur_date and int(lh) == cur_hour: continue
+                except: pass
+            write_log(f"📤 Обычный автоотчёт → {uid} ({cur_hour:02d}:00)")
+            try:
+                rpt = await build_today_report(include_yesterday=False)
+                await context.bot.send_message(chat_id=uid, text=rpt, parse_mode="Markdown")
+                us["last_sent_regular"] = f"{cur_date} {cur_hour}"
+                settings[sid] = us
+                await save_settings(settings)
+            except Exception as e:
+                write_log(f"❌ Обычный автоотчёт {uid}: {e}")
 
 async def cancel(update, context):
     chat_id = update.effective_chat.id
