@@ -29,8 +29,8 @@ from telegram.warnings import PTBUserWarning
 
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
-VERSION = "2.4.9"
-CHANGELOG_MESSAGE = "Правильная логика рассылок: schedule_hours = обычные отчёты, yesterday_report_hours = с блоком Вчера. Раздельные last_sent."
+VERSION = "2.5.0"
+CHANGELOG_MESSAGE = "Реклама для больших периодов: разбивка по 60 дней и суммирование. Работают отчёты и графики за год и произвольные периоды до 2 лет."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 60
@@ -47,6 +47,8 @@ SETTINGS_FILE = "/app/data/settings.json"
 MANAGERS_FILE = "/app/data/managers.json"
 EXPENSE_TYPES_FILE = "/app/data/expense_types.json"
 LOG_FILE = "/app/data/ozon_log.txt"
+
+AD_CHUNK_DAYS = 60  # Размер части для рекламы (лимит Ozon 62 дня)
 
 WAITING_DATE_SINGLE = 1
 WAITING_PERIOD_TYPE = 2
@@ -318,7 +320,6 @@ async def save_settings(settings: Dict):
             write_log(f"❌ settings: {e}")
 
 def get_user_settings(settings: Dict, chat_id: int) -> Dict:
-    """Возвращает настройки пользователя. Мигрирует старый last_sent → last_sent_regular."""
     sid = str(chat_id)
     if sid not in settings:
         settings[sid] = {"schedule_hours": [], "yesterday_report_hours": [],
@@ -326,7 +327,6 @@ def get_user_settings(settings: Dict, chat_id: int) -> Dict:
                          "last_sent_regular": None, "last_sent_yesterday": None,
                          "last_reminder": None}
     us = settings[sid]
-    # Миграция со старого формата
     if "last_sent" in us:
         us.setdefault("last_sent_regular", us.get("last_sent"))
         us.setdefault("last_sent_yesterday", None)
@@ -336,7 +336,6 @@ def get_user_settings(settings: Dict, chat_id: int) -> Dict:
     return us
 
 def user_has_schedule(chat_id: int) -> bool:
-    """Настроены ли рассылки. Достаточно schedule_hours."""
     if not os.path.exists(SETTINGS_FILE): return False
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
@@ -524,14 +523,16 @@ async def get_performance_token():
     except Exception as e:
         write_log(f"❌ Токен: {e}"); return None
 
+# ==================== ОТГРУЗКИ (без ограничений по периоду) ====================
 async def fetch_postings(date_from, date_to):
     cache_key = f"postings_{date_from}_{date_to}"
     cached = await get_from_cache(cache_key)
     if cached is not None: return cached
     headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY, "Content-Type": "application/json"}
     since = f"{date_from}T00:00:00Z"; to = f"{date_to}T23:59:59Z"
-    all_p = []; cursor = ""; LIMIT = 100
+    all_p = []; cursor = ""; LIMIT = 100; page = 0
     while True:
+        page += 1
         payload = {"dir": "ASC", "filter": {"since": since, "to": to},
                    "limit": LIMIT, "translit": False,
                    "with": {"analytics_data": True, "financial_data": True}}
@@ -547,14 +548,15 @@ async def fetch_postings(date_from, date_to):
         if not data.get("has_next"): break
         cursor = data.get("cursor", "")
         if not cursor or len(postings) < LIMIT: break
+        if page % 20 == 0:
+            write_log(f"📦 FBO: загружено {len(all_p)} записей (стр. {page})")
     write_log(f"📦 Отгрузок: {len(all_p)} за {date_from}–{date_to}")
     await save_to_cache(cache_key, all_p)
     return all_p
 
-async def fetch_advertising_expense(date_from, date_to):
-    cache_key = f"ad_{date_from}_{date_to}"
-    cached = await get_from_cache(cache_key)
-    if cached is not None: return cached
+# ==================== РЕКЛАМА (с разбивкой больших периодов) ====================
+async def _fetch_advertising_expense_single(date_from, date_to):
+    """Один запрос к API Performance. Период должен быть ≤ 62 дней."""
     token = await get_performance_token()
     if not token: return 0.0
     url = "https://api-performance.ozon.ru/api/client/statistics/expense/json"
@@ -571,10 +573,55 @@ async def fetch_advertising_expense(date_from, date_to):
                     if ms is not None:
                         try: total += float(str(ms).replace(",", "."))
                         except: pass
-        await save_to_cache(cache_key, total); return total
+        return total
     except Exception as e:
-        write_log(f"❌ Реклама: {e}"); return 0.0
+        write_log(f"❌ Реклама ({date_from}–{date_to}): {e}")
+        return 0.0
 
+async def fetch_advertising_expense(date_from, date_to):
+    """
+    Загружает рекламу за произвольный период.
+    Если период > 60 дней — разбивает на части по 60 дней и суммирует.
+    """
+    cache_key = f"ad_{date_from}_{date_to}"
+    cached = await get_from_cache(cache_key)
+    if cached is not None: return cached
+
+    start_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d").date()
+    end_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d").date()
+    today = get_moscow_today()
+    if start_dt > today: return 0.0
+    if end_dt > today: end_dt = today
+
+    total_days = (end_dt - start_dt).days + 1
+
+    # Один запрос, если укладываемся в лимит
+    if total_days <= AD_CHUNK_DAYS:
+        result = await _fetch_advertising_expense_single(date_from, end_dt.isoformat())
+        await save_to_cache(cache_key, result)
+        return result
+
+    # Разбивка на части
+    total = 0.0
+    chunks_count = (total_days + AD_CHUNK_DAYS - 1) // AD_CHUNK_DAYS
+    write_log(f"📢 Реклама: разбивка {date_from}–{date_to} на {chunks_count} частей по {AD_CHUNK_DAYS} дней")
+    cur = start_dt
+    chunk_idx = 0
+    while cur <= end_dt:
+        chunk_idx += 1
+        chunk_end = min(cur + datetime.timedelta(days=AD_CHUNK_DAYS - 1), end_dt)
+        chunk_from = cur.isoformat()
+        chunk_to = chunk_end.isoformat()
+        write_log(f"📢 Реклама [{chunk_idx}/{chunks_count}]: {chunk_from}–{chunk_to}")
+        part = await _fetch_advertising_expense_single(chunk_from, chunk_to)
+        total += part
+        cur = chunk_end + datetime.timedelta(days=1)
+
+    write_log(f"📢 Реклама: итого {total:.2f} ₽ за {date_from}–{date_to}")
+    await save_to_cache(cache_key, total)
+    return total
+
+# ==================== ФИНАНСЫ (по дням) ====================
 async def fetch_finance_accruals_by_day(date_str):
     headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY, "Content-Type": "application/json"}
     payload = {"date": date_str}; all_a = []
@@ -927,10 +974,6 @@ async def get_period_metrics(df, dt):
 
 # ==================== ОТЧЁТЫ ====================
 async def build_today_report(include_yesterday=False):
-    """
-    include_yesterday=False → обычный отчёт: Сегодня + Текущий месяц + Расходы
-    include_yesterday=True  → отчёт за Вчера: Вчера + Текущий месяц + Расходы
-    """
     now = get_current_time_msk()
     td = now.date(); today = td.isoformat()
     yest = (td - datetime.timedelta(days=1)).isoformat()
@@ -939,7 +982,6 @@ async def build_today_report(include_yesterday=False):
     dp = (td - cm).days + 1
     pm_e = pm + datetime.timedelta(days=dp - 1); pm_e_s = pm_e.isoformat()
 
-    # Всегда загружаем всё нужное
     postings_cur, postings_prev, ad_t, ad_y, ad_m, ad_pm, fin_t, fin_m = await asyncio.gather(
         fetch_postings(cm_s, today), fetch_postings(pm_s, pm_e_s),
         fetch_advertising_expense(today, today), fetch_advertising_expense(yest, yest),
@@ -1305,12 +1347,12 @@ async def send_help(update, context):
         "• 📊 Отчёт по продажам – актуальная сводка за сегодня и текущий месяц.\n"
         "• 📦 Отчёт по товарам – топ товаров по выручке.\n"
         "• 📆 Выбрать дату – данные за конкретный день.\n"
-        "• 📊 Выбрать период – месяц/квартал/год/произвольный.\n"
-        "• 📈 Динамика продаж – график доставленных заказов по месяцам.\n"
+        "• 📊 Выбрать период – месяц/квартал/год/произвольный (до года за раз).\n"
+        "• 📈 Динамика продаж – график доставленных заказов по месяцам (за год или диапазон).\n"
         "• 📈 Динамика по товару – график продаж конкретного товара.\n"
         "• 🔔 Автоматические рассылки – персональная настройка.\n\n"
         "🔹 *Автоматические отчёты (персональные)*\n"
-        "• 🕒 Выбор времени рассылок – общие часы, когда отправляется обычный отчёт (Сегодня + Текущий месяц).\n"
+        "• 🕒 Выбор времени рассылок – часы, когда отправляется обычный отчёт (Сегодня + Текущий месяц).\n"
         "• 📅 Добавление отчёта за Вчера – часы из выбранных, когда отправляется отчёт с блоком «Вчера».\n"
         "• 🔕 Режим тишины – интервал, когда рассылки не отправляются.\n"
         "• 📤 Отправить сейчас – принудительная отправка отчёта за Вчера.\n\n"
@@ -1318,9 +1360,9 @@ async def send_help(update, context):
         "• 🛒 Заказано / 📦 Доставлено / ❌ Отменено – суммы и шт.\n"
         "• 📢 Реклама – расходы, ДРР (общий) и ДРР (по доставленным).\n"
         "• 💰 Расходы (финансовые) – разбивка по услугам.\n\n"
-        "🔹 *Сравнение*\n"
-        "• «Сегодня» – с аналогичным временем вчера.\n"
-        "• «Текущий месяц» – с аналогичным периодом предыдущего.\n\n"
+        "🔹 *Длительные периоды*\n"
+        "• Запросы за большие периоды (год, произвольный до года) могут занимать 1–3 минуты.\n"
+        "• Данные кэшируются: повторный запрос за тот же период — мгновенный.\n\n"
         "🔹 *Часовой пояс*\n"
         "• Все расчёты – по московскому времени (МСК, UTC+3).\n\n"
     )
@@ -1449,7 +1491,7 @@ async def period_year_cb(update, context):
     if d.startswith("pyy_"):
         y = int(d.split("_")[1])
         df = datetime.date(y,1,1).isoformat(); dt = datetime.date(y,12,31).isoformat()
-        await q.edit_message_text(f"⏳ За {y} год...")
+        await q.edit_message_text(f"⏳ За {y} год (может занять 1–3 минуты)...")
         try:
             rpt = await build_period_report(df, dt, f"{y} год")
             await q.edit_message_text(rpt, parse_mode="Markdown")
@@ -1559,7 +1601,7 @@ async def custom_end_cb(update, context):
             if not ok:
                 await q.edit_message_text(r); return WAITING_PERIOD_END
             nm = f"{ds} – {de}"
-            await q.edit_message_text(f"⏳ За {nm}...")
+            await q.edit_message_text(f"⏳ За {nm} (может занять 1–3 минуты)...")
             try:
                 rpt = await build_period_report(ds, de, nm)
                 await q.edit_message_text(rpt, parse_mode="Markdown")
@@ -2109,7 +2151,6 @@ async def schedule_cb(update, context):
         settings = await load_settings()
         us = get_user_settings(settings, chat_id)
         us["schedule_hours"] = temp
-        # Удаляем из yesterday_report_hours часы, которых больше нет в schedule_hours
         us["yesterday_report_hours"] = [h for h in us.get("yesterday_report_hours", []) if h in temp]
         settings[str(chat_id)] = us
         await save_settings(settings)
@@ -2295,19 +2336,10 @@ async def admin_list(update, context):
 
 # ==================== ПЛАНИРОВЩИК ====================
 async def check_auto_reports(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Логика:
-    - schedule_hours = общие часы (обычный отчёт).
-    - yesterday_report_hours ⊆ schedule_hours (отчёт с блоком Вчера).
-    - В час, который в yesterday_report_hours → отправляем отчёт с Вчера.
-    - В остальные часы из schedule_hours → отправляем обычный отчёт.
-    - last_sent_regular и last_sent_yesterday — независимые ключи.
-    """
     now = datetime.datetime.now(MOSCOW_TZ)
     cur_hour = now.hour; cur_date = now.strftime("%Y-%m-%d")
     settings = await load_settings()
 
-    # 1) Напоминание в 12:00 (только если schedule_hours пуст)
     if cur_hour == 12:
         recipients = [ADMIN_CHAT_ID] + [m["id"] for m in load_managers()]
         for uid in set(recipients):
@@ -2329,7 +2361,6 @@ async def check_auto_reports(context: ContextTypes.DEFAULT_TYPE):
                 write_log(f"⚠️ Не отправлено {uid}: {e}")
         await save_settings(settings)
 
-    # 2) Рассылки
     for sid, us in settings.items():
         try: uid = int(sid)
         except: continue
@@ -2338,7 +2369,6 @@ async def check_auto_reports(context: ContextTypes.DEFAULT_TYPE):
         if not sch: continue
         if cur_hour not in sch: continue
 
-        # Режим тишины
         s = us.get("silence_start"); e = us.get("silence_end")
         if s is not None and e is not None:
             if s < e:
@@ -2349,7 +2379,6 @@ async def check_auto_reports(context: ContextTypes.DEFAULT_TYPE):
         yest_hours = us.get("yesterday_report_hours", [])
 
         if cur_hour in yest_hours:
-            # Ветка «с блоком Вчера»
             last = us.get("last_sent_yesterday")
             if last:
                 try:
@@ -2366,7 +2395,6 @@ async def check_auto_reports(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 write_log(f"❌ Автоотчёт (Вчера) {uid}: {e}")
         else:
-            # Ветка обычного отчёта
             last = us.get("last_sent_regular")
             if last:
                 try:
