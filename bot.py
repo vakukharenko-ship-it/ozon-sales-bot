@@ -29,8 +29,8 @@ from telegram.warnings import PTBUserWarning
 
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
-VERSION = "2.8.1"
-CHANGELOG_MESSAGE = "Кэш больше не применяется к отчётам, включающим сегодняшний день (Продажи за сегодня, Текущий месяц и др.). Историческая часть диапазона берётся из кэша, а сегодняшний день — всегда свежий запрос к API. Теперь данные за сегодня в отчётах всегда актуальны."
+VERSION = "2.8.2"
+CHANGELOG_MESSAGE = "Исправлена загрузка справочника начислений Ozon: улучшена обработка ответа, добавлено подробное логирование. Fallback-названия теперь используют категории вместо '(type XX)'. Добавлена возможность ручного заполнения /app/data/accrual_types.json."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 60
@@ -263,6 +263,8 @@ def _save_accrual_types_sync(data):
         write_log(f"❌ Запись accrual_types: {e}")
 
 async def fetch_accrual_types():
+    """Загружает справочник начислений из Ozon API. Кэширует на сутки.
+    Если API недоступен, пытается использовать локальный файл."""
     global _accrual_types_cache
     if _accrual_types_cache is not None:
         return _accrual_types_cache
@@ -272,6 +274,7 @@ async def fetch_accrual_types():
         try:
             mtime = os.path.getmtime(ACCRUAL_TYPES_FILE)
             if time.time() - mtime < ACCRUAL_TYPES_TTL:
+                write_log(f"📚 Справочник начислений из файла ({len(cached)} типов)")
                 return _accrual_types_cache
         except Exception:
             pass
@@ -282,8 +285,18 @@ async def fetch_accrual_types():
         data = await api_request_with_retry(OZON_FINANCE_ACCRUAL_TYPES_URL, headers,
                                             payload, method='POST', kind='finance')
         types_list = []
+        # Поддерживаем несколько возможных структур ответа
         if isinstance(data, dict):
-            types_list = data.get("types", data.get("result", []))
+            if "types" in data:
+                types_list = data["types"]
+            elif "result" in data:
+                res = data["result"]
+                if isinstance(res, dict) and "types" in res:
+                    types_list = res["types"]
+                elif isinstance(res, list):
+                    types_list = res
+            elif "accrual_types" in data:
+                types_list = data["accrual_types"]
         elif isinstance(data, list):
             types_list = data
         result = {}
@@ -297,9 +310,14 @@ async def fetch_accrual_types():
             _accrual_types_cache = result
             _save_accrual_types_sync(result)
             write_log(f"✅ Справочник начислений Ozon загружен ({len(result)} типов)")
+        else:
+            write_log(f"⚠️ Ozon вернул пустой справочник начислений. Ответ: {str(data)[:300]}")
         return result
     except Exception as e:
         write_log(f"❌ Ошибка загрузки справочника начислений: {e}")
+        # Пробуем использовать локальный файл
+        if _accrual_types_cache is None:
+            _accrual_types_cache = _load_accrual_types_sync()
         return _accrual_types_cache if _accrual_types_cache is not None else {}
 
 def get_accrual_type_name(type_id):
@@ -325,21 +343,24 @@ def type_name(type_id, category_code):
         entry = data[tid]
         if isinstance(entry, dict):
             name = entry.get("name", "")
-            if name and not name.startswith("❓"):
+            # Если в локальном справочнике название вида "(type XX)" или "❓", используем категорийный fallback
+            if name and not name.startswith("❓") and "(type " not in name:
                 return name
-        return str(entry)
+        elif not str(entry).startswith("❓") and "(type " not in str(entry):
+            return str(entry)
+    # Категорийный fallback — человеческое название без "(type XX)"
     fallback = CATEGORY_FALLBACK.get(category_code, "Услуги")
-    placeholder = f"{fallback} (type {tid})"
-    data[tid] = {"name": placeholder, "count": 0, "sum": 0.0}
+    # Сохраняем для будущего использования, но уже с чистым названием
+    data[tid] = {"name": fallback, "count": 0, "sum": 0.0}
     _save_expense_types_sync(data)
-    return placeholder
+    return fallback
 
 def register_expense_hit(type_id, amount):
     if type_id is None: return
     tid = str(type_id)
     data = get_expense_types()
     if tid not in data:
-        name = get_accrual_type_name(tid) or f"Услуги (type {tid})"
+        name = get_accrual_type_name(tid) or CATEGORY_FALLBACK.get("ITEM", "Услуги")
         data[tid] = {"name": name, "count": 0, "sum": 0.0}
     entry = data[tid]
     if not isinstance(entry, dict):
@@ -529,8 +550,6 @@ def indicator(value_current, value_prev, better_is_higher):
     return "🟢" if delta < 0 else ("🔴" if delta > 0 else "")
 
 def _range_includes_today(date_from: str, date_to: str) -> bool:
-    """True, если сегодняшняя дата попадает в диапазон [date_from, date_to].
-    Кэш для таких диапазонов не используется, чтобы данные за сегодня были актуальны."""
     try:
         today = get_moscow_today().isoformat()
         return date_from <= today <= date_to
@@ -696,7 +715,8 @@ async def api_request_with_retry(url, headers, payload=None, method='POST', kind
                             w = API_RETRY_DELAY * (2 ** attempt)
                             await asyncio.sleep(w); continue
                         if resp.status >= 400:
-                            if not silent_404: write_log(f"❌ API {resp.status}: {body[:300]}")
+                            if not silent_404:
+                                write_log(f"❌ API {resp.status} {url}: {body[:300]}")
                             raise aiohttp.ClientResponseError(resp.request_info, resp.history,
                                 status=resp.status, message=body[:200])
                         return json.loads(body)
@@ -708,7 +728,8 @@ async def api_request_with_retry(url, headers, payload=None, method='POST', kind
                             w = API_RETRY_DELAY * (2 ** attempt)
                             await asyncio.sleep(w); continue
                         if resp.status >= 400:
-                            if not silent_404: write_log(f"❌ API {resp.status}: {body[:300]}")
+                            if not silent_404:
+                                write_log(f"❌ API {resp.status} {url}: {body[:300]}")
                             raise aiohttp.ClientResponseError(resp.request_info, resp.history,
                                 status=resp.status, message=body[:200])
                         return json.loads(body)
@@ -734,7 +755,6 @@ async def get_performance_token():
 
 # ==================== ОТГРУЗКИ ====================
 async def _fetch_postings_raw(date_from, date_to):
-    """Загрузка отгрузок из Ozon без кэша."""
     headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY, "Content-Type": "application/json"}
     since = f"{date_from}T00:00:00Z"; to = f"{date_to}T23:59:59Z"
     all_p = []; cursor = ""; LIMIT = 100; page = 0
@@ -758,11 +778,8 @@ async def _fetch_postings_raw(date_from, date_to):
     return all_p
 
 async def fetch_postings(date_from, date_to):
-    """Загрузка отгрузок. Для диапазонов, включающих сегодня, кэш не используется:
-    историческая часть берётся из кэша, сегодняшний день — всегда свежий запрос."""
     today = get_moscow_today()
     today_iso = today.isoformat()
-    # Полностью исторический диапазон — используем кэш как раньше
     if date_to < today_iso:
         cache_key = f"postings_{date_from}_{date_to}"
         cached = await get_from_cache(cache_key)
@@ -770,10 +787,8 @@ async def fetch_postings(date_from, date_to):
         all_p = await _fetch_postings_raw(date_from, date_to)
         await save_to_cache(cache_key, all_p)
         return all_p
-    # Диапазон в будущем — ничего не отдаём
     if date_from > today_iso:
         return []
-    # Диапазон включает сегодня: история из кэша + сегодня свежее
     result = []
     if date_from < today_iso:
         yest_iso = (today - datetime.timedelta(days=1)).isoformat()
@@ -785,7 +800,6 @@ async def fetch_postings(date_from, date_to):
             hist = await _fetch_postings_raw(date_from, yest_iso)
             await save_to_cache(cache_key, hist)
             result.extend(hist)
-    # сегодня — всегда без кэша
     today_data = await _fetch_postings_raw(today_iso, today_iso)
     result.extend(today_data)
     return result
@@ -833,7 +847,6 @@ async def fetch_advertising_expense(date_from, date_to):
     today = get_moscow_today()
     if start_dt > today: return 0.0
     if end_dt > today: end_dt = today
-    # Полностью исторический диапазон — кэш
     if end_dt < today:
         cache_key = f"ad_{date_from}_{date_to}"
         cached = await get_from_cache(cache_key)
@@ -841,7 +854,6 @@ async def fetch_advertising_expense(date_from, date_to):
         result = await _fetch_advertising_expense_chunked(date_from, end_dt)
         await save_to_cache(cache_key, result)
         return result
-    # Включает сегодня: история из кэша + сегодня без кэша
     total = 0.0
     if start_dt < today:
         yest = today - datetime.timedelta(days=1)
@@ -901,7 +913,6 @@ async def fetch_finance_transactions(date_from, date_to, status_msg=None):
     all_a = []; missing = []
     for d in days:
         if d == today_iso:
-            # сегодня всегда перезагружаем (не читаем даже с диска)
             missing.append(d)
             continue
         c = disk_cache_get(f"fin_day_{d}")
@@ -1459,8 +1470,6 @@ async def _get_all_campaign_data(token, status_msg=None):
     return campaigns, skus_by_campaign
 
 async def build_ad_report_month(status_msg=None):
-    # Отчёт за текущий месяц охватывает [1-е число месяца, вчера],
-    # т.е. сегодняшний день не входит — кэш безопасен.
     cache_key = f"ad_report_month_{get_moscow_today().isoformat()}_v3"
     cached = await get_from_cache(cache_key)
     if cached is not None: return cached
@@ -2048,7 +2057,12 @@ async def accrual_types_command(update, context):
         return
     types = await fetch_accrual_types()
     if not types:
-        await update.message.reply_text("❌ Не удалось загрузить справочник начислений.")
+        await update.message.reply_text(
+            "❌ Не удалось загрузить справочник начислений.\n\n"
+            "Проверьте лог `/app/data/ozon_log.txt` — там указана точная причина.\n\n"
+            "Вы также можете заполнить файл `/app/data/accrual_types.json` вручную:\n"
+            '```json\n{"41": "Реклама", "59": "Услуги отправления"}\n```',
+            parse_mode="Markdown")
         return
     lines = ["📚 *Справочник начислений Ozon*", ""]
     for tid, name in sorted(types.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 0):
