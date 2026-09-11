@@ -23,8 +23,8 @@ from telegram.warnings import PTBUserWarning
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ ====================
-VERSION = "2.4.2"
-CHANGELOG_MESSAGE = "Товарные отчёты (топ за день/период + динамика). Persistent disk cache — повторные запросы мгновенные."
+VERSION = "2.4.3"
+CHANGELOG_MESSAGE = "version_history.json теперь в /app/data/ — сохраняется между перезапусками."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 60
@@ -33,9 +33,9 @@ API_RETRY_DELAY = 10
 POSTINGS_RATE = 0.5
 FINANCE_RATE = 0.5
 PERFORMANCE_RATE = 1.0
-CACHE_TTL_SECONDS = 3600       # RAM-кэш: 1 час
+CACHE_TTL_SECONDS = 3600
 DISK_CACHE_DIR = "/app/data/cache"
-VERSION_HISTORY_FILE = "version_history.json"
+VERSION_HISTORY_FILE = "/app/data/version_history.json"   # ← перенесён в персистентную папку
 LOG_FILE = "/app/data/ozon_log.txt"
 
 # Состояния
@@ -121,24 +121,35 @@ def validate_env_vars() -> bool:
     return True
 
 def update_version_history(version, message):
+    """История версий в /app/data/ — сохраняется между перезапусками."""
+    try:
+        os.makedirs(os.path.dirname(VERSION_HISTORY_FILE), exist_ok=True)
+    except Exception as e:
+        write_log(f"⚠️ Не удалось создать папку для истории: {e}")
+
     history = []
     if os.path.exists(VERSION_HISTORY_FILE):
         try:
             with open(VERSION_HISTORY_FILE, "r", encoding="utf-8") as f:
                 history = json.load(f)
-        except: history = []
+        except Exception as e:
+            write_log(f"⚠️ Ошибка чтения истории: {e}")
+            history = []
+
     for e in history:
         if e.get("version") == version:
             write_log(f"ℹ️ Версия {version} уже в истории.")
             return
+
     now = datetime.datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M:%S")
     history.append({"version": version, "date": now, "message": message})
+
     try:
         with open(VERSION_HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
-        write_log(f"✅ История: {version}")
+        write_log(f"✅ История: {version} (всего записей: {len(history)})")
     except Exception as e:
-        write_log(f"❌ Ошибка истории: {e}")
+        write_log(f"❌ Ошибка записи истории: {e}")
 
 # ==================== PERSISTENT CACHE ====================
 def _disk_path(key):
@@ -168,7 +179,6 @@ async def get_from_cache(key):
             ts = _cache_timestamps.get(key)
             if ts and (time.time() - ts) < CACHE_TTL_SECONDS:
                 return _api_cache[key]
-    # RAM промах — проверяем диск
     val = disk_cache_get(key)
     if val is not None:
         async with _cache_lock:
@@ -1157,12 +1167,20 @@ async def cancel(update, context):
 # ==================== ЗАПУСК ====================
 def main():
     if not validate_env_vars(): sys.exit(1)
+    # Создаём папку для данных заранее
+    try:
+        os.makedirs("/app/data", exist_ok=True)
+        os.makedirs(DISK_CACHE_DIR, exist_ok=True)
+    except Exception as e:
+        print(f"⚠️ Не удалось создать /app/data: {e}")
+
     write_log(f"🚀 Запуск (v{VERSION})")
     write_log(f"✅ OZON_CLIENT_ID: {mask_secret(OZON_CLIENT_ID)}")
     write_log(f"✅ OZON_API_KEY: {mask_secret(OZON_API_KEY)}")
     write_log(f"✅ TELEGRAM_BOT_TOKEN: {mask_secret(TELEGRAM_BOT_TOKEN)}")
     write_log(f"✅ ADMIN_CHAT_ID: {ADMIN_CHAT_ID}")
     write_log(f"✅ Disk cache: {DISK_CACHE_DIR}")
+    write_log(f"✅ История версий: {VERSION_HISTORY_FILE}")
     update_version_history(VERSION, CHANGELOG_MESSAGE)
 
     app = (Application.builder()
