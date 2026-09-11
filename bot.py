@@ -1,6 +1,5 @@
 # ============================================================
-# ОТЧЁТ ПО РЕКЛАМЕ — раздел "Текущий месяц"
-# Тестовый скрипт. После проверки переносим в основной бот.
+# ОТЧЁТ ПО РЕКЛАМЕ — раздел "Текущий месяц" (тестовая версия 2)
 # ============================================================
 import asyncio
 import aiohttp
@@ -9,7 +8,6 @@ import json
 import os
 from typing import List, Dict, Optional
 
-# ==================== КОНФИГ ====================
 OZON_PERFORMANCE_CLIENT_ID = os.getenv("OZON_PERFORMANCE_CLIENT_ID")
 OZON_PERFORMANCE_CLIENT_SECRET = os.getenv("OZON_PERFORMANCE_CLIENT_SECRET")
 OZON_CLIENT_ID = os.getenv("OZON_CLIENT_ID")
@@ -42,7 +40,6 @@ async def close_session():
 
 
 async def _perf_rate_acquire():
-    """1 запрос в секунду к Performance API."""
     global _perf_last
     async with _perf_rate_lock:
         now = asyncio.get_event_loop().time()
@@ -52,29 +49,32 @@ async def _perf_rate_acquire():
         _perf_last = asyncio.get_event_loop().time()
 
 
-async def api_get(url, headers, params=None, kind='perf'):
+async def api_get(url, headers, params=None, kind='perf', silent_404=False):
     for attempt in range(3):
         try:
             if kind == 'perf':
                 await _perf_rate_acquire()
             async with _http_session.get(url, headers=headers, params=params) as r:
                 body = await r.text()
+                if r.status == 404 and silent_404:
+                    return None
                 if r.status == 429:
                     w = 2 * (2 ** attempt)
                     log(f"⚠️ 429, ждём {w}с")
                     await asyncio.sleep(w)
                     continue
                 if r.status >= 400:
-                    log(f"❌ GET {url} → {r.status}: {body[:200]}")
-                    raise aiohttp.ClientResponseError(r.request_info, r.history,
-                        status=r.status, message=body[:200])
+                    if not silent_404:
+                        log(f"❌ GET {url} → {r.status}: {body[:200]}")
+                    return None
                 return json.loads(body)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             if attempt == 2:
-                log(f"❌ GET failed: {e}")
-                raise
+                if not silent_404:
+                    log(f"❌ GET failed: {e}")
+                return None
             await asyncio.sleep(2 * (attempt + 1))
-    raise Exception("API failed")
+    return None
 
 
 async def api_post(url, headers, payload=None, kind='seller'):
@@ -91,24 +91,25 @@ async def api_post(url, headers, payload=None, kind='seller'):
                     continue
                 if r.status >= 400:
                     log(f"❌ POST {url} → {r.status}: {body[:200]}")
-                    raise aiohttp.ClientResponseError(r.request_info, r.history,
-                        status=r.status, message=body[:200])
+                    return None
                 return json.loads(body)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             if attempt == 2:
                 log(f"❌ POST failed: {e}")
-                raise
+                return None
             await asyncio.sleep(2 * (attempt + 1))
-    raise Exception("API failed")
+    return None
 
 
 # ==================== ПАРСИНГ ЧИСЕЛ ====================
 def to_float(val, default=0.0):
-    """'705,69' → 705.69, '0,03' → 0.03, None → default."""
+    """'705,69' → 705.69, {'amount': '1496'} → 1496.0"""
     if val is None:
         return default
     if isinstance(val, (int, float)):
         return float(val)
+    if isinstance(val, dict):
+        val = val.get("amount", val.get("value", 0))
     s = str(val).strip().replace(" ", "").replace(",", ".")
     try:
         return float(s)
@@ -123,6 +124,14 @@ def to_int(val, default=0):
         return default
 
 
+def extract_price(product) -> float:
+    """Правильно извлекает цену из товара: dict или строка."""
+    if not isinstance(product, dict):
+        return 0.0
+    price_val = product.get("price", 0)
+    return to_float(price_val)
+
+
 # ==================== PERFORMANCE API ====================
 async def get_perf_token():
     if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
@@ -134,71 +143,50 @@ async def get_perf_token():
         "client_secret": OZON_PERFORMANCE_CLIENT_SECRET,
         "grant_type": "client_credentials",
     }
-    try:
-        data = await api_post(url, {"Content-Type": "application/json"}, payload, kind='perf')
-        token = data.get("access_token")
-        if token:
-            log("✅ Performance токен получен")
-        return token
-    except Exception as e:
-        log(f"❌ Токен Performance: {e}")
-        return None
+    data = await api_post(url, {"Content-Type": "application/json"}, payload, kind='perf')
+    if data and data.get("access_token"):
+        log("✅ Performance токен получен")
+        return data["access_token"]
+    log("❌ Не удалось получить Performance токен")
+    return None
 
 
 async def fetch_campaigns(token) -> List[Dict]:
     headers = {"Authorization": f"Bearer {token}"}
-    try:
-        data = await api_get("https://api-performance.ozon.ru/api/client/campaign",
-                             headers, kind='perf')
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            return data.get("list", data.get("campaigns", []))
-    except Exception as e:
-        log(f"❌ Кампании: {e}")
+    data = await api_get("https://api-performance.ozon.ru/api/client/campaign", headers)
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get("list", data.get("campaigns", []))
     return []
 
 
 async def fetch_campaign_objects(token, campaign_id: str) -> List[str]:
-    """Возвращает список SKU, участвующих в кампании."""
+    """SKU-объекты кампании. 404 (нет объектов) — не ошибка, тихо пропускаем."""
     headers = {"Authorization": f"Bearer {token}"}
     url = f"https://api-performance.ozon.ru/api/client/campaign/{campaign_id}/objects"
-    try:
-        data = await api_get(url, headers, kind='perf')
-        result = []
-        if isinstance(data, dict):
-            for item in data.get("list", []):
-                if isinstance(item, dict) and item.get("id"):
-                    result.append(str(item["id"]))
-        return result
-    except Exception:
-        return []
+    data = await api_get(url, headers, silent_404=True)
+    result = []
+    if isinstance(data, dict):
+        for item in data.get("list", []):
+            if isinstance(item, dict) and item.get("id"):
+                result.append(str(item["id"]))
+    return result
 
 
 async def fetch_stats(token, campaign_ids: List[str], date_from: str, date_to: str) -> List[Dict]:
-    """
-    Одна строка на кампанию. Возвращает список словарей вида:
-    {id, title, moneySpent, views, clicks, ctr, clickPrice, orders, ordersMoney, drr, toCart, ...}
-    """
     if not campaign_ids:
         return []
     headers = {"Authorization": f"Bearer {token}"}
-    url = "https://api-performance.ozon.ru/api/client/statistics/campaign/product/json"
-    # Передаём как repeated params
-    params = [("dateFrom", date_from), ("dateTo", date_to)]
+    base = "https://api-performance.ozon.ru/api/client/statistics/campaign/product/json"
+    parts = [f"dateFrom={date_from}", f"dateTo={date_to}"]
     for cid in campaign_ids:
-        params.append(("campaignIds", cid))
-    # aiohttp не принимает list of tuples в params — строим вручную
-    query = "&".join(f"{k}={v}" for k, v in params)
-    full_url = f"{url}?{query}"
-    try:
-        data = await api_get(full_url, headers, kind='perf')
-        rows = data.get("rows", []) if isinstance(data, dict) else []
-        log(f"📊 Статистика по {len(rows)} кампаниям за {date_from}–{date_to}")
-        return rows
-    except Exception as e:
-        log(f"❌ Статистика: {e}")
-        return []
+        parts.append(f"campaignIds={cid}")
+    url = base + "?" + "&".join(parts)
+    data = await api_get(url, headers)
+    rows = data.get("rows", []) if isinstance(data, dict) else []
+    log(f"📊 Статистика: {len(rows)} строк за {date_from}–{date_to}")
+    return rows
 
 
 # ==================== SELLER API (заказы) ====================
@@ -223,11 +211,9 @@ async def fetch_postings(date_from: str, date_to: str) -> List[Dict]:
         }
         if cursor:
             payload["cursor"] = cursor
-        try:
-            data = await api_post("https://api-seller.ozon.ru/v3/posting/fbo/list",
-                                  headers, payload, kind='seller')
-        except Exception as e:
-            log(f"❌ FBO: {e}")
+        data = await api_post("https://api-seller.ozon.ru/v3/posting/fbo/list",
+                              headers, payload, kind='seller')
+        if not data:
             break
         postings = data.get("postings", [])
         if not postings:
@@ -242,48 +228,45 @@ async def fetch_postings(date_from: str, date_to: str) -> List[Dict]:
     return all_p
 
 
-def sum_sales_by_skus(postings: List[Dict], skus: set) -> float:
-    """Суммирует продажи по указанным SKU."""
+def sum_sales_by_sku_set(postings: List[Dict], skus: set) -> float:
+    """Сумма продаж по SKU. Корректно работает с price как dict."""
+    if not skus:
+        return 0.0
     total = 0.0
+    matched_skus = set()
     for p in postings:
         for prod in p.get("products", []):
             sku = str(prod.get("sku", ""))
             if sku in skus:
+                matched_skus.add(sku)
                 qty = int(prod.get("quantity", 0))
-                try:
-                    price = float(str(prod.get("price", "0")).replace(",", "."))
-                except Exception:
-                    price = 0.0
+                price = extract_price(prod)
                 total += price * qty
+    if matched_skus:
+        log(f"   найдено заказов по {len(matched_skus)}/{len(skus)} SKU")
     return total
 
 
 # ==================== АГРЕГАЦИЯ ====================
-def aggregate_stats_rows(rows: List[Dict], skus_by_campaign: Dict[str, List[str]],
-                        postings: List[Dict]) -> Dict:
-    """Агрегирует строки статистики в суммарный блок."""
+def aggregate_stats_rows(rows, skus_by_campaign, postings):
     total = {
         "avg_bid": 0.0, "avg_cpc": 0.0, "ad_sales": 0.0, "total_sales": 0.0,
         "expense": 0.0, "drr_ad": None, "drr_total": None,
-        "impressions": 0, "clicks": 0, "carts": 0, "ctr": 0.0,
-        "orders": 0,
+        "impressions": 0, "clicks": 0, "carts": 0, "ctr": 0.0, "orders": 0,
     }
-    total_bid = 0.0
-    bid_count = 0
-    total_expense = 0.0
-    total_ad_sales = 0.0
-    total_views = 0
-    total_clicks = 0
-    total_carts = 0
-    total_orders = 0
+    if not rows:
+        return total
+
+    total_bid = 0.0; bid_count = 0
+    total_expense = 0.0; total_ad_sales = 0.0
+    total_views = 0; total_clicks = 0; total_carts = 0; total_orders = 0
     all_skus = set()
 
     for r in rows:
         cid = str(r.get("id", ""))
         bid = to_float(r.get("clickPrice"))
         if bid > 0:
-            total_bid += bid
-            bid_count += 1
+            total_bid += bid; bid_count += 1
         total_expense += to_float(r.get("moneySpent"))
         total_ad_sales += to_float(r.get("ordersMoney"))
         total_views += to_int(r.get("views"))
@@ -292,8 +275,7 @@ def aggregate_stats_rows(rows: List[Dict], skus_by_campaign: Dict[str, List[str]
         total_orders += to_int(r.get("orders"))
         all_skus.update(skus_by_campaign.get(cid, []))
 
-    # Продано товаров ВСЕГО = сумма продаж по всем рекламируемым SKU
-    total_sales_all = sum_sales_by_sku_set(postings, all_skus) if all_skus else 0.0
+    total_sales_all = sum_sales_by_sku_set(postings, all_skus)
 
     total["avg_bid"] = total_bid / bid_count if bid_count > 0 else 0.0
     total["avg_cpc"] = total_expense / total_clicks if total_clicks > 0 else 0.0
@@ -310,23 +292,7 @@ def aggregate_stats_rows(rows: List[Dict], skus_by_campaign: Dict[str, List[str]
     return total
 
 
-def sum_sales_by_sku_set(postings: List[Dict], skus: set) -> float:
-    total = 0.0
-    for p in postings:
-        for prod in p.get("products", []):
-            if str(prod.get("sku", "")) in skus:
-                qty = int(prod.get("quantity", 0))
-                try:
-                    price = float(str(prod.get("price", "0")).replace(",", "."))
-                except Exception:
-                    price = 0.0
-                total += price * qty
-    return total
-
-
-def aggregate_by_campaign(rows: List[Dict], skus_by_campaign: Dict[str, List[str]],
-                         postings: List[Dict]) -> List[Dict]:
-    """Обрабатывает строки статистики: каждая строка — одна кампания."""
+def aggregate_by_campaign(rows, skus_by_campaign, postings):
     result = []
     for r in rows:
         cid = str(r.get("id", ""))
@@ -338,7 +304,7 @@ def aggregate_by_campaign(rows: List[Dict], skus_by_campaign: Dict[str, List[str
         orders = to_int(r.get("orders"))
         click_price = to_float(r.get("clickPrice"))
         skus = skus_by_campaign.get(cid, [])
-        total_sales = sum_sales_by_sku_set(postings, set(skus)) if skus else 0.0
+        total_sales = sum_sales_by_sku_set(postings, set(skus))
         result.append({
             "campaign_id": cid,
             "campaign_name": r.get("title", cid),
@@ -359,9 +325,8 @@ def aggregate_by_campaign(rows: List[Dict], skus_by_campaign: Dict[str, List[str
     return result
 
 
-# ==================== СРАВНЕНИЕ ====================
+# ==================== ФОРМАТИРОВАНИЕ ====================
 def indicator(cur, prev, better_is_higher=True):
-    """🟢 лучше / 🔴 хуже / '' нет данных."""
     if cur is None or prev is None:
         return ""
     if prev == 0 and cur == 0:
@@ -376,10 +341,10 @@ def indicator(cur, prev, better_is_higher=True):
     return "🟢" if delta < 0 else "🔴"
 
 
-def fmt_f(val, suffix=""):
+def fmt_f(val):
     if val is None:
-        return f"—{suffix}"
-    return f"{val:,.2f}".replace(",", " ") + suffix
+        return "—"
+    return f"{val:,.2f}".replace(",", " ")
 
 
 def fmt_i(val):
@@ -388,56 +353,65 @@ def fmt_i(val):
     return f"{int(val):,}".replace(",", " ")
 
 
-def line(label, cur, prev, fmt_func, better_is_higher=True, suffix="", no_indicator=False):
-    ind = "" if no_indicator else indicator(cur, prev, better_is_higher)
-    prefix = f"{ind} " if ind else "   "
-    cur_str = fmt_func(cur)
-    prev_str = fmt_func(prev)
-    return f"{prefix}{label}: {cur_str} vs {prev_str}"
-
-
 def fmt_pct(val):
     if val is None:
         return "—"
     return f"{val:.2f}%"
 
 
-# ==================== ФОРМИРОВАНИЕ ОТЧЁТА ====================
-def build_report(cur_total, prev_total, cur_camps, prev_camps, period_label):
+def line(label, cur, prev, fmt_func, better_is_higher=True, no_indicator=False, has_prev_data=True):
+    """Строка отчёта. Если prev данных нет — выводим 'нет данных'."""
+    cur_str = fmt_func(cur)
+
+    if not has_prev_data:
+        # За предыдущий период нет данных
+        return f"   {label}: {cur_str} vs — (нет данных)"
+
+    prev_str = fmt_func(prev)
+    if no_indicator:
+        return f"   {label}: {cur_str} vs {prev_str}"
+    ind = indicator(cur, prev, better_is_higher)
+    prefix = f"{ind} " if ind else "   "
+    return f"{prefix}{label}: {cur_str} vs {prev_str}"
+
+
+# ==================== ОТЧЁТ ====================
+def build_report(cur_total, prev_total, cur_camps, prev_camps,
+                 period_label, has_prev_data=True):
     lines = []
     lines.append(f"📊 Статистика за текущий месяц на {period_label} (без сегодня):")
     lines.append("Суммарные данные по всем рекламным кампаниям")
     lines.append("")
-    lines.append(line("Ваша ставка, руб.", cur_total["avg_bid"], prev_total["avg_bid"],
-                      fmt_f, better_is_higher=False, no_indicator=True))
-    lines.append(line("Средняя стоимость клика, руб.", cur_total["avg_cpc"], prev_total["avg_cpc"],
-                      fmt_f, better_is_higher=False))
-    lines.append(line("Продано товаров в рекламной компании, руб.",
-                      cur_total["ad_sales"], prev_total["ad_sales"],
-                      fmt_f, better_is_higher=True))
-    lines.append(line("Продано товаров ВСЕГО, руб.", cur_total["total_sales"], prev_total["total_sales"],
-                      fmt_f, better_is_higher=True))
-    lines.append(line("Расход, руб.", cur_total["expense"], prev_total["expense"],
-                      fmt_f, better_is_higher=False))
-    lines.append(line("ДРР в рекламной компании, %", cur_total["drr_ad"], prev_total["drr_ad"],
-                      fmt_pct, better_is_higher=False))
-    lines.append(line("ДРР ОБЩИЙ, %", cur_total["drr_total"], prev_total["drr_total"],
-                      fmt_pct, better_is_higher=False))
-    lines.append(line("Показы, кол-во.", cur_total["impressions"], prev_total["impressions"],
-                      fmt_i, better_is_higher=True))
-    lines.append(line("Клики, кол-во.", cur_total["clicks"], prev_total["clicks"],
-                      fmt_i, better_is_higher=True))
-    lines.append(line("Добавления в корзину, кол-во.", cur_total["carts"], prev_total["carts"],
-                      fmt_i, better_is_higher=True))
-    lines.append(line("CTR, %", cur_total["ctr"], prev_total["ctr"],
-                      fmt_pct, better_is_higher=True))
+
+    def L(label, cur_key, fmt_func, better_is_higher=True, no_ind=False):
+        return line(label, cur_total.get(cur_key), prev_total.get(cur_key),
+                    fmt_func, better_is_higher, no_ind, has_prev_data)
+
+    lines.append(L("Ваша ставка, руб.", "avg_bid", fmt_f, False, no_ind=True))
+    lines.append(L("Средняя стоимость клика, руб.", "avg_cpc", fmt_f, False))
+    lines.append(L("Продано товаров в рекламной компании, руб.", "ad_sales", fmt_f, True))
+    lines.append(L("Продано товаров ВСЕГО, руб.", "total_sales", fmt_f, True))
+    lines.append(L("Расход, руб.", "expense", fmt_f, False))
+    lines.append(L("ДРР в рекламной компании, %", "drr_ad", fmt_pct, False))
+    lines.append(L("ДРР ОБЩИЙ, %", "drr_total", fmt_pct, False))
+    lines.append(L("Показы, кол-во.", "impressions", fmt_i, True))
+    lines.append(L("Клики, кол-во.", "clicks", fmt_i, True))
+    lines.append(L("Добавления в корзину, кол-во.", "carts", fmt_i, True))
+    lines.append(L("CTR, %", "ctr", fmt_pct, True))
     lines.append("")
     lines.append("ПО КОМПАНИЯМ")
     lines.append("")
 
     prev_map = {c["campaign_id"]: c for c in prev_camps}
 
-    for c in cur_camps:
+    # Показываем только кампании с активностью (показы > 0 или расход > 0)
+    active = [c for c in cur_camps if c["impressions"] > 0 or c["expense"] > 0]
+
+    if not active:
+        lines.append("Нет активных кампаний в этом периоде.")
+        return "\n".join(lines)
+
+    for c in active:
         p = prev_map.get(c["campaign_id"], {})
         lines.append(f"Название рекламной компании: {c['campaign_name']}")
         sku_str = ", ".join(c["skus"][:5]) if c["skus"] else "—"
@@ -445,34 +419,28 @@ def build_report(cur_total, prev_total, cur_camps, prev_camps, period_label):
             sku_str += f" … (+{len(c['skus']) - 5})"
         lines.append(f"СКЮ/АРТИКУЛ: {sku_str}")
         lines.append("")
-        lines.append(line("Ваша ставка, руб.", c["avg_bid"], p.get("avg_bid"),
-                          fmt_f, better_is_higher=False, no_indicator=True))
-        lines.append(line("Средняя стоимость клика, руб.", c["avg_cpc"], p.get("avg_cpc"),
-                          fmt_f, better_is_higher=False))
-        lines.append(line("Продано товаров в рекламной компании, руб.",
-                          c["ad_sales"], p.get("ad_sales"), fmt_f, better_is_higher=True))
-        lines.append(line("Продано товаров ВСЕГО, руб.",
-                          c["total_sales"], p.get("total_sales"), fmt_f, better_is_higher=True))
-        lines.append(line("Расход, руб.", c["expense"], p.get("expense"),
-                          fmt_f, better_is_higher=False))
-        lines.append(line("ДРР в рекламной компании, %", c["drr_ad"], p.get("drr_ad"),
-                          fmt_pct, better_is_higher=False))
-        lines.append(line("ДРР ОБЩИЙ, %", c["drr_total"], p.get("drr_total"),
-                          fmt_pct, better_is_higher=False))
-        lines.append(line("Показы, кол-во.", c["impressions"], p.get("impressions"),
-                          fmt_i, better_is_higher=True))
-        lines.append(line("Клики, кол-во.", c["clicks"], p.get("clicks"),
-                          fmt_i, better_is_higher=True))
-        lines.append(line("Добавления в корзину, кол-во.", c["carts"], p.get("carts"),
-                          fmt_i, better_is_higher=True))
-        lines.append(line("CTR, %", c["ctr"], p.get("ctr"),
-                          fmt_pct, better_is_higher=True))
+
+        def Lc(label, key, fmt_func, better_is_higher=True, no_ind=False):
+            return line(label, c.get(key), p.get(key), fmt_func,
+                        better_is_higher, no_ind, has_prev_data)
+
+        lines.append(Lc("Ваша ставка, руб.", "avg_bid", fmt_f, False, no_ind=True))
+        lines.append(Lc("Средняя стоимость клика, руб.", "avg_cpc", fmt_f, False))
+        lines.append(Lc("Продано товаров в рекламной компании, руб.", "ad_sales", fmt_f, True))
+        lines.append(Lc("Продано товаров ВСЕГО, руб.", "total_sales", fmt_f, True))
+        lines.append(Lc("Расход, руб.", "expense", fmt_f, False))
+        lines.append(Lc("ДРР в рекламной компании, %", "drr_ad", fmt_pct, False))
+        lines.append(Lc("ДРР ОБЩИЙ, %", "drr_total", fmt_pct, False))
+        lines.append(Lc("Показы, кол-во.", "impressions", fmt_i, True))
+        lines.append(Lc("Клики, кол-во.", "clicks", fmt_i, True))
+        lines.append(Lc("Добавления в корзину, кол-во.", "carts", fmt_i, True))
+        lines.append(Lc("CTR, %", "ctr", fmt_pct, True))
         lines.append("")
 
     return "\n".join(lines)
 
 
-# ==================== ОСНОВНАЯ ФУНКЦИЯ ====================
+# ==================== ГЛАВНАЯ ====================
 async def generate_ad_report_month():
     await init_session()
     try:
@@ -481,7 +449,6 @@ async def generate_ad_report_month():
         cur_from = today.replace(day=1)
         cur_to = yesterday
 
-        # Аналогичный период предыдущего месяца
         days_count = (cur_to - cur_from).days + 1
         prev_month_end = cur_from - datetime.timedelta(days=1)
         prev_from = prev_month_end.replace(day=1)
@@ -501,7 +468,7 @@ async def generate_ad_report_month():
         if not campaigns:
             return "❌ Кампании не найдены"
 
-        # Собираем SKU по каждой кампании
+        # SKU по кампаниям
         skus_by_campaign = {}
         for c in campaigns:
             cid = str(c.get("id", ""))
@@ -514,7 +481,7 @@ async def generate_ad_report_month():
 
         campaign_ids = [str(c.get("id")) for c in campaigns if c.get("id")]
 
-        # Параллельно: статистика + postings за оба периода
+        # Параллельно 4 запроса
         cur_rows, prev_rows, cur_postings, prev_postings = await asyncio.gather(
             fetch_stats(token, campaign_ids, cur_from.isoformat(), cur_to.isoformat()),
             fetch_stats(token, campaign_ids, prev_from.isoformat(), prev_to.isoformat()),
@@ -522,14 +489,16 @@ async def generate_ad_report_month():
             fetch_postings(prev_from.isoformat(), prev_to.isoformat()),
         )
 
+        has_prev_data = bool(prev_rows) and any(to_int(r.get("views")) > 0 for r in prev_rows)
+
         cur_total = aggregate_stats_rows(cur_rows, skus_by_campaign, cur_postings)
         prev_total = aggregate_stats_rows(prev_rows, skus_by_campaign, prev_postings)
         cur_camps = aggregate_by_campaign(cur_rows, skus_by_campaign, cur_postings)
         prev_camps = aggregate_by_campaign(prev_rows, skus_by_campaign, prev_postings)
 
-        # Метка даты
         period_label = cur_to.strftime("%d.%m.%Y")
-        return build_report(cur_total, prev_total, cur_camps, prev_camps, period_label)
+        return build_report(cur_total, prev_total, cur_camps, prev_camps,
+                           period_label, has_prev_data)
     finally:
         await close_session()
 
