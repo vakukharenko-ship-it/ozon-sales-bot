@@ -29,8 +29,8 @@ from telegram.warnings import PTBUserWarning
 
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
-VERSION = "2.9.2"
-CHANGELOG_MESSAGE = "Исправлена кнопка '🔙 Назад' (не работала из подменю после 2.9.1). Справочник расходов теперь подменяет устаревшие названия '(type XX)' актуальными из accrual_types.json. Улучшена разбивка длинных сообщений — код-блоки (```) больше не разрезаются, устранена ошибка 'Can't parse entities'."
+VERSION = "2.9.3"
+CHANGELOG_MESSAGE = "Исправлено двойное начисление расходов на рекламу: убрано ручное добавление 'Оплата за клик' в блок 'Расходы', так как Ozon теперь отдаёт эти данные через финансы (type 41 → 'Оплата за клик (реклама)')."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 60
@@ -1671,8 +1671,8 @@ async def build_today_report(include_yesterday=False):
     p_m = aggregate_postings_range(postings_prev, pm_s, pm_e_s)
     exp_t = aggregate_finance_expenses(fin_t)
     exp_m = aggregate_finance_expenses(fin_m)
-    if ad_t > 0: exp_t["Оплата за клик"] = exp_t.get("Оплата за клик", 0) + ad_t
-    if ad_m > 0: exp_m["Оплата за клик"] = exp_m.get("Оплата за клик", 0) + ad_m
+    # ВАЖНО: НЕ добавляем «Оплата за клик» вручную — Ozon уже отдаёт эти данные
+    # через finance API (type 41 → «Оплата за клик (реклама)»). Иначе будет дублирование.
 
     def blk_today():
         os_ = t_m["ordered_sum"]; ou_ = t_m["ordered_units"]
@@ -2689,7 +2689,6 @@ async def show_expense_types(update, context):
     data = get_expense_types()
     if not data:
         await update.message.reply_text("Справочник пуст."); return
-    # Подгружаем справочник начислений Ozon для актуализации названий
     accrual = _accrual_types_cache
     if not accrual:
         accrual = _load_accrual_types_sync()
@@ -2700,7 +2699,6 @@ async def show_expense_types(update, context):
             name = entry.get("name", "?"); cnt = entry.get("count", 0); sm = entry.get("sum", 0.0)
         else:
             name = str(entry); cnt = 0; sm = 0.0
-        # Если есть официальное название — заменяем устаревшее "(type XX)"
         if tid in accrual:
             official = accrual[tid]
             if name != official:
@@ -3737,7 +3735,6 @@ def main():
            .connect_timeout(30.0).read_timeout(30.0).write_timeout(30.0)
            .post_init(init_http_session).post_shutdown(close_http_session).build())
 
-    # ===== Команды =====
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("version", version_command))
     app.add_handler(CommandHandler("help", send_help))
@@ -3746,32 +3743,24 @@ def main():
     app.add_handler(CommandHandler("clearcache", clearcache_command))
     app.add_handler(CommandHandler("accrual_types", accrual_types_command))
 
-    # ===== Главное меню (все кнопки верхнего уровня) =====
     app.add_handler(MessageHandler(filters.Regex(
         "^(📊 Отчёт по продажам|📦 Отчёт по товарам|📈 Отчёт по рекламе|"
         "🔔 Автоматические рассылки|⚙️ Администрирование|"
         "📚 Справочник расходов|📖 Справка|📚 Руководство)$"), handle_main_menu))
 
-    # ===== Проверка доступа =====
     app.add_handler(MessageHandler(filters.Text(["🔄 Проверить доступ"]), check_access_cmd))
-
-    # ===== Кнопки-одиночки =====
     app.add_handler(MessageHandler(filters.Text(["📅 Продажи за сегодня"]), today_report))
     app.add_handler(MessageHandler(filters.Text(["📅 Топ товаров за сегодня"]), top_today))
     app.add_handler(MessageHandler(filters.Text(["📋 Список менеджеров"]), admin_list))
     app.add_handler(MessageHandler(filters.Text(["📅 Реклама за текущий месяц"]), ad_report_month_handler))
-    # Глобальная кнопка «Назад» — возвращает в главное меню
     app.add_handler(MessageHandler(filters.Text(["🔙 Назад"]), back_to_main_menu))
 
-    # ===== Меню автоматических рассылок =====
     app.add_handler(MessageHandler(filters.Regex(
         "^(🕒 Выбор времени рассылок|📅 Добавление отчета за Вчера|"
         "🔕 Режим тишины|📤 Отправить отчет за Вчера сейчас)$"), auto_menu_router))
 
-    # ===== Callback справочника расходов =====
     app.add_handler(CallbackQueryHandler(expense_types_cb, pattern="^et_"))
 
-    # ===== ConversationHandler-ы =====
     conv_date = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📆 Выбрать дату"), date_menu)],
         states={WAITING_DATE_SINGLE: [CallbackQueryHandler(date_cb)]},
