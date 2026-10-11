@@ -10,6 +10,8 @@ import aiohttp
 import warnings
 import sys
 import io
+import base64
+import urllib.parse
 from typing import Optional, List, Dict
 
 import matplotlib
@@ -127,6 +129,9 @@ OZON_PERFORMANCE_CLIENT_SECRET = os.getenv("OZON_PERFORMANCE_CLIENT_SECRET")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID_STR = os.getenv("ADMIN_CHAT_ID")
 ADMIN_CHAT_ID = int(ADMIN_CHAT_ID_STR) if ADMIN_CHAT_ID_STR and ADMIN_CHAT_ID_STR.isdigit() else 0
+# --- FIN API (Apps Script Web App) ---
+FIN_WEBAPP_URL = (os.getenv("FIN_WEBAPP_URL") or "").strip()
+FIN_WEBAPP_SECRET = (os.getenv("FIN_WEBAPP_SECRET") or "").strip()
 
 OZON_POSTING_FBO_URL = "https://api-seller.ozon.ru/v3/posting/fbo/list"
 OZON_FINANCE_ACCRUAL_BY_DAY_URL = "https://api-seller.ozon.ru/v1/finance/accrual/by-day"
@@ -724,7 +729,61 @@ async def get_performance_token():
         return data.get("access_token")
     except Exception as e:
         write_log(f"❌ Токен: {e}"); return None
+# ==================== FIN API (Apps Script) ====================
+async def fin_fetch_options():
+    """Запрашивает у Apps Script доступные годы/периоды/метрики."""
+    if not FIN_WEBAPP_URL or not FIN_WEBAPP_SECRET:
+        return None
+    params = {"secret": FIN_WEBAPP_SECRET, "action": "options"}
+    url = FIN_WEBAPP_URL + "?" + urllib.parse.urlencode(params)
+    try:
+        async with _http_session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            if resp.status != 200:
+                write_log(f"❌ fin options HTTP {resp.status}")
+                return None
+            data = await resp.json(content_type=None)
+            if not isinstance(data, dict) or not data.get("ok"):
+                write_log(f"❌ fin options: {data.get('error') if isinstance(data, dict) else data}")
+                return None
+            return data
+    except Exception as e:
+        write_log(f"❌ fin options: {e}")
+        return None
 
+
+async def fin_fetch_pdf(year, metric, period):
+    """Запрашивает PDF у Apps Script. Возвращает io.BytesIO или None."""
+    if not FIN_WEBAPP_URL or not FIN_WEBAPP_SECRET:
+        return None
+    params = {
+        "secret": FIN_WEBAPP_SECRET,
+        "action": "pdf",
+        "year": year or "",
+        "metric": metric or "",
+        "period": period or "",
+    }
+    url = FIN_WEBAPP_URL + "?" + urllib.parse.urlencode(params)
+    try:
+        async with _http_session.get(url, timeout=aiohttp.ClientTimeout(total=180)) as resp:
+            if resp.status != 200:
+                write_log(f"❌ fin pdf HTTP {resp.status}")
+                return None
+            data = await resp.json(content_type=None)
+            if not isinstance(data, dict) or not data.get("ok"):
+                write_log(f"❌ fin pdf: {data.get('error') if isinstance(data, dict) else data}")
+                return None
+            b64 = data.get("base64", "")
+            if not b64:
+                write_log("❌ fin pdf: пустой base64")
+                return None
+            raw = base64.b64decode(b64)
+            buf = io.BytesIO(raw)
+            buf.name = data.get("filename", "Финпоказатели.pdf")
+            return buf
+    except Exception as e:
+        write_log(f"❌ fin pdf: {e}")
+        return None
+        
 # ==================== ОТГРУЗКИ ====================
 async def _fetch_postings_raw(date_from, date_to):
     headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY, "Content-Type": "application/json"}
@@ -1803,6 +1862,7 @@ def create_calendar(year, month, prefix):
 # ==================== КЛАВИАТУРЫ ====================
 def main_kb(chat_id):
     buttons = [
+        [KeyboardButton("💰 Финансовые показатели")],
         [KeyboardButton("📊 Отчёт по продажам")],
         [KeyboardButton("📦 Отчёт по товарам")],
         [KeyboardButton("📈 Отчёт по рекламе")],
@@ -2281,7 +2341,9 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not has_access(chat_id):
         await update.message.reply_text("❌ Нет доступа.", reply_markup=access_check_kb()); return
-    if text == "📊 Отчёт по продажам":
+    if text == "💰 Финансовые показатели":
+        await show_fin_menu(update, context)
+    elif text == "📊 Отчёт по продажам":
         await update.message.reply_text("📊 *Отчёт по продажам*\n\nВыберите действие:",
                                         reply_markup=sales_reports_kb(), parse_mode="Markdown")
     elif text == "📦 Отчёт по товарам":
@@ -2315,6 +2377,186 @@ async def back_to_main_menu(update, context):
         return
     await update.message.reply_text("🏠 Главное меню:", reply_markup=main_kb(chat_id))
 
+# ==================== ФИНАНСОВЫЕ ПОКАЗАТЕЛИ (UI) ====================
+DEFAULT_FIN_METRICS = [
+    "Оборот", "Валовая прибыль", "Чистая прибыль", "Себестоимость", "Кол-во",
+    "ЧП на 1 шт.", "ROI %", "Налог 7%", "ДРР руб.", "ДРР %", "Возвраты руб.", "Возвраты %",
+]
+
+
+def _fin_get_state(context):
+    st = context.user_data.get("fin_state")
+    if not st:
+        st = {
+            "year": str(get_moscow_today().year),
+            "metric": DEFAULT_FIN_METRICS[0],
+            "period": "Все",
+        }
+        context.user_data["fin_state"] = st
+    return st
+
+
+def _fin_menu_text(st):
+    return (
+        "💰 *Финансовые показатели*\n\n"
+        f"📅 Год: *{st['year']}*\n"
+        f"📈 Показатель: *{st['metric']}*\n"
+        f"🗓 Период: *{st['period']}*\n\n"
+        "Выберите фильтры и нажмите «Получить PDF отчёт»."
+    )
+
+
+def _fin_menu_kb(st):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"📅 Год: {st['year']} ▼", callback_data="fin_pickYear")],
+        [InlineKeyboardButton(f"📈 Показатель: {st['metric']} ▼", callback_data="fin_pickMetric")],
+        [InlineKeyboardButton(f"🗓 Период: {st['period']} ▼", callback_data="fin_pickPeriod")],
+        [InlineKeyboardButton("📄 Получить PDF отчёт", callback_data="fin_getPdf")],
+        [InlineKeyboardButton("🔙 В главное меню", callback_data="fin_back")],
+    ])
+
+
+async def show_fin_menu(update, context):
+    chat_id = update.effective_chat.id
+    if not has_access(chat_id):
+        await update.message.reply_text("❌ Нет доступа.", reply_markup=access_check_kb())
+        return
+    st = _fin_get_state(context)
+    await update.message.reply_text(
+        _fin_menu_text(st), parse_mode="Markdown", reply_markup=_fin_menu_kb(st)
+    )
+
+
+async def fin_callback_handler(update, context):
+    q = update.callback_query
+    await q.answer()
+    d = q.data
+    st = _fin_get_state(context)
+
+    # --- назад в главное меню ---
+    if d == "fin_back":
+        await q.edit_message_text("Возвращаюсь…")
+        await q.message.reply_text("🏠 Главное меню:", reply_markup=main_kb(q.message.chat_id))
+        return
+
+    # --- назад в меню фильтров ---
+    if d == "fin_backToMenu":
+        await q.edit_message_text(_fin_menu_text(st), parse_mode="Markdown",
+                                  reply_markup=_fin_menu_kb(st))
+        return
+
+    # --- выбор года ---
+    if d == "fin_pickYear":
+        opt = await fin_fetch_options()
+        years = (opt or {}).get("years") or []
+        cur = get_moscow_today().year
+        if str(cur) not in years:
+            years.append(str(cur))
+        years = sorted(set(years), reverse=True)
+        if not years:
+            years = [str(cur)]
+        rows = [[InlineKeyboardButton(str(y), callback_data=f"fin_setYear:{y}")] for y in years]
+        rows.append([InlineKeyboardButton("⬅ Назад", callback_data="fin_backToMenu")])
+        await q.edit_message_text("📅 Выберите год:", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    # --- выбор показателя ---
+    if d == "fin_pickMetric":
+        metrics = DEFAULT_FIN_METRICS
+        rows, row = [], []
+        for m in metrics:
+            row.append(InlineKeyboardButton(m, callback_data=f"fin_setMetric:{m}"))
+            if len(row) == 2:
+                rows.append(row); row = []
+        if row:
+            rows.append(row)
+        rows.append([InlineKeyboardButton("⬅ Назад", callback_data="fin_backToMenu")])
+        await q.edit_message_text("📈 Выберите показатель:", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    # --- выбор периода ---
+    if d == "fin_pickPeriod":
+        opt = await fin_fetch_options()
+        periods = (opt or {}).get("periods") or []
+        if not periods:
+            periods = ["Все"]
+        rows, row = [], []
+        for p in periods:
+            row.append(InlineKeyboardButton(p, callback_data=f"fin_setPeriod:{p}"))
+            if len(row) == 3:
+                rows.append(row); row = []
+        if row:
+            rows.append(row)
+        rows.append([InlineKeyboardButton("⬅ Назад", callback_data="fin_backToMenu")])
+        await q.edit_message_text("🗓 Выберите период:", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    # --- сохранение выбора ---
+    if d.startswith("fin_setYear:"):
+        st["year"] = d.split(":", 1)[1]
+        context.user_data["fin_state"] = st
+        await q.edit_message_text(_fin_menu_text(st), parse_mode="Markdown",
+                                  reply_markup=_fin_menu_kb(st))
+        return
+
+    if d.startswith("fin_setMetric:"):
+        st["metric"] = d.split(":", 1)[1]
+        context.user_data["fin_state"] = st
+        await q.edit_message_text(_fin_menu_text(st), parse_mode="Markdown",
+                                  reply_markup=_fin_menu_kb(st))
+        return
+
+    if d.startswith("fin_setPeriod:"):
+        st["period"] = d.split(":", 1)[1]
+        context.user_data["fin_state"] = st
+        await q.edit_message_text(_fin_menu_text(st), parse_mode="Markdown",
+                                  reply_markup=_fin_menu_kb(st))
+        return
+
+    # --- получить PDF ---
+    if d == "fin_getPdf":
+        if not FIN_WEBAPP_URL or not FIN_WEBAPP_SECRET:
+            await q.edit_message_text(
+                "⚠️ Не заданы переменные окружения FIN_WEBAPP_URL / FIN_WEBAPP_SECRET.\n"
+                "Добавьте их и перезапустите бота."
+            )
+            return
+
+        await q.edit_message_text(
+            "⏳ Формирую PDF…\n\n"
+            f"📅 {st['year']} · 📈 {st['metric']} · 🗓 {st['period']}"
+        )
+
+        buf = await fin_fetch_pdf(st["year"], st["metric"], st["period"])
+        if not buf:
+            await q.edit_message_text(
+                "❌ Не удалось получить PDF.\n\n"
+                "Возможные причины:\n"
+                "• Apps Script Web App не развёрнут или недоступен\n"
+                "• Неверный FIN_WEBAPP_SECRET\n"
+                "• Лист «Финпоказатели» отсутствует\n\n"
+                "Подробности — в логе бота."
+            )
+            return
+
+        try:
+            await q.message.reply_document(
+                document=buf,
+                filename=buf.name or "Финпоказатели.pdf",
+                caption=(f"📊 Финпоказатели\n"
+                         f"📅 {st['year']} · 📈 {st['metric']} · 🗓 {st['period']}"),
+            )
+            await q.delete_message()
+            await q.message.reply_text("✅ Готово. Выберите действие:",
+                                       reply_markup=_fin_menu_kb(st))
+        except Exception as e:
+            write_log(f"❌ fin send: {e}")
+            try:
+                await q.edit_message_text(f"❌ Ошибка отправки: {e}")
+            except Exception:
+                pass
+        return
+    
 # ==================== ОТЧЁТ ПО РЕКЛАМЕ — текущий месяц ====================
 async def ad_report_month_handler(update, context):
     if not has_access(update.effective_chat.id): return
@@ -3743,8 +3985,8 @@ def main():
     app.add_handler(CommandHandler("clearcache", clearcache_command))
     app.add_handler(CommandHandler("accrual_types", accrual_types_command))
 
-    app.add_handler(MessageHandler(filters.Regex(
-        "^(📊 Отчёт по продажам|📦 Отчёт по товарам|📈 Отчёт по рекламе|"
+        app.add_handler(MessageHandler(filters.Regex(
+        "^(💰 Финансовые показатели|📊 Отчёт по продажам|📦 Отчёт по товарам|📈 Отчёт по рекламе|"
         "🔔 Автоматические рассылки|⚙️ Администрирование|"
         "📚 Справочник расходов|📖 Справка|📚 Руководство)$"), handle_main_menu))
 
@@ -3760,6 +4002,7 @@ def main():
         "🔕 Режим тишины|📤 Отправить отчет за Вчера сейчас)$"), auto_menu_router))
 
     app.add_handler(CallbackQueryHandler(expense_types_cb, pattern="^et_"))
+    app.add_handler(CallbackQueryHandler(fin_callback_handler, pattern="^fin_"))
 
     conv_date = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📆 Выбрать дату"), date_menu)],
