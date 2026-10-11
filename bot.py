@@ -3985,7 +3985,7 @@ def main():
     app.add_handler(CommandHandler("clearcache", clearcache_command))
     app.add_handler(CommandHandler("accrual_types", accrual_types_command))
 
-        app.add_handler(MessageHandler(filters.Regex(
+    app.add_handler(MessageHandler(filters.Regex(
         "^(💰 Финансовые показатели|📊 Отчёт по продажам|📦 Отчёт по товарам|📈 Отчёт по рекламе|"
         "🔔 Автоматические рассылки|⚙️ Администрирование|"
         "📚 Справочник расходов|📖 Справка|📚 Руководство)$"), handle_main_menu))
