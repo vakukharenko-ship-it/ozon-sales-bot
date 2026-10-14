@@ -1862,16 +1862,30 @@ def create_calendar(year, month, prefix):
 # ==================== КЛАВИАТУРЫ ====================
 def main_kb(chat_id):
     buttons = [
-        [KeyboardButton("💰 Финансовые показатели")],
-        [KeyboardButton("📊 Отчёт по продажам")],
+        [KeyboardButton("📊 Отчёты")],
+        [KeyboardButton("⚙️ Настройки")],
+        [KeyboardButton("📚 Руководство")],
+    ]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+
+def reports_kb():
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("💰 Отчёт по финансам")],
+        [KeyboardButton("📊 Отчёт по заказам")],
         [KeyboardButton("📦 Отчёт по товарам")],
         [KeyboardButton("📈 Отчёт по рекламе")],
+        [KeyboardButton("🔙 Назад")]], resize_keyboard=True)
+
+
+def settings_kb(chat_id):
+    buttons = [
         [KeyboardButton("🔔 Автоматические рассылки")],
     ]
     if is_admin(chat_id):
         buttons.append([KeyboardButton("⚙️ Администрирование")])
         buttons.append([KeyboardButton("📚 Справочник расходов")])
-    buttons.append([KeyboardButton("📖 Справка"), KeyboardButton("📚 Руководство")])
+    buttons.append([KeyboardButton("🔙 Назад")])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 def access_check_kb():
@@ -1902,8 +1916,7 @@ def admin_kb():
     return ReplyKeyboardMarkup([
         [KeyboardButton("➕ Добавить менеджера"), KeyboardButton("➖ Удалить менеджера")],
         [KeyboardButton("📋 Список менеджеров")],
-        [KeyboardButton("📚 Руководство")],
-        [KeyboardButton("🔙 Назад")]], resize_keyboard=True)
+        [KeyboardButton("🔙 В настройки")]], resize_keyboard=True)
 
 def auto_kb():
     return ReplyKeyboardMarkup([
@@ -1911,7 +1924,7 @@ def auto_kb():
         [KeyboardButton("📅 Добавление отчета за Вчера")],
         [KeyboardButton("🔕 Режим тишины")],
         [KeyboardButton("📤 Отправить отчет за Вчера сейчас")],
-        [KeyboardButton("🔙 Назад")]], resize_keyboard=True)
+        [KeyboardButton("🔙 В настройки")]], resize_keyboard=True)
 
 def products_period_kb():
     return InlineKeyboardMarkup([
@@ -1951,12 +1964,40 @@ def _scheme_main_menu() -> str:
         "┌───────────────────────────────┐\n"
         "│        ГЛАВНОЕ МЕНЮ           │\n"
         "├───────────────────────────────┤\n"
-        "│ 💰  Финансовые показатели     │\n"
-        "│ 📊  Отчёт по продажам         │\n"
+        "│ 📊  Отчёты                    │\n"
+        "│ ⚙️  Настройки                 │\n"
+        "│ 📚  Руководство               │\n"
+        "└───────────────────────────────┘\n"
+        "```"
+    )
+
+
+def _scheme_reports_menu() -> str:
+    return (
+        "```\n"
+        "┌───────────────────────────────┐\n"
+        "│           ОТЧЁТЫ              │\n"
+        "├───────────────────────────────┤\n"
+        "│ 💰  Отчёт по финансам         │\n"
+        "│ 📊  Отчёт по заказам          │\n"
         "│ 📦  Отчёт по товарам          │\n"
         "│ 📈  Отчёт по рекламе          │\n"
+        "│ 🔙  Назад                     │\n"
+        "└───────────────────────────────┘\n"
+        "```"
+    )
+
+
+def _scheme_settings_menu() -> str:
+    return (
+        "```\n"
+        "┌───────────────────────────────┐\n"
+        "│         НАСТРОЙКИ             │\n"
+        "├───────────────────────────────┤\n"
         "│ 🔔  Автоматические рассылки   │\n"
-        "│ 📖  Справка  │ 📚 Руководство │\n"
+        "│ ⚙️  Администрирование (админ) │\n"
+        "│ 📚  Справочник расходов       │\n"
+        "│ 🔙  Назад                     │\n"
         "└───────────────────────────────┘\n"
         "```"
     )
@@ -2029,11 +2070,11 @@ def _scheme_auto_menu() -> str:
         "│ 📅 Отчёт за Вчера             │\n"
         "│ 🔕 Режим тишины               │\n"
         "│ 📤 Отправить сейчас           │\n"
-        "│ 🔙 Назад                      │\n"
+        "│ 🔙 В настройки                │\n"
         "└───────────────────────────────┘\n"
         "```"
     )
-
+    
 def _scheme_admin_menu() -> str:
     return (
         "```\n"
@@ -2049,111 +2090,6 @@ def _scheme_admin_menu() -> str:
         "```"
     )
 
-# ==================== СПРАВКА ====================
-def _help_text_common() -> str:
-    return (
-        "📖 *Справка по боту*\n\n"
-        "Бот показывает аналитику вашего магазина Ozon: продажи, товары, "
-        "рекламу, финансовые показатели и автоматические отчёты. Все данные — "
-        "в реальном времени через официальное API Ozon.\n\n"
-
-        "🔹 *Главное меню*\n"
-        f"{_scheme_main_menu()}\n\n"
-
-        "🔹 *Как читать цифры*\n"
-        "• 🟢 рост • 🔴 снижение — относительно прошлого периода.\n"
-        "• *ДРР* — доля рекламных расходов в выручке.\n"
-        "• *CTR* — процент кликов от показов.\n"
-        "• Все расчёты по МСК (UTC+3).\n\n"
-
-        "💡 Подробное руководство: /guide или кнопка «📚 Руководство».\n\n"
-    )
-
-def _help_text_manager_extended() -> str:
-    return (
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔹 *Возможности менеджера*\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-
-        "*💰 Финансовые показатели*\n"
-        "Интерактивный раздел для получения PDF-отчёта с листа «Финпоказатели» "
-        "Google-таблицы. Фильтры:\n"
-        "  • 📅 Год — для графика динамики;\n"
-        "  • 📈 Показатель — метрика графика (Оборот, Чистая прибыль, ROI и др.);\n"
-        "  • 🗓 Период — период для карточек KPI (конкретный месяц или «Все»).\n"
-        "После выбора фильтров — кнопка «📄 Получить PDF отчёт».\n\n"
-
-        "*📊 Отчёт по продажам*\n"
-        f"{_scheme_sales_menu()}\n\n"
-        "• *Продажи за сегодня* — заказы, отмены и реклама на текущий момент "
-        "сравниваются с вчера.\n"
-        "• *Выбрать дату* — отчёт за один конкретный день (календарь).\n"
-        "• *Выбрать период* — по месяцам / кварталам / годам или произвольно.\n"
-        f"{_scheme_period_menu()}\n"
-        "• *Динамика продаж* — график доставленных заказов по месяцам, "
-        "можно сравнить до 10 лет.\n\n"
-
-        "*📦 Отчёт по товарам*\n"
-        f"{_scheme_products_menu()}\n\n"
-
-        "*📈 Отчёт по рекламе*\n"
-        f"{_scheme_ad_menu()}\n\n"
-
-        "*🔔 Автоматические рассылки*\n"
-        f"{_scheme_auto_menu()}\n\n"
-
-        "⚠️ Если рассылки не настроены, бот напомнит в 12:00 МСК.\n\n"
-    )
-def _help_text_admin_extended() -> str:
-    return (
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔹 *Возможности администратора*\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-
-        "*⚙️ Управление менеджерами*\n"
-        f"{_scheme_admin_menu()}\n\n"
-
-        "*📚 Справочник расходов*\n"
-        "Показывает типы услуг Ozon: распознанные и требующие уточнения. "
-        "Используется в отчётах для расшифровки блока «Расходы».\n\n"
-
-        "*🔧 Технические команды*\n"
-        "• /accrual_types — справочник начислений Ozon.\n"
-        "• /clearcache — очистить кэш API (принудительное обновление данных).\n"
-        "• /guide — подробное руководство пользователя.\n"
-        "• /version — версия бота.\n\n"
-
-        "*🔌 Интеграция с Google Apps Script (для PDF-отчётов)*\n"
-        "Раздел «💰 Финансовые показатели» получает PDF из Google-таблицы "
-        "через Web App (Apps Script). Нужны переменные окружения:\n"
-        "• `FIN_WEBAPP_URL` — URL Web App (оканчивается на `/exec`).\n"
-        "• `FIN_WEBAPP_SECRET` — секрет из меню «📨 Telegram → "
-        "🔑 FIN API для Python-бота» в Google-таблице.\n"
-        "Если PDF не приходит — проверьте логи бота (там будет точная причина).\n\n"
-
-        "*📂 Файлы данных (в контейнере)*\n"
-        "• /app/data/expense_types.json — локальный справочник расходов.\n"
-        "• /app/data/accrual_types.json — справочник начислений Ozon.\n"
-        "• /app/data/managers.json — список менеджеров.\n"
-        "• /app/data/settings.json — расписания рассылок.\n"
-        "• /app/data/ozon_log.txt — лог работы бота.\n\n"
-    )
-
-async def send_help(update, context):
-    chat_id = update.effective_chat.id
-    common = _help_text_common()
-    if is_admin(chat_id):
-        full = (common + _help_text_admin_extended() + _help_text_manager_extended() +
-                f"🤖 *Версия бота:* {VERSION}")
-    elif is_manager(chat_id):
-        full = (common + _help_text_manager_extended() +
-                f"🤖 *Версия бота:* {VERSION}\n\n"
-                "ℹ️ Для дополнительных возможностей обратитесь к администратору.")
-    else:
-        full = "❌ У вас нет доступа. Обратитесь к администратору."
-    await send_long_message(update.message, full, parse_mode="Markdown")
-
-
 async def send_guide(update, context):
     chat_id = update.effective_chat.id
     if not has_access(chat_id):
@@ -2165,9 +2101,12 @@ async def send_guide(update, context):
         "🔹 *1. ГЛАВНОЕ МЕНЮ*\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"{_scheme_main_menu()}\n\n"
-        "Пять основных разделов плюс справка и руководство. Для админа "
-        "дополнительно появляются разделы «⚙️ Администрирование» и "
-        "«📚 Справочник расходов».\n\n"
+        "Три раздела: «📊 Отчёты», «⚙️ Настройки» и «📚 Руководство».\n\n"
+        "Раздел «📊 Отчёты» содержит четыре отчёта:\n"
+        f"{_scheme_reports_menu()}\n"
+        "Раздел «⚙️ Настройки» содержит:\n"
+        f"{_scheme_settings_menu()}\n"
+        "Для менеджеров в «Настройках» виден только пункт «🔔 Автоматические рассылки».\n\n"
 
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "🔹 *2. ФИНАНСОВЫЕ ПОКАЗАТЕЛИ*\n"
@@ -2404,10 +2343,22 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not has_access(chat_id):
         await update.message.reply_text("❌ Нет доступа.", reply_markup=access_check_kb()); return
-    if text == "💰 Финансовые показатели":
+
+    # ===== Главное меню =====
+    if text == "📊 Отчёты":
+        await update.message.reply_text("📊 *Отчёты*\n\nВыберите отчёт:",
+                                        reply_markup=reports_kb(), parse_mode="Markdown")
+    elif text == "⚙️ Настройки":
+        await update.message.reply_text("⚙️ *Настройки*\n\nВыберите действие:",
+                                        reply_markup=settings_kb(chat_id), parse_mode="Markdown")
+    elif text == "📚 Руководство":
+        await send_guide(update, context)
+
+    # ===== Раздел «Отчёты» =====
+    elif text == "💰 Отчёт по финансам":
         await show_fin_menu(update, context)
-    elif text == "📊 Отчёт по продажам":
-        await update.message.reply_text("📊 *Отчёт по продажам*\n\nВыберите действие:",
+    elif text == "📊 Отчёт по заказам":
+        await update.message.reply_text("📊 *Отчёт по заказам*\n\nВыберите действие:",
                                         reply_markup=sales_reports_kb(), parse_mode="Markdown")
     elif text == "📦 Отчёт по товарам":
         await update.message.reply_text("📦 *Отчёт по товарам*\n\nВыберите действие:",
@@ -2415,6 +2366,8 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "📈 Отчёт по рекламе":
         await update.message.reply_text("📈 *Отчёт по рекламе*\n\nВыберите действие:",
                                         reply_markup=ad_reports_kb(), parse_mode="Markdown")
+
+    # ===== Раздел «Настройки» =====
     elif text == "🔔 Автоматические рассылки":
         await update.message.reply_text("🔔 *Автоматические рассылки*\n\nВыберите действие:",
                                         reply_markup=auto_kb(), parse_mode="Markdown")
@@ -2427,10 +2380,6 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(chat_id):
             await update.message.reply_text("⛔ Только для администратора."); return
         await show_expense_types(update, context)
-    elif text == "📖 Справка":
-        await send_help(update, context)
-    elif text == "📚 Руководство":
-        await send_guide(update, context)
 
 async def back_to_main_menu(update, context):
     """Глобальный обработчик кнопки «🔙 Назад» — возврат в главное меню."""
@@ -2439,6 +2388,15 @@ async def back_to_main_menu(update, context):
         await update.message.reply_text("❌ Нет доступа.", reply_markup=access_check_kb())
         return
     await update.message.reply_text("🏠 Главное меню:", reply_markup=main_kb(chat_id))
+
+async def back_to_settings(update, context):
+    """Возврат в раздел «Настройки»."""
+    chat_id = update.effective_chat.id
+    if not has_access(chat_id):
+        await update.message.reply_text("❌ Нет доступа.", reply_markup=access_check_kb())
+        return
+    await update.message.reply_text("⚙️ *Настройки*\n\nВыберите действие:",
+                                    reply_markup=settings_kb(chat_id), parse_mode="Markdown")
 
 # ==================== ФИНАНСОВЫЕ ПОКАЗАТЕЛИ (UI) ====================
 DEFAULT_FIN_METRICS = [
@@ -3043,9 +3001,10 @@ async def expense_types_cb(update, context):
     chat_id = q.message.chat_id
     if not is_admin(chat_id):
         await q.edit_message_text("⛔ Только для админа."); return
-    if d == "et_back":
-        await q.edit_message_text("Главное меню:", reply_markup=None)
-        await q.message.reply_text("🏠 Главное меню:", reply_markup=main_kb(chat_id))
+       if d == "et_back":
+        await q.edit_message_text("Возвращаюсь в Настройки…", reply_markup=None)
+        await q.message.reply_text("⚙️ *Настройки*\n\nВыберите действие:",
+                                   reply_markup=settings_kb(chat_id), parse_mode="Markdown")
     elif d == "et_refresh":
         global _expense_types_cache, _accrual_types_cache
         _expense_types_cache = _load_expense_types_sync()
@@ -4042,16 +4001,16 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("version", version_command))
-    app.add_handler(CommandHandler("help", send_help))
+    app.add_handler(CommandHandler("help", send_guide))
     app.add_handler(CommandHandler("guide", send_guide))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("clearcache", clearcache_command))
     app.add_handler(CommandHandler("accrual_types", accrual_types_command))
 
-    app.add_handler(MessageHandler(filters.Regex(
-        "^(💰 Финансовые показатели|📊 Отчёт по продажам|📦 Отчёт по товарам|📈 Отчёт по рекламе|"
-        "🔔 Автоматические рассылки|⚙️ Администрирование|"
-        "📚 Справочник расходов|📖 Справка|📚 Руководство)$"), handle_main_menu))
+        app.add_handler(MessageHandler(filters.Regex(
+        "^(📊 Отчёты|⚙️ Настройки|📚 Руководство|"
+        "💰 Отчёт по финансам|📊 Отчёт по заказам|📦 Отчёт по товарам|📈 Отчёт по рекламе|"
+        "🔔 Автоматические рассылки|⚙️ Администрирование|📚 Справочник расходов)$"), handle_main_menu))
 
     app.add_handler(MessageHandler(filters.Text(["🔄 Проверить доступ"]), check_access_cmd))
     app.add_handler(MessageHandler(filters.Text(["📅 Продажи за сегодня"]), today_report))
@@ -4059,6 +4018,7 @@ def main():
     app.add_handler(MessageHandler(filters.Text(["📋 Список менеджеров"]), admin_list))
     app.add_handler(MessageHandler(filters.Text(["📅 Реклама за текущий месяц"]), ad_report_month_handler))
     app.add_handler(MessageHandler(filters.Text(["🔙 Назад"]), back_to_main_menu))
+    app.add_handler(MessageHandler(filters.Text(["🔙 В настройки"]), back_to_settings))
 
     app.add_handler(MessageHandler(filters.Regex(
         "^(🕒 Выбор времени рассылок|📅 Добавление отчета за Вчера|"
