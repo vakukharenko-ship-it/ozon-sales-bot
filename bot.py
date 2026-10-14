@@ -3001,7 +3001,7 @@ async def expense_types_cb(update, context):
     chat_id = q.message.chat_id
     if not is_admin(chat_id):
         await q.edit_message_text("⛔ Только для админа."); return
-       if d == "et_back":
+        if d == "et_back":
         await q.edit_message_text("Возвращаюсь в Настройки…", reply_markup=None)
         await q.message.reply_text("⚙️ *Настройки*\n\nВыберите действие:",
                                    reply_markup=settings_kb(chat_id), parse_mode="Markdown")
